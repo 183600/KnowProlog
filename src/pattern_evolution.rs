@@ -1477,6 +1477,31 @@ impl EvolutionLedger {
         Ok(receipt)
     }
 
+    /// 无条件记录一代「已观察状态」，用于外部事务开始前的基线。
+    ///
+    /// 这不是提案：它不声称改进，也不做回放；调用方应在随后用
+    /// [`Self::snapshot_library`] 对真正的外部变更过闸门。只用于配置重载
+    /// 这类「先把当前事实钉住，再比较下一状态」的场景。
+    pub fn record_baseline(
+        &mut self,
+        library: &PatternLibrary,
+        clock: EvolutionClock,
+        note: impl Into<String>,
+    ) -> PatternGeneration {
+        let parent = self.current().map(|snapshot| snapshot.generation);
+        let generation = PatternGeneration::snapshot(
+            self.next_generation(),
+            parent,
+            library,
+            clock,
+            GenerationStatus::Active,
+            note,
+        );
+        self.generations.push(generation.clone());
+        self.trim_generations();
+        generation
+    }
+
     /// 把当前模式库记录成新的一代（相对台账当前代做完整回放）。
     pub fn snapshot_library(
         &mut self,
@@ -2068,6 +2093,36 @@ mod tests {
                 .map(PatternEntry::id)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn baseline_then_bad_config_snapshot_is_rejected_and_keeps_baseline() {
+        let base = base_generation();
+        let mut ledger = EvolutionLedger::default();
+        ledger.ensure_initial(&base.library(), base.clock, "初始");
+        let before = base.library();
+        let baseline =
+            ledger.record_baseline(&before, EvolutionClock::new(1, 2, 1, 0), "重载前基线");
+        let mut after = before.clone();
+        after.add(entry(
+            "悬空配置",
+            "config.toml#悬空",
+            "no_such_query",
+            20,
+            &["坏", "配置"],
+        ));
+        let receipt = ledger
+            .snapshot_library(
+                &after,
+                &[],
+                &config(),
+                EvolutionClock::new(2, 2, 2, 0),
+                "配置重载",
+            )
+            .unwrap();
+        assert_eq!(receipt.verdict, EvolutionVerdict::Reject);
+        assert_eq!(ledger.current().unwrap().generation, baseline.generation);
+        assert_eq!(ledger.current().unwrap().fingerprint, base.fingerprint);
     }
 
     #[test]

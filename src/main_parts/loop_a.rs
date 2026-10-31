@@ -102,6 +102,7 @@
         ) {
             match lang_runtime.reload() {
                 Ok(LangReloadOutcome::Applied(apply)) => {
+                    let pattern_before_reload = pattern_library.clone();
                     language_config = Arc::clone(lang_runtime.current().language_config());
                     let (patterns, language, plugin_entries) = apply_language_snapshot(
                         &language_config,
@@ -144,6 +145,49 @@
                         );
                     }
                     println!("  对话焦点、编年史、会话事实与已学模式保持不变。");
+                    let clock = EvolutionClock::new(
+                        apply.epoch,
+                        kb_revision,
+                        pattern_evolution
+                            .current()
+                            .map(|generation| generation.generation)
+                            .unwrap_or(0),
+                        pattern_episodes.revision(),
+                    );
+                    match gate_config_change(
+                        &mut pattern_evolution,
+                        &pattern_before_reload,
+                        &pattern_library,
+                        pattern_episodes.entries(),
+                        &language_config,
+                        clock,
+                        &evolution_path,
+                        "配置重载",
+                    ) {
+                        Ok(receipt) => {
+                            println!(
+                                "  演化闸门：{}（回放 {} 例，回归 {}，留出新增命中 {}）。",
+                                receipt.verdict.label(),
+                                receipt.replay.cases,
+                                receipt.replay.regressions,
+                                receipt.replay.held_out_gains
+                            );
+                            if !receipt.verdict.may_commit() {
+                                pattern_library = pattern_before_reload;
+                                println!("  模式层未通过闸门，已恢复重载前状态：");
+                                println!("{}", receipt.render());
+                            } else if let Err(error) = oxigraph_manager
+                                .sync_pattern_ledger(pattern_library.entries())
+                                .await
+                            {
+                                eprintln!("  模式层已更新，但模式落图失败：{}", error);
+                            }
+                        }
+                        Err(error) => {
+                            pattern_library = pattern_before_reload;
+                            println!("  演化台账无法记录，模式层已恢复重载前状态：{}", error);
+                        }
+                    }
                 }
                 Ok(LangReloadOutcome::Unchanged { epoch }) => {
                     println!("配置未发生语义变化（epoch {}）。", epoch);
@@ -166,6 +210,7 @@
         ) {
             match lang_runtime.rollback() {
                 Ok(rollback) => {
+                    let pattern_before_rollback = pattern_library.clone();
                     language_config = Arc::clone(lang_runtime.current().language_config());
                     let (patterns, language, plugin_entries) = apply_language_snapshot(
                         &language_config,
@@ -203,6 +248,49 @@
                     );
                     println!("  同义词按会话单调追加，已登记映射需重启才完全撤销。");
                     println!("  对话焦点、编年史、会话事实与已学模式保持不变。");
+                    let clock = EvolutionClock::new(
+                        rollback.epoch,
+                        kb_revision,
+                        pattern_evolution
+                            .current()
+                            .map(|generation| generation.generation)
+                            .unwrap_or(0),
+                        pattern_episodes.revision(),
+                    );
+                    match gate_config_change(
+                        &mut pattern_evolution,
+                        &pattern_before_rollback,
+                        &pattern_library,
+                        pattern_episodes.entries(),
+                        &language_config,
+                        clock,
+                        &evolution_path,
+                        "配置回滚",
+                    ) {
+                        Ok(receipt) => {
+                            println!(
+                                "  演化闸门：{}（回放 {} 例，回归 {}，留出新增命中 {}）。",
+                                receipt.verdict.label(),
+                                receipt.replay.cases,
+                                receipt.replay.regressions,
+                                receipt.replay.held_out_gains
+                            );
+                            if !receipt.verdict.may_commit() {
+                                pattern_library = pattern_before_rollback;
+                                println!("  模式层未通过闸门，已恢复回滚前状态：");
+                                println!("{}", receipt.render());
+                            } else if let Err(error) = oxigraph_manager
+                                .sync_pattern_ledger(pattern_library.entries())
+                                .await
+                            {
+                                eprintln!("  模式层已更新，但模式落图失败：{}", error);
+                            }
+                        }
+                        Err(error) => {
+                            pattern_library = pattern_before_rollback;
+                            println!("  演化台账无法记录，模式层已恢复回滚前状态：{}", error);
+                        }
+                    }
                 }
                 Err(error) => {
                     println!("{}（epoch {} 保持）。", error, lang_runtime.epoch());

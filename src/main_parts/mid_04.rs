@@ -987,6 +987,29 @@ fn persist_pattern_evolution(ledger: &EvolutionLedger, path: &str) {
     }
 }
 
+/// 配置重载/回滚前后的模式层事务：先钉住重载前基线，再让候选过四类闸门。
+///
+/// 返回 `Ok(receipt)` 时由调用方决定是否保留候选；返回 `Err` 表示台账本身
+/// 无法记录。无论结果如何，调用方在 `!receipt.verdict.may_commit()` 时应恢复
+/// 重载前的模式库，避免悬空 `query_type` 静默进入路由。
+fn gate_config_change(
+    ledger: &mut EvolutionLedger,
+    before: &PatternLibrary,
+    after: &PatternLibrary,
+    episodes: &[know_prolog::pattern_ir::PatternEpisode],
+    config: &SystemConfig,
+    clock: EvolutionClock,
+    path: &str,
+    label: &str,
+) -> Result<know_prolog::pattern_evolution::EvolutionReceipt, String> {
+    ledger.record_baseline(before, clock, format!("{}前基线", label));
+    let result = ledger
+        .snapshot_library(after, episodes, config, clock, label)
+        .map_err(|error| error.to_string());
+    persist_pattern_evolution(ledger, path);
+    result
+}
+
 /// 模式命中回执里若来源是锻造规则，则给该规则记一次成功使用。
 ///
 /// 只做计数，不改变回答；台账按需落盘，避免每轮都写 JSON。
