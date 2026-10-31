@@ -100,8 +100,10 @@ impl SymbolicReasoner {
         }
         let policy = TurnPolicy::from_confidence(&self.config.confidence);
         let turn = self.epistemic_turns.turn.saturating_add(1);
-        self.epistemic_turns
-            .observe_turn(&TurnEnvelope::from_plan(turn, plan), &policy);
+        let envelope = TurnEnvelope::from_plan(turn, plan);
+        self.epistemic_turns.observe_turn(&envelope, &policy);
+        self.beliefs.observe_turn(turn, &plan.subject, &envelope);
+        self.beliefs.advance_to(turn);
     }
 
     /// 从生成命题的来源等级与槽账本事件构造逐命题置信区间。
@@ -302,9 +304,10 @@ impl SymbolicReasoner {
         if self.config.confidence.enabled && !self.epistemic_turns.is_empty() {
             let policy = TurnPolicy::from_confidence(&self.config.confidence);
             let turn = self.epistemic_turns.turn.saturating_add(1);
-            let report = self
-                .epistemic_turns
-                .reconcile(&TurnEnvelope::from_plan(turn, &current), &policy);
+            let envelope = TurnEnvelope::from_plan(turn, &current);
+            let report = self.epistemic_turns.reconcile(&envelope, &policy);
+            self.beliefs.observe_turn(turn, &current.subject, &envelope);
+            self.beliefs.advance_to(turn);
             let text = report.render_zh();
             if !text.is_empty() {
                 output.push_str("\n置信复核：\n");
@@ -403,8 +406,25 @@ impl SymbolicReasoner {
                 output.push('\n');
                 output.push_str(&pending);
             }
+            if !self.beliefs.is_empty() {
+                output.push('\n');
+                output.push_str(&self.beliefs.render_report(self.beliefs.turn()));
+                output.push('\n');
+            }
         }
         output
+    }
+
+    /// 跨模块/跨轮信念账本的只读视图；未启用 PCC 时为空。
+    pub fn belief_ledger(&self) -> &BeliefLedger {
+        &self.beliefs
+    }
+
+    pub fn belief_ledger_report(&self) -> String {
+        if self.beliefs.is_empty() {
+            return "信念账本为空：先生成一份带置信区间的回答计划。".to_string();
+        }
+        self.beliefs.render_report(self.beliefs.turn())
     }
 
     pub fn discourse(&self) -> &DiscoursePlanner {

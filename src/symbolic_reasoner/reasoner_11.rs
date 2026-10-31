@@ -84,6 +84,8 @@ impl SymbolicReasoner {
         self.context.restore(snapshot);
         // 复核台账是会话态：旧快照缺省为空，避免把上一会话的待办带进来。
         self.epistemic_turns = snapshot.epistemic_turns.clone().unwrap_or_default();
+        // 跨轮信念账本同样只在快照声明时恢复；旧快照保持空账本。
+        self.beliefs = snapshot.beliefs.clone().unwrap_or_default();
         // 镜像对齐：旧快照没有该字段时清空，避免把上一会话的词形规则串进来。
         let alignment = snapshot.alignment.clone().unwrap_or_default();
         *self.linker.alignment_mut() = alignment;

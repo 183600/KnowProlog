@@ -159,6 +159,7 @@ impl SymbolicReasoner {
             persisted_laws: None,
             context: DialogueContext::new(5),
             epistemic_turns: EpistemicTurnBook::new(),
+            beliefs: BeliefLedger::default(),
             embedding,
             schema_view: SchemaView::new(),
             walks,
@@ -287,6 +288,7 @@ impl SymbolicReasoner {
     fn reset_session_state(&mut self) {
         self.context.clear();
         self.epistemic_turns.clear();
+        self.beliefs = BeliefLedger::default();
         *self.contextual_last.lock() = None;
         self.search_session.lock().clear();
         *self.formal_clarification.lock() = None;

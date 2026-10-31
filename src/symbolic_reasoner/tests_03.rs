@@ -1633,3 +1633,50 @@ rules = [
         assert!(report.contains("事实"));
         assert!(report.contains("知识库"));
     }
+
+    #[test]
+    fn belief_ledger_tracks_cross_turn_slots_and_survives_snapshot() {
+        let mut config = test_config();
+        config.max_profile_sentences = 4;
+        config.confidence.enabled = true;
+        let mut reasoner = SymbolicReasoner::new(config.clone(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        reasoner.generate_about("张三").expect("应能生成介绍");
+        assert!(
+            reasoner.belief_ledger().len() > 0,
+            "生成计划后账本应记录槽位信念"
+        );
+        let report = reasoner.answer_plan_report();
+        assert!(report.contains("信念账本"), "{}", report);
+        assert!(report.contains("师傅"), "{}", report);
+
+        reasoner.assert_nl_fact("记住：张三的师傅是赵六");
+        reasoner.generate_about("张三").expect("会话事实应可重新生成");
+        let masters = reasoner.belief_ledger().slot_beliefs("张三", "师傅");
+        assert!(masters.len() >= 2, "同一槽位应保留冲突候选：{:?}", masters);
+        assert!(
+            masters.iter().any(|belief| belief.conflicts > 0),
+            "不同取值应记冲突：{:?}",
+            masters
+        );
+
+        let snapshot = reasoner.dialogue_snapshot();
+        assert!(snapshot.beliefs.is_some());
+        let plain = SymbolicReasoner::new(config, HashMap::new());
+        assert!(
+            !serde_json::to_string(&plain.dialogue_snapshot())
+                .unwrap()
+                .contains("\"beliefs\""),
+            "空账本不得写字段"
+        );
+        let mut restored = SymbolicReasoner::new(reasoner.config.clone(), HashMap::new());
+        restored.observe_facts(&master_facts());
+        restored
+            .restore_dialogue_snapshot(&snapshot)
+            .expect("信念账本应可随快照恢复");
+        assert_eq!(
+            restored.belief_ledger().len(),
+            reasoner.belief_ledger().len()
+        );
+        assert!(restored.belief_ledger_report().contains("赵六"));
+    }

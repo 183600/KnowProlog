@@ -104,6 +104,7 @@ use crate::semantic_monitor::{
 use crate::slot_ledger::{
     AssertionStrength, SlotAssertion, SlotKey, SlotLedger, SlotPolicy, SlotTransition,
 };
+use crate::stage_bus::BeliefLedger;
 use crate::symbolic_generator::{
     GenerationCursor, GenerationOrder, GenerationOverlay, ProfileClause, SymbolicGenerator,
 };
@@ -591,6 +592,9 @@ pub struct DialogueSnapshot {
     /// 逐命题复核台账；旧快照缺省为空，空台账不写字段以保持字节兼容。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epistemic_turns: Option<EpistemicTurnBook>,
+    /// 跨模块/跨轮的槽位信念账本；空账本不落盘，旧快照字节保持不变。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub beliefs: Option<BeliefLedger>,
     // 跨会话临时信念：被采纳的假设事实（会话级，不写知识图谱）
     #[serde(default)]
     pub session_facts: Vec<SnapshotAtom>,
@@ -828,6 +832,7 @@ impl DialogueContext {
             history: self.history.clone(),
             generation: self.generation.clone(),
             epistemic_turns: None,
+            beliefs: None,
             session_facts: Vec::new(),
             session_negative_facts: Vec::new(),
             slots: None,
@@ -1309,6 +1314,8 @@ pub struct SymbolicReasoner {
     persisted_laws: Option<LawBook>,
     context: DialogueContext,
     epistemic_turns: EpistemicTurnBook,
+    // 跨模块/跨轮槽位信念：只记录带信封的命题，不写图谱。
+    beliefs: BeliefLedger,
     embedding: SymbolicEmbedding,
     // 单一 RDFS 模式视图：类型闭包/子属性/域值域，嵌入与审计共用同一坐标系。
     schema_view: SchemaView,

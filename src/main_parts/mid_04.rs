@@ -100,6 +100,19 @@ async fn run_ask(
             });
             continue;
         }
+        if matches!(
+            question.as_str(),
+            "置信账本" | "信念账本" | "跨轮信念" | "belief-ledger"
+        ) {
+            reasoner.clear_pending_awaiting();
+            answers.push(AskAnswer {
+                question,
+                status: "answered",
+                answer: Some(reasoner.belief_ledger_report()),
+                derivation: None,
+            });
+            continue;
+        }
         // 批次线索优先于澄清/悬问回填：问「这批」时不应被当成上一轮短答。
         if know_prolog::import_episode::looks_like_episode_reference(&question) {
             if import_episodes.is_none() {

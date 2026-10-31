@@ -1540,6 +1540,7 @@ impl SymbolicReasoner {
             (!self.linker.alignment().is_empty()).then(|| self.linker.alignment().clone());
         snapshot.epistemic_turns =
             (!self.epistemic_turns.is_empty()).then(|| self.epistemic_turns.clone());
+        snapshot.beliefs = (!self.beliefs.is_empty()).then(|| self.beliefs.clone());
         snapshot
     }
 }

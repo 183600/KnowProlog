@@ -17,6 +17,7 @@ impl Clone for SymbolicReasoner {
             persisted_laws: self.persisted_laws.clone(),
             context: self.context.clone(),
             epistemic_turns: self.epistemic_turns.clone(),
+            beliefs: self.beliefs.clone(),
             embedding: self.embedding.clone(),
             schema_view: self.schema_view.clone(),
             walks: self.walks.clone(),

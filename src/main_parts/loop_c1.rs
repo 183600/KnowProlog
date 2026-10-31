@@ -121,6 +121,13 @@
             continue;
         }
 
+        // 跨轮信念账本：同一槽位上的候选、来源、佐证/冲突与衰减后区间。
+        if matches!(input, "置信账本" | "信念账本" | "跨轮信念" | "belief-ledger") {
+            println!("{}", symbolic_reasoner.belief_ledger_report());
+            println!();
+            continue;
+        }
+
         // 多轮生成：按同一份回答计划换风格重述（不重新检索、不新增事实）
         if let Some(directive) = StyleDirective::parse(input) {
             match symbolic_reasoner.restyle_generation(directive) {
