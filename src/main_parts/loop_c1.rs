@@ -558,7 +558,10 @@
             } else {
                 refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
                 println!("{}", symbolic_reasoner.resolution_proof_report(target));
-                if let Some(view) = symbolic_reasoner.resolution_proof_view(target) {
+                if let Some((view, access)) =
+                    symbolic_reasoner.resolution_proof_view_with_receipt(target)
+                {
+                    println!("{}", access.render_zh());
                     let certificates = ProofCertificate::from_view(&view, ProofLimits::default());
                     if let Some(chronicle) = chronicle.as_mut() {
                         let _ = know_prolog::proof_journal::record_proofs(chronicle, &certificates);
@@ -585,7 +588,10 @@
             } else {
                 refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
                 println!("{}", symbolic_reasoner.resolution_query_report(target));
-                if let Some(view) = symbolic_reasoner.resolution_proof_view(target) {
+                if let Some((view, access)) =
+                    symbolic_reasoner.resolution_proof_view_with_receipt(target)
+                {
+                    println!("{}", access.render_zh());
                     let certificates = ProofCertificate::from_view(&view, ProofLimits::default());
                     if let Some(chronicle) = chronicle.as_mut() {
                         let _ = know_prolog::proof_journal::record_proofs(chronicle, &certificates);

@@ -140,9 +140,77 @@ impl SymbolicReasoner {
         }
     }
 
+    /// 证明记忆：当前会话的命中、字节与淘汰回执（确定性，可直接断言）。
+    pub fn proof_memory_report(&self) -> String {
+        self.proof_memory.lock().render_receipt()
+    }
+
+    /// 清空当前会话的证明记忆；知识图谱、会话事实与编年史不受影响。
+    pub fn clear_proof_memory(&self) -> String {
+        let mut memory = self.proof_memory.lock();
+        let before = memory.len();
+        memory.clear();
+        format!("证明记忆已清空：移除 {} 条。", before)
+    }
+
+    /// 与 [`Self::resolution_proof_view`] 相同，并给出缓存命中或写入回执。
+    ///
+    /// 只复用搜索完整的证明；被截断的搜索只作为一次性视图返回，不写入
+    /// 可复用记忆。缓存键是去首尾标点后的规范请求键，同一会话内文字
+    /// 变化（换说法/换实体）不会误命中。
+    pub fn resolution_proof_view_with_receipt(
+        &self,
+        text: &str,
+    ) -> Option<(ResolutionProofView, ProofMemoryAccess)> {
+        if !self.config.enable_resolution {
+            return None;
+        }
+        let key = canonical_key(text);
+        if !key.is_empty() {
+            let hit = self.proof_memory.lock().lookup_complete(&key);
+            if let Some(hit) = hit {
+                let saved_steps = hit.cost.steps().saturating_mul(hit.hits);
+                let access = ProofMemoryHitAccess {
+                    hits: hit.hits,
+                    payload_bytes: hit.payload_bytes,
+                    saved_steps,
+                    status: hit.status,
+                };
+                return Some((hit.payload, ProofMemoryAccess::hit(key, access)));
+            }
+        }
+        let view = self.resolution_proof_view_uncached(text)?;
+        let incomplete = view.search_truncated || view.search_status == SearchStatus::Incomplete;
+        if incomplete || key.is_empty() {
+            let mut access = ProofMemoryAccess::miss(key);
+            if incomplete {
+                access.status = ProofStatus::MayBeIncomplete;
+            }
+            return Some((view, access));
+        }
+        let record = ProofRecord::new(
+            key.clone(),
+            view.clone(),
+            estimate_resolution_view_bytes(&view),
+        )
+        .with_footprint(resolution_view_footprint(&view))
+        .with_cost(proof_search_cost(&view.stats))
+        .with_status(ProofStatus::Complete);
+        let receipt = self.proof_memory.lock().store(record);
+        Some((view, ProofMemoryAccess::miss(key).with_store(&receipt)))
+    }
+
     /// 结构化证明视图：陈述句（"证明"）与开放问句（"推理链"）统一入口。
     /// 返回 None 表示无法形式化为归结目标或归结未启用。
+    ///
+    /// 同一会话内重复的完整查询走 [`Self::resolution_proof_view_with_receipt`]
+    /// 的证明记忆；需要命中信息时直接调用后者。
     pub fn resolution_proof_view(&self, text: &str) -> Option<ResolutionProofView> {
+        self.resolution_proof_view_with_receipt(text)
+            .map(|(view, _)| view)
+    }
+
+    fn resolution_proof_view_uncached(&self, text: &str) -> Option<ResolutionProofView> {
         if !self.config.enable_resolution {
             return None;
         }
@@ -1508,4 +1576,80 @@ impl SymbolicReasoner {
         }
         readings
     }
+}
+
+fn proof_search_cost(stats: &SearchStats) -> ProofSearchCost {
+    ProofSearchCost {
+        goals: stats.goals,
+        goal_attempts: stats.goal_attempts,
+        fact_checks: stats.fact_checks,
+        rule_attempts: stats.rule_attempts,
+        depth_cutoffs: stats.depth_cutoffs,
+        budget_cutoffs: stats.budget_cutoffs,
+        solution_cutoffs: stats.solution_cutoffs,
+        state_cutoffs: stats.state_cutoffs,
+    }
+}
+
+fn estimate_resolution_view_bytes(view: &ResolutionProofView) -> usize {
+    fn node_bytes(node: &ProofViewNode) -> usize {
+        let source = match &node.source {
+            crate::view_render::ViewProofSource::Fact => 4,
+            crate::view_render::ViewProofSource::Rule(source) => source.len(),
+        };
+        node.label
+            .len()
+            .saturating_add(node.canonical.len())
+            .saturating_add(source)
+            .saturating_add(32)
+            .saturating_add(node.children.iter().map(node_bytes).sum::<usize>())
+    }
+    let mut bytes = 128usize
+        .saturating_add(view.phrase.len())
+        .saturating_add(view.goal_display.len());
+    for solution in &view.solutions {
+        for (name, value) in &solution.bindings {
+            bytes = bytes
+                .saturating_add(name.len())
+                .saturating_add(value.len())
+                .saturating_add(3);
+        }
+        bytes = bytes.saturating_add(24);
+        bytes = bytes.saturating_add(solution.proofs.iter().map(node_bytes).sum::<usize>());
+    }
+    for frontier in &view.frontier {
+        bytes = bytes
+            .saturating_add(frontier.goal.len())
+            .saturating_add(64);
+    }
+    bytes
+}
+
+fn resolution_view_footprint(view: &ResolutionProofView) -> ProofFootprint {
+    fn collect<'a>(node: &'a ProofViewNode, out: &mut Vec<&'a str>) {
+        out.push(node.canonical.as_str());
+        for child in &node.children {
+            collect(child, out);
+        }
+    }
+    let mut texts: Vec<&str> = Vec::new();
+    for goal in view.goal_display.split('，') {
+        let goal = goal.trim();
+        if !goal.is_empty() {
+            texts.push(goal);
+        }
+    }
+    for solution in &view.solutions {
+        for proof in &solution.proofs {
+            collect(proof, &mut texts);
+        }
+    }
+    for frontier in &view.frontier {
+        texts.push(frontier.goal.as_str());
+    }
+    let mut footprint = ProofFootprint::from_canonical_atoms(texts);
+    if footprint.is_empty() {
+        footprint.watch_any = true;
+    }
+    footprint
 }

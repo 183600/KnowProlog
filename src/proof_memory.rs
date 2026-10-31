@@ -368,6 +368,88 @@ impl ProofStoreReceipt {
     }
 }
 
+/// 一次「查缓存 / 重算并写入」的调用回执。文本只含计数与键，不含答案正文。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProofMemoryAccess {
+    pub key: String,
+    pub hit: bool,
+    pub hits: u64,
+    pub payload_bytes: usize,
+    pub saved_steps: u64,
+    pub status: ProofStatus,
+    pub stored: bool,
+    pub oversized: bool,
+    pub evicted: Vec<String>,
+}
+
+impl ProofMemoryAccess {
+    pub fn hit(key: String, hit: ProofMemoryHitAccess) -> Self {
+        Self {
+            key,
+            hit: true,
+            hits: hit.hits,
+            payload_bytes: hit.payload_bytes,
+            saved_steps: hit.saved_steps,
+            status: hit.status,
+            stored: true,
+            oversized: false,
+            evicted: Vec::new(),
+        }
+    }
+
+    pub fn miss(key: String) -> Self {
+        Self {
+            key,
+            hit: false,
+            hits: 0,
+            payload_bytes: 0,
+            saved_steps: 0,
+            status: ProofStatus::Complete,
+            stored: false,
+            oversized: false,
+            evicted: Vec::new(),
+        }
+    }
+
+    pub fn with_store(mut self, receipt: &ProofStoreReceipt) -> Self {
+        self.stored = receipt.stored;
+        self.oversized = receipt.oversized;
+        self.evicted = receipt.evicted_keys();
+        self
+    }
+
+    pub fn render_zh(&self) -> String {
+        if self.hit {
+            format!(
+                "证明记忆：命中（第 {} 次复用，约省 {} 步 / {} 字节）",
+                self.hits, self.saved_steps, self.payload_bytes
+            )
+        } else if self.oversized {
+            "证明记忆：未命中（条目超出字节预算，未写入）".to_string()
+        } else if self.stored {
+            format!("证明记忆：未命中（已写入 {} 字节）", self.payload_bytes)
+        } else if !self.evicted.is_empty() {
+            format!(
+                "证明记忆：未命中（写入时淘汰 {} 条）",
+                self.evicted.len()
+            )
+        } else if self.status == ProofStatus::MayBeIncomplete {
+            "证明记忆：未命中（搜索被截断，不缓存最终答案）".to_string()
+        } else {
+            "证明记忆：未命中".to_string()
+        }
+    }
+}
+
+/// 供 [`ProofMemoryAccess::hit`] 使用的轻量命中摘要。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProofMemoryHitAccess {
+    pub hits: u64,
+    pub payload_bytes: usize,
+    pub saved_steps: u64,
+    pub status: ProofStatus,
+}
+
 /// 一次知识增量复核的确定性报告。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProofRevalidation {

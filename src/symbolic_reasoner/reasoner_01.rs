@@ -181,6 +181,7 @@ impl SymbolicReasoner {
             attribute_profiles: crate::attribute_bridge::AttributeRegistry::default(),
             associations,
             resolver,
+            proof_memory: parking_lot::Mutex::new(ProofMemory::with_defaults()),
             abduction,
             frames: FrameMemory::new(),
             pending_questions: PendingQuestionLedger::new(),
@@ -323,6 +324,7 @@ impl SymbolicReasoner {
         self.entity_mentions_memo.lock().clear();
         self.predicate_canonicals_memo.lock().clear();
         self.prediction_drafts.lock().clear();
+        self.proof_memory.lock().clear();
         self.read_traces.clear();
         self.semantic.clear();
         self.engine_fault = None;

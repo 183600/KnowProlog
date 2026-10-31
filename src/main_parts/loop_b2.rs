@@ -809,6 +809,18 @@
             continue;
         }
 
+        // 证明记忆：当前会话的查询级证明缓存（命中/字节/淘汰回执）
+        if matches!(input, "证明记忆" | "证明缓存" | "证明记忆报告") {
+            println!("{}", symbolic_reasoner.proof_memory_report());
+            println!();
+            continue;
+        }
+        if matches!(input, "清空证明记忆" | "清空证明缓存") {
+            println!("{}", symbolic_reasoner.clear_proof_memory());
+            println!();
+            continue;
+        }
+
         // 证明日志：从编年史回放已具体化的证明凭证（稳定 id，可再叙述）
         if matches!(input, "证明日志" | "证明档案" | "证明记录") {
             match chronicle.as_ref() {
@@ -1037,12 +1049,13 @@
                 println!("请提供要证明的目标，例如：证明图：张三的师傅的师傅是王五");
             } else {
                 refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
-                match symbolic_reasoner.resolution_proof_view(target) {
-                    Some(view) => {
+                match symbolic_reasoner.resolution_proof_view_with_receipt(target) {
+                    Some((view, access)) => {
                         println!(
                             "证明图：{}  〔{}；知识库 {} 条事实 / {} 条规则〕",
                             view.phrase, view.goal_display, view.facts, view.clauses
                         );
+                        println!("{}", access.render_zh());
                         if view.solutions.is_empty() {
                             if view.search_status == SearchStatus::Incomplete {
                                 println!(

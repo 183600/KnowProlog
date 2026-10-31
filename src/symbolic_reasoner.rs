@@ -25,6 +25,7 @@ mod tests {
     include!("symbolic_reasoner/tests_05.rs");
     include!("symbolic_reasoner/tests_06.rs");
     include!("symbolic_reasoner/tests_07.rs");
+    include!("symbolic_reasoner/tests_proof_memory.rs");
     include!("symbolic_reasoner/tests_core_paths.rs");
     include!("symbolic_reasoner/tests_batch.rs");
 }

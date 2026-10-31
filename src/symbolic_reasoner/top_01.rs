@@ -79,6 +79,10 @@ use crate::probabilistic_query_intent::{
 };
 use crate::problog::{ProblogAnswer, ProblogEngine};
 use crate::prolog_engine::PrologFact;
+use crate::proof_memory::{
+    canonical_key, ProofFootprint, ProofMemory, ProofMemoryAccess, ProofMemoryHitAccess,
+    ProofRecord, ProofSearchCost, ProofStatus,
+};
 use crate::query_anchor::{self, AnchorEvidence, TypeFit};
 use crate::query_planner::{QueryPlan, QueryPlanner};
 use crate::query_rewrite::{self, RelationLexicon};
@@ -1355,6 +1359,8 @@ pub struct SymbolicReasoner {
     associations: AssociationMiner,
     // 一阶归结引擎（事实 + 链接预测规则 + 关联规则）
     resolver: ResolutionEngine,
+    // 查询级证明记忆：同一会话内复用完整证明，按字节预算与知识变更失效。
+    proof_memory: parking_lot::Mutex<ProofMemory<ResolutionProofView>>,
     // 溯因·假设生成引擎（后向链失败前沿 → 候选假设 → 反事实模拟）
     abduction: AbductionEngine,
     // 话语帧记忆：带洞查询帧 + 挂账（合一式多轮消解，跨会话持久化）

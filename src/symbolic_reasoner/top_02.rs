@@ -39,6 +39,8 @@ impl Clone for SymbolicReasoner {
             attribute_profiles: self.attribute_profiles.clone(),
             associations: self.associations.clone(),
             resolver: self.resolver.clone(),
+            // 证明记忆是会话级缓存：分叉从空记忆开始，不跨会话共享证明。
+            proof_memory: parking_lot::Mutex::new(ProofMemory::with_defaults()),
             abduction: self.abduction.clone(),
             frames: self.frames.clone(),
             pending_questions: self.pending_questions.clone(),

@@ -532,6 +532,8 @@ impl SymbolicReasoner {
             engine.add_clause(clause);
         }
         self.resolver = engine;
+        // 归结事实或规则已变：旧证明的足迹可能不再成立，整体作废。
+        self.proof_memory.lock().clear();
         self.stamp_rebuild("resolver");
     }
 
