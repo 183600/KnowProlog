@@ -135,6 +135,7 @@ pub mod owl_annotation;
 pub mod ownthink_api;
 pub mod path_memory;
 pub mod pattern_closure;
+pub mod pattern_evolution;
 pub mod pattern_forge;
 pub mod pattern_ir;
 pub mod pending_question;
