@@ -765,6 +765,9 @@ pub struct RegisteredClaim {
     pub id: String,
     pub status: ClaimStatus,
     pub created: bool,
+    /// 在原计划中的零基位置；用于回答出处编号，避免被拒命题造成错位。
+    #[serde(default)]
+    pub plan_index: usize,
 }
 
 /// 计划登记结果；被拒绝的命题显式列出，不静默丢弃。
@@ -1641,6 +1644,7 @@ impl ClaimLedger {
                 id,
                 status: record.status,
                 created,
+                plan_index: 0,
             });
         }
 
@@ -1762,6 +1766,7 @@ impl ClaimLedger {
             id,
             status,
             created: true,
+            plan_index: 0,
         })
     }
 
@@ -1774,10 +1779,13 @@ impl ClaimLedger {
     ) -> PlanRegistration {
         let mut claims = Vec::with_capacity(plan.claims.len());
         let mut rejected = Vec::new();
-        for claim in &plan.claims {
+        for (index, claim) in plan.claims.iter().enumerate() {
             let draft = ClaimDraft::from_plan_claim(plan, claim);
             match self.register(draft, turn, revision) {
-                Ok(registered) => claims.push(registered),
+                Ok(mut registered) => {
+                    registered.plan_index = index;
+                    claims.push(registered);
+                }
                 Err(error) => rejected.push(format!("槽位 {}：{}", claim.slot, error)),
             }
         }
@@ -1969,10 +1977,10 @@ impl ClaimLedger {
         let registration = self.register_plan(plan, turn, revision);
         let mut emitted = Vec::new();
         let mut refused = Vec::new();
-        for (index, claim) in registration.claims.iter().enumerate() {
+        for claim in &registration.claims {
             let decision = self.authorize_emission(
                 &claim.id,
-                ClaimOrigin::reply(reply_seq, index as u32 + 1),
+                ClaimOrigin::reply(reply_seq, claim.plan_index as u32 + 1),
                 turn,
                 revision,
                 context,
@@ -2666,6 +2674,28 @@ mod tests {
         assert!(!second.claims[0].created);
         assert_eq!(ledger.len(), 1);
         assert_eq!(ledger.events.len(), 2, "事实登记 + 命题登记，无重复事件");
+    }
+
+    #[test]
+    fn rejected_plan_claim_does_not_shift_reply_origins() {
+        let mut ledger = ClaimLedger::new();
+        let plan = plan_with(vec![
+            PlanClaim::new("s0", "", "缺谓词。", false),
+            claim_with_evidence("s1", "张三是教师。", vec![("张三", "职业", "教师")]),
+        ]);
+        let emission = ledger.emit_plan(&plan, 9, 1, 7, &GateContext::default());
+        assert_eq!(emission.rejected.len(), 1);
+        assert_eq!(emission.emitted.len(), 1);
+        let record = ledger
+            .claim(&emission.emitted[0])
+            .expect("emitted claim should exist");
+        assert!(record.origins.iter().any(|origin| matches!(
+            origin,
+            ClaimOrigin::Reply {
+                reply_seq: 9,
+                index: 2
+            }
+        )));
     }
 
     #[test]
