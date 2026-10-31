@@ -554,15 +554,73 @@ pub fn classify_move(kind: &MoveKind) -> AnswerSchema {
     }
 }
 
-/// 结合上一回合与追问字面做分类。
+/// 短追问的字面上限：超过这个长度视为新问题，避免把含「比较 / 为什么」
+/// 的完整问句误读成上一回合的追问。
+pub const FOLLOWUP_CHAR_LIMIT: usize = 16;
+
+/// 从问句字面提取强图式线索。
 ///
-/// 同一回答回合内的追问（继续 / 依据 / 换说法 / 对比 / 澄清）继承上一图式；
-/// 显式切换话题或没有上一回合时，按本轮话语动作重新分类。
+/// 只在线索足够明确时命中；身份、属性等高频问句交给话语动作分类，避免
+/// 一个「什么」把回顾、定义和澄清混在一起。
+pub fn classify_lexical(input: &str) -> Option<AnswerSchema> {
+    let text = input.trim();
+    if text.is_empty() {
+        return None;
+    }
+    const COMPARISON: [&str; 6] = ["谁更", "比较", "对比", "区别", "差异", "从高到低"];
+    if COMPARISON.iter().any(|marker| text.contains(marker)) {
+        return Some(AnswerSchema::Comparison);
+    }
+    const PROCEDURE: [&str; 5] = ["如何", "步骤", "方法", "怎么做", "怎么操作"];
+    if PROCEDURE.iter().any(|marker| text.contains(marker)) {
+        return Some(AnswerSchema::Procedure);
+    }
+    const ENUMERATION: [&str; 6] = ["列出", "所有", "哪些", "列一下", "列举", "扫描"];
+    if ENUMERATION.iter().any(|marker| text.contains(marker)) {
+        return Some(AnswerSchema::Enumeration);
+    }
+    if text.contains("几个") || text.contains("多少次") || text.contains("多少条") {
+        return Some(AnswerSchema::Count);
+    }
+    const DEFINITION: [&str; 4] = ["什么是", "定义", "概念", "指的是"];
+    if DEFINITION.iter().any(|marker| text.contains(marker)) {
+        return Some(AnswerSchema::Definition);
+    }
+    const EXPLANATION: [&str; 5] = ["为什么", "原因", "原理", "影响", "为何"];
+    if EXPLANATION.iter().any(|marker| text.contains(marker)) {
+        return Some(AnswerSchema::Explanation);
+    }
+    if text.ends_with('吗')
+        || text.ends_with('么')
+        || text.contains("是不是")
+        || text.contains("是否")
+        || text.contains("有没有")
+    {
+        return Some(AnswerSchema::Truth);
+    }
+    None
+}
+
+/// 结合上一回合、追问字面与显式线索做分类。
+///
+/// 同一回答回合内的短追问（继续 / 依据 / 换说法 / 对比 / 澄清）继承上一
+/// 图式；完整问句先看显式线索（对比、步骤、列举、定义、解释、是非），
+/// 再回落到话语动作。没有线索时保持 `Unknown`，把澄清义务显式留下。
 pub fn classify_input(input: &str, kind: &MoveKind, previous: Option<AnswerSchema>) -> AnswerSchema {
-    if let (Some(previous), Some(followup)) = (previous, FollowUpKind::from_input(input)) {
-        if followup.stays_in_episode() {
+    let text = input.trim();
+    let short_followup = text.chars().count() <= FOLLOWUP_CHAR_LIMIT;
+    let lexical = classify_lexical(input);
+    if let (true, Some(previous), Some(followup)) =
+        (short_followup, previous, FollowUpKind::from_input(input))
+    {
+        let explicit_comparison =
+            matches!(lexical, Some(AnswerSchema::Comparison)) && text.chars().count() > 5;
+        if followup.stays_in_episode() && !explicit_comparison {
             return previous;
         }
+    }
+    if let Some(schema) = lexical {
+        return schema;
     }
     match kind {
         MoveKind::ContinueRequest | MoveKind::ElaborateRequest => {
@@ -1042,6 +1100,57 @@ mod tests {
         assert_eq!(second.subject.as_deref(), Some("姚明"));
         assert_eq!(second.turns, 2);
         assert_eq!(second.missing, vec![Obligation::Answer, Obligation::Evidence]);
+    }
+
+    #[test]
+    fn lexical_cues_choose_the_schema_without_waiting_for_the_move() {
+        assert_eq!(
+            classify_lexical("比较姚明和叶莉的身高"),
+            Some(AnswerSchema::Comparison)
+        );
+        assert_eq!(
+            classify_lexical("列出所有人的身高"),
+            Some(AnswerSchema::Enumeration)
+        );
+        assert_eq!(
+            classify_lexical("知识图谱的定义是什么"),
+            Some(AnswerSchema::Definition)
+        );
+        assert_eq!(
+            classify_lexical("姚明是不是很高"),
+            Some(AnswerSchema::Truth)
+        );
+        assert_eq!(classify_lexical("姚明的身高是多少"), None);
+        assert_eq!(
+            classify_input("列出所有人的身高", &MoveKind::Other, None),
+            AnswerSchema::Enumeration
+        );
+    }
+
+    #[test]
+    fn explicit_comparison_breaks_out_of_an_attribute_episode() {
+        let ask = MoveKind::AskAttribute;
+        let plan = vec!["direct_answer".to_string()];
+        let evidence = vec!["图谱 姚明 身高 226".to_string()];
+        let first = AnswerEpisode::observe(
+            &observation(
+                "姚明的身高是多少",
+                &ask,
+                Some("姚明"),
+                Some("226 厘米"),
+                &evidence,
+                &plan,
+            ),
+            None,
+        );
+        assert_eq!(
+            classify_input("比较姚明和叶莉的身高", &ask, Some(first.schema)),
+            AnswerSchema::Comparison
+        );
+        assert_eq!(
+            classify_input("比较一下", &ask, Some(first.schema)),
+            AnswerSchema::Attribute
+        );
     }
 
     #[test]
