@@ -2517,9 +2517,9 @@ impl ClaimLedger {
         }
 
         if let Some(expected) = expected_emissions {
-            if emitted < expected {
+            if emitted != expected {
                 unknown_reasons.insert(format!(
-                    "可核对已说命题 {} 条，少于预期 {} 条",
+                    "可核对已说命题 {} 条，与预期 {} 条不一致",
                     emitted, expected
                 ));
             }
@@ -3039,6 +3039,11 @@ mod tests {
         assert_eq!(report.verdict, AuditVerdict::Clean);
         assert_eq!(report.emitted, 1);
         assert_eq!(report.ungrounded, 0);
+        assert_eq!(
+            ledger.audit(Some(0), &AuditOptions::default()).verdict,
+            AuditVerdict::Unknown,
+            "多出的已说命题同样应触发未知"
+        );
 
         let ungrounded = ledger
             .register(
