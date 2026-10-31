@@ -1029,6 +1029,7 @@ fn run_claim_ledger(
     retire_claims: &[String],
     supersessions: &[String],
     stale_claims: &[String],
+    revalidate_claims: &[String],
     retire_kind: &str,
     reason: &str,
     impact_facts: &[String],
@@ -1161,6 +1162,19 @@ fn run_claim_ledger(
         dirty = true;
     }
 
+    let mut revalidated = Vec::new();
+    for id in revalidate_claims {
+        let id = id.trim();
+        match ledger.revalidate(id, turn, revision) {
+            Ok(status) => revalidated.push((id.to_string(), status.code())),
+            Err(error) => {
+                eprintln!("复核命题失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+        dirty = true;
+    }
+
     let mut claim_impacts = Vec::new();
     for id in retire_claims {
         let id = id.trim();
@@ -1245,6 +1259,12 @@ fn run_claim_ledger(
                 serde_json::to_value(&staled).unwrap_or(serde_json::Value::Null),
             );
         }
+        if !revalidated.is_empty() {
+            object.insert(
+                "revalidated".to_string(),
+                serde_json::to_value(&revalidated).unwrap_or(serde_json::Value::Null),
+            );
+        }
         if !claim_impacts.is_empty() {
             object.insert(
                 "claim_impacts".to_string(),
@@ -1292,6 +1312,9 @@ fn run_claim_ledger(
         }
         for id in &staled {
             println!("命题 {} 已标记为待复核（{}）。", id, reason);
+        }
+        for (id, status) in &revalidated {
+            println!("命题 {} 复核通过（{}）。", id, status);
         }
         for impact in &claim_impacts {
             println!("{}", impact.render_zh());

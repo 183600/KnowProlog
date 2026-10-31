@@ -1744,6 +1744,9 @@ enum Commands {
         /// Mark a claim as needing revalidation without retiring it (repeatable)
         #[arg(long = "stale-claim", value_name = "CLAIM_ID")]
         stale_claim: Vec<String>,
+        /// Revalidate a stale claim; refuses terminal or still-unsupported claims
+        #[arg(long = "revalidate-claim", value_name = "CLAIM_ID")]
+        revalidate_claim: Vec<String>,
         /// Retirement kind: retracted / superseded / expired / redacted
         #[arg(long, default_value = "retracted")]
         retire_kind: String,
