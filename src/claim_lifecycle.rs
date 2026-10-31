@@ -2003,10 +2003,17 @@ impl ClaimLedger {
         let Some(record) = self.claims.get_mut(id) else {
             return false;
         };
-        if record.status.is_terminal() {
-            return false;
-        }
         let from = record.status;
+        if from.is_terminal() {
+            let current_rank = record
+                .retirement
+                .as_ref()
+                .map(|retirement| retirement.kind.rank())
+                .unwrap_or(0);
+            if kind.rank() <= current_rank {
+                return false;
+            }
+        }
         let next = ClaimStatus::from_retirement(kind);
         let seq = self.events.len() as u64 + 1;
         record.status = next;
@@ -2050,12 +2057,22 @@ impl ClaimLedger {
             )));
         };
         self.ensure_fact(fact, turn, revision);
-        let already = self
+        let (already, from, current_rank) = self
             .facts
             .get(&fact.key())
-            .map(|record| record.status.is_terminal())
-            .unwrap_or(false);
-        if !already {
+            .map(|record| {
+                (
+                    record.status.is_terminal(),
+                    record.status,
+                    record
+                        .retirement
+                        .as_ref()
+                        .map(|retirement| retirement.kind.rank())
+                        .unwrap_or(0),
+                )
+            })
+            .unwrap_or((false, FactStatus::Alive, 0));
+        if !already || kind.rank() > current_rank {
             let seq = self.events.len() as u64 + 1;
             if let Some(record) = self.facts.get_mut(&fact.key()) {
                 record.status = status;
@@ -2071,7 +2088,7 @@ impl ClaimLedger {
             self.append_event(
                 ClaimEventKind::FactRetired,
                 ClaimEventTarget::fact(fact),
-                Some(FactStatus::Alive.code()),
+                Some(from.code()),
                 Some(status.code()),
                 reason,
                 turn,
@@ -2718,6 +2735,66 @@ mod tests {
             .findings
             .iter()
             .any(|finding| finding.code == GateFindingCode::ClaimRetired));
+    }
+
+    #[test]
+    fn stronger_retirement_upgrades_facts_claims_and_descendants() {
+        let mut ledger = ClaimLedger::new();
+        let root = fact("王五", "住址", "旧地址");
+        let parent = ledger
+            .register(
+                draft(
+                    "王五",
+                    "住址",
+                    "s1",
+                    "王五住在旧地址。",
+                    vec![ClaimSupport::fact(&root)],
+                ),
+                1,
+                1,
+            )
+            .unwrap();
+        let child = ledger
+            .register(
+                draft(
+                    "王五",
+                    "通勤",
+                    "s2",
+                    "王五通勤距离很短。",
+                    vec![ClaimSupport::claim(&parent.id)],
+                ),
+                2,
+                1,
+            )
+            .unwrap();
+
+        ledger
+            .retire_fact(&root, RetirementKind::Expired, "超过有效期", 3, 2)
+            .unwrap();
+        assert_eq!(ledger.fact(&root).unwrap().status, FactStatus::Expired);
+
+        ledger
+            .retire_fact(&root, RetirementKind::Redacted, "用户遗忘", 4, 3)
+            .unwrap();
+        assert_eq!(ledger.fact(&root).unwrap().status, FactStatus::Redacted);
+        assert_eq!(
+            ledger.claim(&parent.id).unwrap().status,
+            ClaimStatus::Redacted
+        );
+        assert_eq!(
+            ledger.claim(&child.id).unwrap().status,
+            ClaimStatus::Redacted
+        );
+
+        ledger
+            .retire_fact(&root, RetirementKind::Retracted, "来源撤回", 5, 4)
+            .unwrap();
+        assert_eq!(ledger.fact(&root).unwrap().status, FactStatus::Redacted);
+        assert_eq!(
+            ledger.claim(&parent.id).unwrap().status,
+            ClaimStatus::Redacted
+        );
+        assert!(ledger.verify_chain(None).intact);
     }
 
     #[test]
