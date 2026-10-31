@@ -1535,6 +1535,107 @@ impl ClaimLedger {
     pub fn claim(&self, id: &str) -> Option<&ClaimRecord> {
         self.claims.get(id)
     }
+    /// 会话内 claim 台账的文本视图：确定性审计 + 最近更新的断言。
+    pub fn render_report(&self) -> String {
+        let mut output = self
+            .audit(None, &AuditOptions::default())
+            .render_zh();
+        if self.claims.is_empty() {
+            return output;
+        }
+        let mut recent = self.claims.values().collect::<Vec<_>>();
+        recent.sort_by(|left, right| {
+            right
+                .updated_seq
+                .cmp(&left.updated_seq)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        output.push_str(&format!(
+            "\n最近断言（共 {} 条，按更新时间）：",
+            self.claims.len()
+        ));
+        for record in recent.into_iter().take(8) {
+            output.push_str(&format!(
+                "\n  {} [{}] {} / {} / {}",
+                record.id,
+                record.status.label_zh(),
+                record.shape.subject,
+                record.shape.predicate,
+                record.shape.structure
+            ));
+            if let Some(retirement) = &record.retirement {
+                output.push_str(&format!(
+                    "（{}：{}）",
+                    retirement.kind.label_zh(),
+                    retirement.reason
+                ));
+            }
+        }
+        output
+    }
+
+    /// 单条断言的完整解释：状态、结构、支撑、出处、退役原因与反向影响。
+    pub fn explain(&self, id: &str) -> Result<String, ClaimError> {
+        let record = self
+            .claims
+            .get(id)
+            .ok_or_else(|| ClaimError::UnknownClaim(id.to_string()))?;
+        let mut output = format!(
+            "断言 {}：{}（{}）\n  结构：{} / {} / {}{}\n  轮次 {}..{} / 知识版本 v{}\n  曾说：{}",
+            record.id,
+            record.status.label_zh(),
+            record.status.code(),
+            record.shape.subject,
+            record.shape.predicate,
+            record.shape.structure,
+            if record.shape.session { " / 会话" } else { "" },
+            record.first_turn,
+            record.last_turn,
+            record.revision,
+            if record.ever_emitted { "是" } else { "否" }
+        );
+        output.push_str("\n  支撑：");
+        if record.support.is_empty() {
+            output.push_str("（无）");
+        }
+        for support in &record.support {
+            output.push_str("\n    ");
+            output.push_str(&support.render());
+        }
+        output.push_str("\n  出处：");
+        if record.origins.is_empty() {
+            output.push_str("（无）");
+        }
+        for origin in &record.origins {
+            output.push_str("\n    ");
+            output.push_str(&origin.render());
+        }
+        if let Some(retirement) = &record.retirement {
+            let cause = match &retirement.cause {
+                RetirementCause::Fact { fact } => format!("事实 {}", fact.render()),
+                RetirementCause::Parent { claim_id } => format!("父断言 {}", claim_id),
+                RetirementCause::Manual => "手工".to_string(),
+            };
+            output.push_str(&format!(
+                "\n  退役：{}（{}）/ 轮次 {} / 事件 #{} / 原因：{}",
+                retirement.kind.label_zh(),
+                cause,
+                retirement.turn,
+                retirement.seq,
+                retirement.reason
+            ));
+        }
+        let impact = self.impact_of_claim(id);
+        if !impact.plans.is_empty() || !impact.replies.is_empty() {
+            output.push_str(&format!(
+                "\n  影响计划：{} / 影响回答：{}",
+                impact.plans.len(),
+                impact.replies.len()
+            ));
+        }
+        Ok(output)
+    }
+
     /// 已遗忘事实中的可扫描明文（主语与宾语）；谓词是结构标签，不参与扫描。
     ///
     /// 账本不保存 claim 原文，因此这里只回放事实层明文。调用方应把它与
@@ -4124,6 +4225,47 @@ mod tests {
             ClaimStatus::Expired
         );
         assert!(rebuilt.verify_chain(None).intact);
+    }
+
+    #[test]
+    fn explain_and_report_surface_support_origins_and_retirement() {
+        let mut ledger = ClaimLedger::new();
+        let fact_key = fact("吴四十", "职业", "厨师");
+        let registered = ledger
+            .register(
+                draft(
+                    "吴四十",
+                    "职业",
+                    "s1",
+                    "吴四十是厨师。",
+                    vec![ClaimSupport::fact(&fact_key)],
+                )
+                .with_origin(ClaimOrigin::reply(9, 1)),
+                1,
+                1,
+            )
+            .unwrap();
+        ledger
+            .retire_claim(
+                &registered.id,
+                RetirementKind::Retracted,
+                "用户否认",
+                2,
+                2,
+            )
+            .unwrap();
+        let detail = ledger.explain(&registered.id).unwrap();
+        assert!(detail.contains("已撤回"), "{}", detail);
+        assert!(detail.contains(&fact_key.render()), "{}", detail);
+        assert!(detail.contains("回答 #9 / 第 1 句"), "{}", detail);
+        assert!(detail.contains("用户否认"), "{}", detail);
+        let report = ledger.render_report();
+        assert!(report.contains("最近断言"), "{}", report);
+        assert!(report.contains(&registered.id), "{}", report);
+        assert_eq!(
+            ledger.explain("不存在"),
+            Err(ClaimError::UnknownClaim("不存在".to_string()))
+        );
     }
 
     #[test]

@@ -293,6 +293,10 @@ mod session_tests {
             "计划复核",
             "核对计划",
             "检查计划",
+            "claim台账",
+            "claim：abc",
+            "撤回claim：abc",
+            "复核claim：abc",
         ] {
             assert!(is_command_like(input), "计划命令不应被当成短答：{}", input);
         }
@@ -1161,6 +1165,10 @@ mod session_tests {
             "简短点",
             "回答计划",
             "复核计划",
+            "claim台账",
+            "claim：<id>",
+            "撤回claim：<id>",
+            "复核claim：<id>",
             "对话工件",
             "工件：",
             "帮助",

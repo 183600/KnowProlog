@@ -337,6 +337,32 @@ impl SymbolicReasoner {
         &self.claims
     }
 
+    /// 会话 claim 台账的文本视图。
+    pub fn claim_ledger_report(&self) -> String {
+        self.claims.render_report()
+    }
+
+    /// 单条 claim 的完整解释。
+    pub fn claim_explain(
+        &self,
+        id: &str,
+    ) -> Result<String, crate::claim_lifecycle::ClaimError> {
+        self.claims.explain(id)
+    }
+
+    /// 撤回一条生成断言（手动来源），返回反向影响面。
+    pub fn retract_generation_claim(
+        &mut self,
+        id: &str,
+        reason: &str,
+    ) -> Result<crate::claim_lifecycle::Impact, crate::claim_lifecycle::ClaimError> {
+        self.retire_generation_claim(
+            id,
+            crate::claim_lifecycle::RetirementKind::Retracted,
+            reason,
+        )
+    }
+
     /// 退役生成路径依赖的事实，并沿支撑谱系传播到相关断言。
     pub fn retire_generation_fact(
         &mut self,

@@ -114,6 +114,73 @@
             continue;
         }
 
+        // 生成断言的 claim 生命周期：审计、单条解释、撤回与复核。
+        if matches!(
+            input,
+            "claim台账" | "claim-ledger" | "命题台账" | "生成断言台账"
+        ) {
+            println!("{}", symbolic_reasoner.claim_ledger_report());
+            println!();
+            continue;
+        }
+        if let Some(id) = strip_any_prefix(
+            input,
+            &["claim：", "claim:", "命题详情：", "命题详情:"],
+        ) {
+            let id = id.trim();
+            if id.is_empty() {
+                println!("请提供断言 id，例如：claim：<id>");
+            } else {
+                match symbolic_reasoner.claim_explain(id) {
+                    Ok(text) => println!("{}", text),
+                    Err(error) => println!("查看断言失败：{}", error),
+                }
+            }
+            println!();
+            continue;
+        }
+        if let Some(rest) = strip_any_prefix(
+            input,
+            &["撤回claim：", "撤回claim:", "撤回断言：", "撤回断言:"],
+        ) {
+            let (id, reason) = rest
+                .trim()
+                .split_once(' ')
+                .map(|(id, reason)| (id.trim(), reason.trim()))
+                .unwrap_or((rest.trim(), ""));
+            if id.is_empty() {
+                println!("请提供断言 id，例如：撤回claim：<id>");
+            } else {
+                let reason = if reason.is_empty() {
+                    "会话内手动撤回"
+                } else {
+                    reason
+                };
+                match symbolic_reasoner.retract_generation_claim(id, reason) {
+                    Ok(impact) => println!("{}", impact.render_zh()),
+                    Err(error) => println!("撤回断言失败：{}", error),
+                }
+            }
+            println!();
+            continue;
+        }
+        if let Some(id) = strip_any_prefix(
+            input,
+            &["复核claim：", "复核claim:", "复核断言：", "复核断言:"],
+        ) {
+            let id = id.trim();
+            if id.is_empty() {
+                println!("请提供断言 id，例如：复核claim：<id>");
+            } else {
+                match symbolic_reasoner.revalidate_generation_claim(id) {
+                    Ok(status) => println!("断言已复核为「{}」。", status.label_zh()),
+                    Err(error) => println!("复核断言失败：{}", error),
+                }
+            }
+            println!();
+            continue;
+        }
+
         // 回答计划复核：用当前知识重建同一实体计划并逐点对照，不改写旧回答。
         if matches!(input, "复核计划" | "计划复核" | "核对计划" | "检查计划") {
             println!("{}", symbolic_reasoner.review_generation_plan());

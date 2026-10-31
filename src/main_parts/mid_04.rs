@@ -89,6 +89,93 @@ async fn run_ask(
         }
         if matches!(
             question.as_str(),
+            "claim台账" | "claim-ledger" | "命题台账" | "生成断言台账"
+        ) {
+            reasoner.clear_pending_awaiting();
+            answers.push(AskAnswer {
+                question,
+                status: "answered",
+                answer: Some(reasoner.claim_ledger_report()),
+                derivation: None,
+            });
+            continue;
+        }
+        if let Some(id) = strip_any_prefix(
+            &question,
+            &["claim：", "claim:", "命题详情：", "命题详情:"],
+        ) {
+            reasoner.clear_pending_awaiting();
+            let id = id.trim();
+            let answer = if id.is_empty() {
+                "请提供断言 id，例如：claim：<id>".to_string()
+            } else {
+                reasoner
+                    .claim_explain(id)
+                    .unwrap_or_else(|error| format!("查看断言失败：{}", error))
+            };
+            answers.push(AskAnswer {
+                question,
+                status: "answered",
+                answer: Some(answer),
+                derivation: None,
+            });
+            continue;
+        }
+        if let Some(rest) = strip_any_prefix(
+            &question,
+            &["撤回claim：", "撤回claim:", "撤回断言：", "撤回断言:"],
+        ) {
+            reasoner.clear_pending_awaiting();
+            let (id, reason) = rest
+                .trim()
+                .split_once(' ')
+                .map(|(id, reason)| (id.trim(), reason.trim()))
+                .unwrap_or((rest.trim(), ""));
+            let answer = if id.is_empty() {
+                "请提供断言 id，例如：撤回claim：<id>".to_string()
+            } else {
+                let reason = if reason.is_empty() {
+                    "会话内手动撤回"
+                } else {
+                    reason
+                };
+                reasoner
+                    .retract_generation_claim(id, reason)
+                    .map(|impact| impact.render_zh())
+                    .unwrap_or_else(|error| format!("撤回断言失败：{}", error))
+            };
+            answers.push(AskAnswer {
+                question,
+                status: "answered",
+                answer: Some(answer),
+                derivation: None,
+            });
+            continue;
+        }
+        if let Some(id) = strip_any_prefix(
+            &question,
+            &["复核claim：", "复核claim:", "复核断言：", "复核断言:"],
+        ) {
+            reasoner.clear_pending_awaiting();
+            let id = id.trim();
+            let answer = if id.is_empty() {
+                "请提供断言 id，例如：复核claim：<id>".to_string()
+            } else {
+                match reasoner.revalidate_generation_claim(id) {
+                    Ok(status) => format!("断言已复核为「{}」。", status.label_zh()),
+                    Err(error) => format!("复核断言失败：{}", error),
+                }
+            };
+            answers.push(AskAnswer {
+                question,
+                status: "answered",
+                answer: Some(answer),
+                derivation: None,
+            });
+            continue;
+        }
+        if matches!(
+            question.as_str(),
             "复核计划" | "计划复核" | "核对计划" | "检查计划"
         ) {
             reasoner.clear_pending_awaiting();
