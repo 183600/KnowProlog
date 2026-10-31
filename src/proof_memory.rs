@@ -23,6 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::context_image::fnv1a_hex;
 use crate::delta_cache::DeltaFootprint;
 
 /// 证明记忆格式版本。
@@ -770,7 +771,11 @@ pub fn canonical_key(text: &str) -> String {
         }
     }
     if key.chars().count() > MAX_KEY_CHARS {
-        key = key.chars().take(MAX_KEY_CHARS).collect();
+        let digest = fnv1a_hex(key.as_bytes());
+        let mut bounded: String = key.chars().take(MAX_KEY_CHARS).collect();
+        bounded.push('#');
+        bounded.push_str(&digest);
+        return bounded;
     }
     key
 }
@@ -778,7 +783,8 @@ pub fn canonical_key(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::delta_cache::DeltaFootprint;
+    use crate::context_image::fnv1a_hex;
+use crate::delta_cache::DeltaFootprint;
     use crate::prolog_engine::PrologFact;
     use crate::resolution_engine::SearchStats;
 
@@ -803,7 +809,10 @@ mod tests {
         assert_eq!(canonical_key("  张三的师傅是谁？ "), "张三的师傅是谁");
         assert_eq!(canonical_key("a \t b。"), "a b");
         let long = "字".repeat(MAX_KEY_CHARS + 8);
-        assert_eq!(canonical_key(&long).chars().count(), MAX_KEY_CHARS);
+        let bounded = canonical_key(&long);
+        assert!(bounded.starts_with(&"字".repeat(MAX_KEY_CHARS)));
+        assert!(bounded.contains('#'));
+        assert_ne!(canonical_key(&format!("{}甲", long)), canonical_key(&format!("{}乙", long)));
     }
 
     #[test]
