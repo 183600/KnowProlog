@@ -68,6 +68,7 @@ pub enum IdentityKind {
     Correction,
     Binding,
     Explicit,
+    Structural,
 }
 
 impl IdentityKind {
@@ -90,6 +91,7 @@ impl IdentityKind {
             IdentityKind::Correction => "用户更正",
             IdentityKind::Binding => "语境绑定",
             IdentityKind::Explicit => "显式指称",
+            IdentityKind::Structural => "结构对齐",
         }
     }
 

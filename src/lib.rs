@@ -94,6 +94,7 @@ pub mod function_words;
 pub mod fusion_arbitration;
 pub mod grammar_extractor;
 pub mod graph_diagnosis;
+pub mod graph_identity;
 pub mod graph_ledger;
 pub mod graph_question;
 pub mod graph_repair;
