@@ -850,6 +850,36 @@ impl AnswerEpisode {
         }
     }
 
+    /// 用本轮实际回答文本推进回合。
+    ///
+    /// 生成管线并不总把最终文本写回 `DialogueTurn.answer_excerpt`（例如续聊
+    /// 轮只记录策略层的原始答案），因此回执应以实际回复为准。本函数不写任何
+    /// 会话状态，只在只读投影上合并本轮观察。
+    #[allow(clippy::too_many_arguments)]
+    pub fn observe_reply(
+        previous: Option<&Self>,
+        question: &str,
+        kind: &MoveKind,
+        subject: Option<&str>,
+        predicate: Option<&str>,
+        plan: &[String],
+        reply: &str,
+        evidence: &[String],
+        revision: u64,
+    ) -> Self {
+        let observation = EpisodeObservation {
+            question,
+            kind,
+            subject,
+            predicate,
+            plan,
+            answer: Some(reply),
+            evidence,
+            revision,
+        };
+        Self::observe(&observation, previous)
+    }
+
     /// 当前回合是否已无必需槽位欠账。
     pub fn is_closed(&self) -> bool {
         self.missing.is_empty()

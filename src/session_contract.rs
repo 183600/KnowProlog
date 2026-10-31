@@ -127,6 +127,15 @@ pub struct ReceiptExpectation {
     /// 回答必须引用的词条（逐字匹配）。
     #[serde(default)]
     pub quoted_contains: Vec<String>,
+    /// 本轮回答回合的图式（`AnswerSchema::label`）。
+    #[serde(default)]
+    pub answer_schema: Option<String>,
+    /// 回答回合仍欠的槽位（`Obligation::label`）。
+    #[serde(default)]
+    pub missing_obligations_contains: Vec<String>,
+    /// 回答回合是否已无必需槽位欠账。
+    #[serde(default)]
+    pub episode_closed: Option<bool>,
     /// 本轮回执摘要锁。
     #[serde(default)]
     pub digest: Option<String>,
@@ -152,6 +161,12 @@ pub struct TurnReceipt {
     /// 无法在知识源中回溯的引号词条（空 = 全部接地）。
     #[serde(default)]
     pub ungrounded_terms: Vec<String>,
+    /// 本轮回答回合的图式；无法分类时为空。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub answer_schema: String,
+    /// 回答回合仍欠的必需槽位（去重、有界、稳定排序）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_obligations: Vec<String>,
     pub answer_excerpt: String,
     pub answer_digest: String,
     pub state_digest: String,
@@ -419,6 +434,9 @@ fn capture_turn(
     let focus_before = manager.focus_entity().map(str::to_string);
     let frame = manager.analyze(input, knowledge);
     let turns_before = manager.turns().len();
+    let previous_episode = crate::answer_taxonomy::AnswerEpisode::from_turns(
+        &manager.turns()[..turns_before],
+    );
     let reply = manager
         .plan_pure_dialogue(input, knowledge)
         .or_else(|| manager.plan_reply(input, knowledge));
@@ -454,6 +472,47 @@ fn capture_turn(
         .cloned()
         .collect();
     let state_digest = canonical_digest(&manager.snapshot()).unwrap_or_default();
+    let last_turn = appended
+        .then(|| manager.turns().last())
+        .flatten();
+    let episode = reply.as_ref().map(|reply| {
+        crate::answer_taxonomy::AnswerEpisode::observe_reply(
+            previous_episode.as_ref(),
+            input,
+            &frame.kind,
+            last_turn
+                .and_then(|turn| turn.entity.as_deref())
+                .or(frame.entity.as_deref())
+                .or_else(|| manager.focus_entity()),
+            last_turn
+                .and_then(|turn| turn.attribute.as_deref())
+                .or(frame.attribute.as_deref()),
+            &reply.plan,
+            &reply.text,
+            last_turn
+                .map(|turn| turn.provenance.as_slice())
+                .unwrap_or(&[]),
+            last_turn
+                .and_then(|turn| turn.kb_revision)
+                .unwrap_or_else(|| knowledge.revision()),
+        )
+    });
+    let answer_schema = episode
+        .as_ref()
+        .map(|episode| episode.schema.label().to_string())
+        .unwrap_or_default();
+    let missing_obligations = episode
+        .as_ref()
+        .map(|episode| {
+            bounded_tokens(
+                episode
+                    .missing
+                    .iter()
+                    .map(|obligation| obligation.label().to_string())
+                    .collect(),
+            )
+        })
+        .unwrap_or_default();
     let reply_kind = reply
         .as_ref()
         .map(|reply| reply.kind.label().to_string())
@@ -472,6 +531,8 @@ fn capture_turn(
         gaps: gaps_for(reply.as_ref(), &plan),
         quoted_terms: bounded_tokens(quoted),
         ungrounded_terms: bounded_tokens(ungrounded),
+        answer_schema,
+        missing_obligations,
         answer_excerpt: excerpt(&answer, 80),
         answer_digest,
         state_digest,
@@ -613,6 +674,36 @@ fn check_expectations(
             failures.push(format!(
                 "回答未引用「{}」（引号词条 {:?}）",
                 needle, receipt.quoted_terms
+            ));
+        }
+    }
+    if let Some(expected) = expect.answer_schema.as_deref() {
+        if expected != receipt.answer_schema {
+            failures.push(format!(
+                "期望回答图式「{}」，实际「{}」",
+                expected, receipt.answer_schema
+            ));
+        }
+    }
+    for needle in &expect.missing_obligations_contains {
+        if !receipt
+            .missing_obligations
+            .iter()
+            .any(|obligation| obligation == needle)
+        {
+            failures.push(format!(
+                "回答回合未欠「{}」（实际 {:?}）",
+                needle, receipt.missing_obligations
+            ));
+        }
+    }
+    if let Some(expected) = expect.episode_closed {
+        let actual = receipt.missing_obligations.is_empty();
+        if expected != actual {
+            failures.push(format!(
+                "期望回答回合{}，实际欠 {:?}",
+                if expected { "已闭合" } else { "未闭合" },
+                receipt.missing_obligations
             ));
         }
     }
@@ -806,6 +897,18 @@ fn compare_receipts(baseline: &TurnReceipt, current: &TurnReceipt) -> Vec<String
         &baseline.ungrounded_terms,
         &current.ungrounded_terms,
     ));
+    if baseline.answer_schema != current.answer_schema {
+        changes.push(format!(
+            "回答图式 {} → {}",
+            schema_label(&baseline.answer_schema),
+            schema_label(&current.answer_schema)
+        ));
+    }
+    changes.extend(compare_tokens(
+        "回合欠账",
+        &baseline.missing_obligations,
+        &current.missing_obligations,
+    ));
     if baseline.answer_digest != current.answer_digest {
         changes.push(format!(
             "回答 {} → {}",
@@ -845,6 +948,14 @@ fn compare_tokens(label: &str, baseline: &[String], current: &[String]) -> Vec<S
 
 fn focus_label(focus: Option<&str>) -> &str {
     focus.unwrap_or("（空）")
+}
+
+fn schema_label(schema: &str) -> &str {
+    if schema.is_empty() {
+        "（未分类）"
+    } else {
+        schema
+    }
 }
 
 fn reports_digest(reports: &[SessionReport]) -> String {
@@ -906,6 +1017,8 @@ fn receipt_digest(receipt: &TurnReceipt) -> String {
         gaps: &'a [String],
         quoted_terms: &'a [String],
         ungrounded_terms: &'a [String],
+        answer_schema: &'a str,
+        missing_obligations: &'a [String],
         answer_excerpt: &'a str,
         answer_digest: &'a str,
         state_digest: &'a str,
@@ -924,6 +1037,8 @@ fn receipt_digest(receipt: &TurnReceipt) -> String {
         gaps: &receipt.gaps,
         quoted_terms: &receipt.quoted_terms,
         ungrounded_terms: &receipt.ungrounded_terms,
+        answer_schema: &receipt.answer_schema,
+        missing_obligations: &receipt.missing_obligations,
         answer_excerpt: &receipt.answer_excerpt,
         answer_digest: &receipt.answer_digest,
         state_digest: &receipt.state_digest,
@@ -1268,6 +1383,8 @@ input = "姚明的身高是多少"
             gaps: vec!["unhandled".to_string()],
             quoted_terms: Vec::new(),
             ungrounded_terms: Vec::new(),
+            answer_schema: String::new(),
+            missing_obligations: Vec::new(),
             answer_excerpt: excerpt(&long, 80),
             answer_digest: canonical_digest(&long).unwrap(),
             state_digest: String::new(),
