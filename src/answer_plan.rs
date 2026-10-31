@@ -1389,6 +1389,13 @@ const BUDGET_PREFIXES: &[&str] = &[
 fn parse_budget(text: &str, explicit: bool) -> Option<usize> {
     let mut body = text.trim();
     let mut explicit = explicit;
+    for prefix in ["回答字数", "回答字符数", "字数", "字符数"] {
+        if let Some(rest) = body.strip_prefix(prefix) {
+            body = rest.trim();
+            explicit = true;
+            break;
+        }
+    }
     for prefix in ["控制在", "不超过", "最多", "限制在", "限制为", "限制", "限"] {
         if let Some(rest) = body.strip_prefix(prefix) {
             body = rest.trim();
@@ -1850,6 +1857,8 @@ mod tests {
             ("控制在 45 字", StyleDirective::Budget(45)),
             ("最多30字", StyleDirective::Budget(30)),
             ("120字以内", StyleDirective::Budget(120)),
+            ("字数不超过100字", StyleDirective::Budget(100)),
+            ("回答字数不超过90字", StyleDirective::Budget(90)),
         ] {
             assert_eq!(
                 StyleDirective::parse(input),

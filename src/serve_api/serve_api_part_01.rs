@@ -330,6 +330,8 @@ fn parse_generation_request(input: &str) -> Option<&str> {
         "介绍:",
         "介绍一下",
         "生成介绍",
+        "讲讲",
+        "说说",
     ] {
         if let Some(rest) = input.strip_prefix(prefix) {
             let entity = rest

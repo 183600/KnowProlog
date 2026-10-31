@@ -573,6 +573,10 @@
             "{}",
             budgeted.render_text()
         );
+
+        let word_count = SessionPolicy::from_system_texts(&["回答字数不超过90字".to_string()]);
+        assert_eq!(word_count.max_answer_chars, Some(90));
+        assert!(word_count.recognized.contains(&"budget:90".to_string()));
     }
 
     #[tokio::test]

@@ -482,6 +482,13 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         assert_eq!(ledger.source, "belief_ledger", "{}", ledger.reply);
         assert!(!ledger.reply.is_empty(), "信念账本不应为空输出");
 
+        let spoken = state
+            .take_turn(&session_id, "说说叶莉")
+            .await
+            .expect("口语化生成命令应成功");
+        assert_eq!(spoken.source, "generation", "{}", spoken.reply);
+        assert!(spoken.reply.contains("叶莉"), "{}", spoken.reply);
+
         let policy = SessionPolicy::from_system_texts(&["回答控制在80字以内".to_string()]);
         let capped = state
             .take_turn_with_policy(&session_id, "介绍：叶莉", Some(&policy))
