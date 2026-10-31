@@ -134,7 +134,7 @@ impl SimilarityCalculator {
             for synonym in &concept.synonyms {
                 synonym_dict
                     .entry(synonym.clone())
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(concept_name.clone());
             }
 
@@ -331,7 +331,7 @@ impl SimilarityCalculator {
             *tf_map.entry(*word).or_insert(0.0) += 1.0;
         }
 
-        for (_, tf) in tf_map.iter_mut() {
+        for tf in tf_map.values_mut() {
             *tf /= total_words;
         }
 
@@ -609,7 +609,7 @@ impl SimilarityCalculator {
         for synonym in &concept.synonyms {
             synonym_dict
                 .entry(synonym.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(concept_name.clone());
         }
 

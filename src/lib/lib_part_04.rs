@@ -756,11 +756,13 @@ impl OxigraphManager {
         })
     }
 }
+/// 从原始问句中提取查询实体：先分词，再复用已标注结果。
 pub fn extract_query_entities(query: &str, config: &SystemConfig) -> Vec<String> {
     let tagged_words = preprocess(query, &config.nlp);
     extract_query_entities_from_tagged(&tagged_words, config)
 }
-/// 使用已分词结果提取查询实体
+
+/// 从已分词结果中提取查询实体，按首次出现顺序去重并应用同义词归一。
 pub fn extract_query_entities_from_tagged(
     tagged_words: &[TaggedWord],
     config: &SystemConfig,
@@ -795,6 +797,10 @@ pub fn extract_query_entities_from_tagged(
     entities.retain(|e| e.len() > 1 && seen.insert(e.clone()));
     entities
 }
+/// 把 Prolog 绑定结果渲染成面向用户的中文回答。
+///
+/// 配置目前只用于保持构造签名稳定；渲染本身按 `query_type` 选择措辞，
+/// 不读取会话状态，因此同一组绑定总能得到同一段文本。
 pub struct ResponseFormatter {
     _config: Arc<SystemConfig>,
 }
@@ -803,14 +809,24 @@ impl ResponseFormatter {
         Self { _config: config }
     }
 
-    /// 取首个结果集中指定变量的绑定值（Prolog 变量名为首字母大写）。
-    fn result_value<'a>(
-        results: &'a [HashMap<String, String>],
+    /// 渲染首个结果行中的指定变量；变量缺失时返回给定文案。
+    ///
+    /// 所有单值查询共用这一条路径，缺失文案与格式化闭包由调用方提供，
+    /// 避免每个 `query_type` 各自重复「取值 / 兜底 / 格式化」三步。
+    fn render_field(
+        results: &[HashMap<String, String>],
         variable: &str,
-    ) -> Option<&'a String> {
-        results[0].get(variable)
+        missing: &str,
+        render: impl FnOnce(&str) -> String,
+    ) -> String {
+        results
+            .first()
+            .and_then(|row| row.get(variable))
+            .map(|value| render(value))
+            .unwrap_or_else(|| missing.to_string())
     }
 
+    /// 按查询类型渲染首个（或全部）绑定行；未知类型保留兜底文案。
     pub fn format_prolog_results(
         &self,
         results: &[HashMap<String, String>],
@@ -821,17 +837,13 @@ impl ResponseFormatter {
         }
 
         match query_type {
-            "age_query" => {
-                if let Some(age) = results[0].get("Age") {
-                    format!("年龄是 {} 岁", age)
-                } else {
-                    "未找到年龄信息".to_string()
-                }
-            }
+            "age_query" => Self::render_field(results, "Age", "未找到年龄信息", |age| {
+                format!("年龄是 {} 岁", age)
+            }),
             "relation_query" => {
                 let relations: Vec<&str> = results
                     .iter()
-                    .filter_map(|r| r.get("Relation"))
+                    .filter_map(|row| row.get("Relation"))
                     .map(String::as_str)
                     .collect();
 
@@ -841,118 +853,78 @@ impl ResponseFormatter {
                     format!("关系是：{}", relations.join(", "))
                 }
             }
-            "count_query" => {
-                if let Some(count) = results[0].get("Count") {
-                    format!("共有 {} 个", count)
-                } else {
-                    "无法计算数量".to_string()
-                }
-            }
-            "spouse_query" => {
-                if let Some(spouse) = results[0].get("Spouse") {
-                    format!("配偶是 {}", spouse)
-                } else {
-                    "未找到配偶信息".to_string()
-                }
-            }
+            "count_query" => Self::render_field(results, "Count", "无法计算数量", |count| {
+                format!("共有 {} 个", count)
+            }),
+            "spouse_query" => Self::render_field(results, "Spouse", "未找到配偶信息", |spouse| {
+                format!("配偶是 {}", spouse)
+            }),
             "capital_query" => {
-                if let Some(capital) = Self::result_value(results, "Capital") {
+                Self::render_field(results, "Capital", "未找到首都信息", |capital| {
                     format!("首都是{}", capital)
-                } else {
-                    "未找到首都信息".to_string()
-                }
+                })
             }
             "altitude_query" => {
-                if let Some(altitude) = Self::result_value(results, "Altitude") {
+                Self::render_field(results, "Altitude", "未找到海拔信息", |altitude| {
                     format!("海拔高度是{}米", altitude)
-                } else {
-                    "未找到海拔信息".to_string()
-                }
+                })
             }
             "chemical_formula_query" => {
-                if let Some(formula) = Self::result_value(results, "Formula") {
+                Self::render_field(results, "Formula", "未找到分子式信息", |formula| {
                     format!("化学分子式是{}", formula)
-                } else {
-                    "未找到分子式信息".to_string()
-                }
+                })
             }
-            "author_query" => {
-                if let Some(author) = Self::result_value(results, "Author") {
-                    format!("作者是{}", author)
-                } else {
-                    "未找到作者信息".to_string()
-                }
-            }
+            "author_query" => Self::render_field(results, "Author", "未找到作者信息", |author| {
+                format!("作者是{}", author)
+            }),
             "champion_query" => {
-                if let Some(champion) = Self::result_value(results, "Champion") {
+                Self::render_field(results, "Champion", "未找到冠军信息", |champion| {
                     format!("冠军是{}", champion)
-                } else {
-                    "未找到冠军信息".to_string()
-                }
+                })
             }
             "birth_year_query" => {
-                if let Some(year) = Self::result_value(results, "Year") {
+                Self::render_field(results, "Year", "未找到诞生年份信息", |year| {
                     format!("诞生于{}年", year)
-                } else {
-                    "未找到诞生年份信息".to_string()
-                }
+                })
             }
             "largest_query" => {
-                if let Some(entity) = Self::result_value(results, "Entity") {
+                Self::render_field(results, "Entity", "未找到相关信息", |entity| {
                     format!("最大的是{}", entity)
-                } else {
-                    "未找到相关信息".to_string()
-                }
+                })
             }
             "quantity_query" => {
-                if let Some(quantity) = Self::result_value(results, "Quantity") {
+                Self::render_field(results, "Quantity", "未找到数量信息", |quantity| {
                     format!("数量是{}", quantity)
-                } else {
-                    "未找到数量信息".to_string()
-                }
+                })
             }
             "concept_query" | "explanation_query" => {
-                if let Some(definition) = results[0].get("definition") {
-                    format!("{}", definition)
-                } else {
-                    "未找到定义信息".to_string()
-                }
+                Self::render_field(results, "definition", "未找到定义信息", |definition| {
+                    definition.to_string()
+                })
             }
             "time_before_query" => {
-                if let Some(year) = results[0].get("year") {
+                Self::render_field(results, "year", "未找到时间信息", |year| {
                     format!("时间是在{}年之前", year)
-                } else {
-                    "未找到时间信息".to_string()
-                }
+                })
             }
             "principle_query" => {
-                if let Some(principle) = results[0].get("principle") {
+                Self::render_field(results, "principle", "未找到原理信息", |principle| {
                     format!("工作原理是{}", principle)
-                } else {
-                    "未找到原理信息".to_string()
-                }
+                })
             }
             "comparison_query" => {
-                if let Some(difference) = results[0].get("difference") {
+                Self::render_field(results, "difference", "未找到比较信息", |difference| {
                     format!("区别是{}", difference)
-                } else {
-                    "未找到比较信息".to_string()
-                }
+                })
             }
             "philosophy_query" => {
-                if let Some(philosophy) = results[0].get("philosophy") {
+                Self::render_field(results, "philosophy", "未找到哲学思想信息", |philosophy| {
                     format!("哲学思想是{}", philosophy)
-                } else {
-                    "未找到哲学思想信息".to_string()
-                }
+                })
             }
-            "impact_query" => {
-                if let Some(impact) = results[0].get("impact") {
-                    format!("影响是{}", impact)
-                } else {
-                    "未找到影响信息".to_string()
-                }
-            }
+            "impact_query" => Self::render_field(results, "impact", "未找到影响信息", |impact| {
+                format!("影响是{}", impact)
+            }),
             "cause_query" | "reason_query" => {
                 if let Some(cause) = results[0].get("cause").or_else(|| results[0].get("reason")) {
                     format!("原因是{}", cause)
@@ -961,23 +933,18 @@ impl ResponseFormatter {
                 }
             }
             "population_query" => {
-                if let Some(population) = results[0].get("Population") {
+                Self::render_field(results, "Population", "未找到人口信息", |population| {
                     format!("人口是 {} 人", population)
-                } else {
-                    "未找到人口信息".to_string()
-                }
+                })
             }
-            "planet_query" => {
-                if let Some(name) = results[0].get("name") {
-                    format!("最大的行星是{}", name)
-                } else {
-                    "未找到行星信息".to_string()
-                }
-            }
+            "planet_query" => Self::render_field(results, "name", "未找到行星信息", |name| {
+                format!("最大的行星是{}", name)
+            }),
             _ => "根据现有信息，找到了相关内容，但无法生成详细回答。".to_string(),
         }
     }
 }
+/// 从工作目录的 `config.toml` 加载系统配置。
 pub async fn load_config() -> Result<SystemConfig, Box<dyn std::error::Error + Send + Sync>> {
     load_config_from("config.toml").await
 }
@@ -1007,6 +974,7 @@ mod config_path_tests {
         );
     }
 }
+/// 命中任一导入关键词即视为知识导入，否则按查询处理。
 pub fn detect_input_mode(input: &str, keywords: &[String]) -> InputMode {
     if keywords.iter().any(|keyword| input.contains(keyword)) {
         InputMode::KnowledgeImport

@@ -769,9 +769,7 @@
                 "采纳锻造:",
             ],
         ) {
-            let key = rest
-                .trim_start_matches(|ch: char| ch == ' ' || ch == '：' || ch == ':')
-                .trim();
+            let key = trim_command_argument(rest);
             if key.is_empty() {
                 println!("用法：确认锻造 <id>（先用「锻造台账」查看候选 id）。");
             } else {
@@ -869,9 +867,7 @@
                 "否决锻造:",
             ],
         ) {
-            let key = rest
-                .trim_start_matches(|ch: char| ch == ' ' || ch == '：' || ch == ':')
-                .trim();
+            let key = trim_command_argument(rest);
             match pattern_forge.refute(key) {
                 Ok((pattern, retired)) => {
                     if retired {
@@ -915,9 +911,7 @@
                 "停用锻造:",
             ],
         ) {
-            let key = rest
-                .trim_start_matches(|ch: char| ch == ' ' || ch == '：' || ch == ':')
-                .trim();
+            let key = trim_command_argument(rest);
             match pattern_forge.retire(key) {
                 Ok(pattern) => {
                     let removed = pattern_library.remove_source(&pattern.source());
@@ -925,14 +919,13 @@
                         "已退役锻造规则 {}「{}」；从模式库移除 {} 条展开。",
                         pattern.id, pattern.name, removed
                     );
-                    match oxigraph_manager
-                        .sync_pattern_ledger(pattern_library.entries())
-                        .await
-                    {
-                        Ok(count) => println!("模式落图：{} 条已同步。", count),
-                        Err(error) => eprintln!("模式落图失败：{}", error),
-                    }
-                    persist_pattern_forge(&pattern_forge, &forge_path);
+                    sync_after_forge(
+                        &oxigraph_manager,
+                        &pattern_library,
+                        &pattern_forge,
+                        &forge_path,
+                    )
+                    .await;
                 }
                 Err(error) => println!("退役锻造失败：{}", error),
             }
@@ -951,9 +944,7 @@
                 "删除锻造:",
             ],
         ) {
-            let key = rest
-                .trim_start_matches(|ch: char| ch == ' ' || ch == '：' || ch == ':')
-                .trim();
+            let key = trim_command_argument(rest);
             match pattern_forge.forget(key) {
                 Ok(pattern) => {
                     let removed = pattern_library.remove_source(&pattern.source());
@@ -961,14 +952,13 @@
                         "已遗忘锻造规则 {}「{}」（移除 {} 条展开）。",
                         pattern.id, pattern.name, removed
                     );
-                    match oxigraph_manager
-                        .sync_pattern_ledger(pattern_library.entries())
-                        .await
-                    {
-                        Ok(count) => println!("模式落图：{} 条已同步。", count),
-                        Err(error) => eprintln!("模式落图失败：{}", error),
-                    }
-                    persist_pattern_forge(&pattern_forge, &forge_path);
+                    sync_after_forge(
+                        &oxigraph_manager,
+                        &pattern_library,
+                        &pattern_forge,
+                        &forge_path,
+                    )
+                    .await;
                 }
                 Err(error) => println!("遗忘锻造失败：{}", error),
             }
@@ -998,9 +988,7 @@
                 "复核锻造:",
             ],
         ) {
-            let key = rest
-                .trim_start_matches(|ch: char| ch == ' ' || ch == '：' || ch == ':')
-                .trim();
+            let key = trim_command_argument(rest);
             let key = (!key.is_empty()).then_some(key);
             match pattern_forge.verify_probes(key, &language_config.nlp) {
                 Ok(report) => {
@@ -1254,9 +1242,7 @@
 
         if let Some(rest) = strip_any_prefix(input, &["确认获取", "确认关系获取", "确认问答获取"])
         {
-            let id = rest
-                .trim_start_matches(|ch: char| ch == ' ' || ch == '：' || ch == ':')
-                .trim();
+            let id = trim_command_argument(rest);
             let outcome = acquisition.confirm(if id.is_empty() { None } else { Some(id) });
             println!("{}", outcome.message);
             if let Some(follow_up) = outcome.follow_up {
@@ -1269,9 +1255,7 @@
 
         if let Some(rest) = strip_any_prefix(input, &["否认获取", "否认关系获取", "拒绝获取"])
         {
-            let id = rest
-                .trim_start_matches(|ch: char| ch == ' ' || ch == '：' || ch == ':')
-                .trim();
+            let id = trim_command_argument(rest);
             let outcome = acquisition.deny(if id.is_empty() { None } else { Some(id) });
             println!("{}", outcome.message);
             persist_acquisition(&acquisition, &acquisition_path);
@@ -1281,9 +1265,7 @@
 
         if let Some(rest) = strip_any_prefix(input, &["撤回获取", "撤销获取", "撤回关系获取"])
         {
-            let id = rest
-                .trim_start_matches(|ch: char| ch == ' ' || ch == '：' || ch == ':')
-                .trim();
+            let id = trim_command_argument(rest);
             let outcome = acquisition.retract(if id.is_empty() { None } else { Some(id) });
             println!("{}", outcome.message);
             persist_acquisition(&acquisition, &acquisition_path);
@@ -1294,9 +1276,7 @@
         // 采纳：Confirmed/Admitted 的条目进入会话事实集（仍不写知识图谱）。
         if let Some(rest) = strip_any_prefix(input, &["采纳获取", "采纳关系获取", "提交获取"])
         {
-            let id = rest
-                .trim_start_matches(|ch: char| ch == ' ' || ch == '：' || ch == ':')
-                .trim();
+            let id = trim_command_argument(rest);
             match acquisition.commit_proposal(if id.is_empty() { None } else { Some(id) }) {
                 Some(proposal) => {
                     let answer = symbolic_reasoner.assert_nl_fact(&proposal.sentence);

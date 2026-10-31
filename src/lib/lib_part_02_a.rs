@@ -97,6 +97,7 @@ impl JsonLdAnonymousScope {
 }
 
 impl OxigraphManager {
+    /// 打开（必要时创建）指定目录的 RDF 存储，并使用独立性能台账。
     pub fn new(store_path: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         Self::with_perf_ledger(store_path, Arc::new(perf_ledger::PerfLedger::new()))
     }
@@ -107,11 +108,10 @@ impl OxigraphManager {
         perf: Arc<perf_ledger::PerfLedger>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // 展开波浪号路径
-        let expanded_path = if store_path.starts_with("~/") {
+        let expanded_path = if let Some(relative) = store_path.strip_prefix("~/") {
             if let Some(home_dir) = std::env::var_os("HOME") {
-                let home_path = std::path::Path::new(&home_dir);
-                home_path
-                    .join(&store_path[2..])
+                std::path::Path::new(&home_dir)
+                    .join(relative)
                     .to_string_lossy()
                     .to_string()
             } else {
@@ -455,7 +455,7 @@ impl OxigraphManager {
                     datatype(local),
                 ))
             }
-            other => Some(Literal::new_simple_literal(&other.to_string())),
+            other => Some(Literal::new_simple_literal(other.to_string())),
         }
     }
 
@@ -709,7 +709,7 @@ impl OxigraphManager {
                     stats.relations += 1;
                 } else {
                     let object = match context.default_language.as_deref() {
-                        Some(language) => Literal::new_language_tagged_literal(s, language)?.into(),
+                        Some(language) => Literal::new_language_tagged_literal(s, language)?,
                         None => Literal::new_simple_literal(s),
                     };
                     store.insert(&Quad::new(
@@ -821,7 +821,7 @@ impl OxigraphManager {
             }
             _ => {
                 // 其他类型转换为字符串
-                let object = Literal::new_simple_literal(&value.to_string());
+                let object = Literal::new_simple_literal(value.to_string());
                 store.insert(&Quad::new(
                     subject.clone(),
                     predicate.clone(),
@@ -939,7 +939,7 @@ impl OxigraphManager {
             }
             Value::Number(_) | Value::Bool(_) => Ok(Self::jsonld_scalar_literal(item)
                 .map(Term::from)
-                .unwrap_or_else(|| Literal::new_simple_literal(&item.to_string()).into())),
+                .unwrap_or_else(|| Literal::new_simple_literal(item.to_string()).into())),
             Value::Object(obj) => {
                 if let Some(id) = obj.get("@id").and_then(Value::as_str) {
                     if id.is_empty() {
@@ -975,9 +975,9 @@ impl OxigraphManager {
                         .map(Term::from)
                         .unwrap_or_else(|| Literal::new_simple_literal(&text).into()));
                 }
-                Ok(Literal::new_simple_literal(&item.to_string()).into())
+                Ok(Literal::new_simple_literal(item.to_string()).into())
             }
-            other => Ok(Literal::new_simple_literal(&other.to_string()).into()),
+            other => Ok(Literal::new_simple_literal(other.to_string()).into()),
         }
     }
 }

@@ -1494,6 +1494,11 @@ fn strip_any_prefix<'a>(input: &'a str, prefixes: &[&str]) -> Option<&'a str> {
         .find_map(|prefix| input.strip_prefix(prefix))
 }
 
+/// 命令前缀之后的参数：去掉紧随其后的半角/全角冒号与空白。
+fn trim_command_argument(rest: &str) -> &str {
+    rest.trim_start_matches([' ', '：', ':']).trim()
+}
+
 /// 当前对话状态快照：供模式守卫、经验检索与案例联想共用同一口径。
 fn dialogue_pattern_context(
     dialogue_manager: &DialogueManager,

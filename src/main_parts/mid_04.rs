@@ -981,6 +981,20 @@ fn persist_pattern_forge(forge: &PatternForge, path: &str) {
     }
 }
 
+/// 锻造命令改动模式库后的统一收尾：同步模式图，再落盘锻造台账。
+async fn sync_after_forge(
+    manager: &OxigraphManager,
+    library: &PatternLibrary,
+    forge: &PatternForge,
+    forge_path: &str,
+) {
+    match manager.sync_pattern_ledger(library.entries()).await {
+        Ok(count) => println!("模式落图：{} 条已同步。", count),
+        Err(error) => eprintln!("模式落图失败：{}", error),
+    }
+    persist_pattern_forge(forge, forge_path);
+}
+
 fn persist_pattern_evolution(ledger: &EvolutionLedger, path: &str) {
     if let Err(error) = ledger.save_to_path(path) {
         eprintln!("模式演化台账保存失败：{}", error);

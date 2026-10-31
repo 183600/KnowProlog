@@ -706,11 +706,7 @@ impl EntityRelationExtractor {
             if keyword_set.contains(*word) {
                 // 在关键词附近查找可能的实体
                 let search_range = 3; // 前后3个词的范围
-                let start_idx = if i >= search_range {
-                    i - search_range
-                } else {
-                    0
-                };
+                let start_idx = i.saturating_sub(search_range);
                 let end_idx = (i + search_range + 1).min(words.len());
 
                 for j in start_idx..end_idx {
@@ -813,7 +809,7 @@ impl EntityRelationExtractor {
 
         // 检查实体文本长度和格式（按字符数而非 UTF-8 字节数，避免中文被误判过长）
         let char_count = entity_text.chars().count();
-        if char_count >= 2 && char_count <= 10 {
+        if (2..=10).contains(&char_count) {
             confidence += 0.1;
         }
 
@@ -826,7 +822,7 @@ impl EntityRelationExtractor {
     }
 
     fn remove_overlapping_entities(&self, entities: &mut Vec<EntityExtraction>) {
-        entities.sort_by(|a, b| a.position.start.cmp(&b.position.start));
+        entities.sort_by_key(|entity| entity.position.start);
 
         let mut i = 0;
         while i < entities.len() {
@@ -952,7 +948,7 @@ impl EntityRelationExtractor {
                     // 同一实体对+关系类型只产出一次（多个关键词命中时，重复三元组最终也会被去重）
                     let hit = keywords.iter().any(|keyword| {
                         if keyword.chars().count() == 1 {
-                            between_words.iter().any(|word| *word == keyword.as_str())
+                            between_words.contains(&keyword.as_str())
                         } else {
                             text_between.contains(keyword.as_str())
                         }
@@ -1048,7 +1044,7 @@ impl EntityRelationExtractor {
         let pos_tags = self.simple_pos_tagging(&words);
 
         for i in 0..words.len() {
-            if self.is_verb(&pos_tags[i]) {
+            if self.is_verb(pos_tags[i]) {
                 let verb = &words[i];
                 let subject = self.find_subject(&words, &pos_tags, i);
                 let object = self.find_object(&words, &pos_tags, i);

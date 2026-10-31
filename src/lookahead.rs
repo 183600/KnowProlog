@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::abduction::{ClarificationReply, ClarificationSession};
-use crate::resolution_engine::{Atom, Clause, ResolutionEngine};
+use crate::resolution_engine::{Clause, ResolutionEngine};
 
 /// 默认前瞻缓存容量（一个澄清问题最多几条短答分支）。
 pub const DEFAULT_CAPACITY: usize = 8;
@@ -409,6 +409,7 @@ pub fn digest_list(items: &[String]) -> u64 {
 mod tests {
     use super::*;
     use crate::abduction::{Hypothesis, HypothesisKind};
+    use crate::resolution_engine::Atom;
 
     fn hypothesis(atom: Atom) -> Hypothesis {
         Hypothesis {

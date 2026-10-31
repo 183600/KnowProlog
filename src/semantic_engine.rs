@@ -103,11 +103,11 @@ impl SemanticEngine {
                 for alias in &entity_aliases_list {
                     aliases
                         .entry(alias.clone())
-                        .or_insert_with(Vec::new)
+                        .or_default()
                         .push(entity_name.clone());
                     aliases_lower
                         .entry(alias.to_lowercase())
-                        .or_insert_with(Vec::new)
+                        .or_default()
                         .push(entity_name.clone());
                 }
 
@@ -732,11 +732,11 @@ impl SemanticEngine {
         for alias in &entity_aliases_list {
             aliases
                 .entry(alias.clone())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(entity_name.clone());
             aliases_lower
                 .entry(alias.to_lowercase())
-                .or_insert_with(Vec::new)
+                .or_default()
                 .push(entity_name.clone());
         }
 

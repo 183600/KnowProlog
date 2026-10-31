@@ -654,7 +654,7 @@ pub fn analyze_query_intent(
     }
 
     let mut sorted_rules: Vec<&PrologRule> = rules.iter().collect();
-    sorted_rules.sort_by(|a, b| b.priority.cmp(&a.priority)); // 按优先级降序排序
+    sorted_rules.sort_by_key(|rule| std::cmp::Reverse(rule.priority)); // 按优先级降序排序
 
     first_matching_rule(tagged_words, sorted_rules)
 }
