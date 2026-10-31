@@ -734,6 +734,8 @@ pub enum ClaimError {
     TerminalClaim(String),
     InvalidRetirement(String),
     StillUnsupported(String),
+    ChainDamaged,
+    TombstonedSupport(String),
     LedgerVersion(u32),
     Serialize(String),
 }
@@ -756,6 +758,10 @@ impl fmt::Display for ClaimError {
             }
             ClaimError::StillUnsupported(id) => {
                 write!(formatter, "claim 的支撑仍失效，不能复核为可用：{}", id)
+            }
+            ClaimError::ChainDamaged => write!(formatter, "事件链损坏，不能复核 claim"),
+            ClaimError::TombstonedSupport(detail) => {
+                write!(formatter, "claim 的支撑命中外部墓碑：{}", detail)
             }
             ClaimError::LedgerVersion(version) => {
                 write!(formatter, "不支持的 claim 生命周期版本：{}", version)
@@ -1514,6 +1520,26 @@ impl ClaimLedger {
     pub fn claim(&self, id: &str) -> Option<&ClaimRecord> {
         self.claims.get(id)
     }
+    /// 已遗忘事实中的可扫描明文（主语与宾语）；谓词是结构标签，不参与扫描。
+    ///
+    /// 账本不保存 claim 原文，因此这里只回放事实层明文。调用方应把它与
+    /// 删除时显式提供的词项合并，再交给 [`scan_residue`]。
+    pub fn redacted_terms(&self) -> Vec<String> {
+        let mut terms = BTreeSet::new();
+        for record in self.facts.values() {
+            if record.status != FactStatus::Redacted {
+                continue;
+            }
+            for value in [&record.key.subject, &record.key.object] {
+                let value = value.trim();
+                if !value.is_empty() {
+                    terms.insert(value.to_string());
+                }
+            }
+        }
+        terms.into_iter().collect()
+    }
+
 
     pub fn fact(&self, key: &FactKey) -> Option<&FactRecord> {
         self.facts.get(&key.key())
@@ -2441,11 +2467,31 @@ impl ClaimLedger {
         turn: u64,
         revision: u64,
     ) -> Result<ClaimStatus, ClaimError> {
+        self.revalidate_with_context(id, turn, revision, &GateContext::default())
+    }
+
+    /// 带外部墓碑与链状态的复核；外部遗忘优先于本地支撑检查。
+    pub fn revalidate_with_context(
+        &mut self,
+        id: &str,
+        turn: u64,
+        revision: u64,
+        context: &GateContext,
+    ) -> Result<ClaimStatus, ClaimError> {
+        if self.version != CLAIM_LEDGER_VERSION {
+            return Err(ClaimError::LedgerVersion(self.version));
+        }
+        if !context.chain_intact || !self.verify_chain(None).intact {
+            return Err(ClaimError::ChainDamaged);
+        }
         let Some(record) = self.claims.get(id) else {
             return Err(ClaimError::UnknownClaim(id.to_string()));
         };
         if record.status.is_terminal() {
             return Err(ClaimError::StillUnsupported(id.to_string()));
+        }
+        if let Some(fact) = self.support_tombstone(record, &context.extra_retired) {
+            return Err(ClaimError::TombstonedSupport(fact.render()));
         }
         if self.support_problem(record).is_some() {
             return Err(ClaimError::StillUnsupported(id.to_string()));
@@ -4048,6 +4094,76 @@ mod tests {
             ClaimStatus::Expired
         );
         assert!(rebuilt.verify_chain(None).intact);
+    }
+
+    #[test]
+    fn redacted_terms_cover_fact_endpoints_without_schema_labels() {
+        let mut ledger = ClaimLedger::new();
+        let phone = FactKey::new("李四", "电话", "13800138000", false);
+        let job = FactKey::new("李四", "职业", "教师", false);
+        ledger
+            .retire_fact(&phone, RetirementKind::Redacted, "遗忘", 1, 1)
+            .unwrap();
+        ledger
+            .register(
+                draft(
+                    "李四",
+                    "职业",
+                    "s1",
+                    "李四是教师。",
+                    vec![ClaimSupport::fact(&job)],
+                ),
+                2,
+                2,
+            )
+            .unwrap();
+        let terms = ledger.redacted_terms();
+        assert!(terms.contains(&"李四".to_string()));
+        assert!(terms.contains(&"13800138000".to_string()));
+        assert!(!terms.contains(&"电话".to_string()));
+        assert!(!terms.contains(&"教师".to_string()));
+    }
+
+    #[test]
+    fn revalidation_consults_external_tombstones_and_chain_state() {
+        let mut ledger = ClaimLedger::new();
+        let fact_key = fact("秦二十", "电话", "13900139000");
+        let claim = ledger
+            .register(
+                draft(
+                    "秦二十",
+                    "电话",
+                    "s1",
+                    "秦二十的电话是 13900139000。",
+                    vec![ClaimSupport::fact(&fact_key)],
+                ),
+                1,
+                1,
+            )
+            .unwrap();
+        ledger.mark_stale(&claim.id, "来源待复核", 2, 2).unwrap();
+        let context = GateContext::default().with_retired_facts([fact_key.clone()]);
+        assert_eq!(
+            ledger.revalidate_with_context(&claim.id, 3, 3, &context),
+            Err(ClaimError::TombstonedSupport(fact_key.render()))
+        );
+        assert_eq!(
+            ledger.claim(&claim.id).unwrap().status,
+            ClaimStatus::Stale
+        );
+        assert_eq!(
+            ledger.revalidate_with_context(
+                &claim.id,
+                3,
+                3,
+                &GateContext::default().with_chain_intact(false)
+            ),
+            Err(ClaimError::ChainDamaged)
+        );
+        assert_eq!(
+            ledger.revalidate_with_context(&claim.id, 4, 4, &GateContext::default()),
+            Ok(ClaimStatus::Planned)
+        );
     }
 
     #[test]

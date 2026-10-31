@@ -169,6 +169,7 @@ async fn main() {
         scan_surface,
         archive_surface,
         scan_term,
+        scan_retired,
         strict,
         json,
     }) = &cli.command
@@ -197,6 +198,7 @@ async fn main() {
             scan_surface,
             archive_surface,
             scan_term,
+            *scan_retired,
             *strict,
             *json,
         );

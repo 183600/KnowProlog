@@ -1043,6 +1043,7 @@ fn run_claim_ledger(
     scan_surfaces: &[String],
     archive_surfaces: &[String],
     scan_terms: &[String],
+    scan_retired: bool,
     strict: bool,
     json: bool,
 ) {
@@ -1257,8 +1258,12 @@ fn run_claim_ledger(
     let audit = ledger.audit(expected_emissions, &AuditOptions::default());
     let mut surfaces = load_claim_surfaces(scan_surfaces, true);
     surfaces.extend(load_claim_surfaces(archive_surfaces, false));
-    let residue = (!surfaces.is_empty() || !scan_terms.is_empty())
-        .then(|| scan_residue(&surfaces, scan_terms));
+    let mut terms = scan_terms.to_vec();
+    if scan_retired {
+        terms.extend(ledger.redacted_terms());
+    }
+    let residue = (!surfaces.is_empty() || !terms.is_empty())
+        .then(|| scan_residue(&surfaces, &terms));
 
     if json {
         let mut object = serde_json::Map::new();

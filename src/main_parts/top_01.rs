@@ -1787,6 +1787,9 @@ enum Commands {
         /// Plaintext that must no longer appear on active surfaces (repeatable)
         #[arg(long = "scan-term", value_name = "TERM")]
         scan_term: Vec<String>,
+        /// Also scan for subjects/objects of every redacted fact in the ledger
+        #[arg(long = "scan-retired")]
+        scan_retired: bool,
         /// Exit non-zero unless audit, emission and residue scan are clean
         #[arg(long)]
         strict: bool,
