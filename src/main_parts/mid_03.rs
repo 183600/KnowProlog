@@ -1030,11 +1030,14 @@ fn run_claim_ledger(
     reason: &str,
     impact_facts: &[String],
     expected_emissions: Option<usize>,
+    scan_surfaces: &[String],
+    archive_surfaces: &[String],
+    scan_terms: &[String],
     strict: bool,
     json: bool,
 ) {
     use know_prolog::claim_lifecycle::{
-        AuditOptions, AuditVerdict, ClaimLedger, GateContext, RetirementKind,
+        scan_residue, AuditOptions, AuditVerdict, ClaimLedger, GateContext, RetirementKind, Surface,
     };
 
     let retirement = match retire_kind.trim().to_ascii_lowercase().as_str() {
@@ -1127,6 +1130,10 @@ fn run_claim_ledger(
         }
     }
     let audit = ledger.audit(expected_emissions, &AuditOptions::default());
+    let mut surfaces = load_claim_surfaces(scan_surfaces, true);
+    surfaces.extend(load_claim_surfaces(archive_surfaces, false));
+    let residue = (!surfaces.is_empty() || !scan_terms.is_empty())
+        .then(|| scan_residue(&surfaces, scan_terms));
 
     if json {
         let mut object = serde_json::Map::new();
@@ -1160,6 +1167,12 @@ fn run_claim_ledger(
             "audit".to_string(),
             serde_json::to_value(&audit).unwrap_or(serde_json::Value::Null),
         );
+        if let Some(residue) = &residue {
+            object.insert(
+                "residue".to_string(),
+                serde_json::to_value(residue).unwrap_or(serde_json::Value::Null),
+            );
+        }
         match serde_json::to_string_pretty(&serde_json::Value::Object(object)) {
             Ok(text) => println!("{}", text),
             Err(error) => {
@@ -1178,15 +1191,65 @@ fn run_claim_ledger(
             println!("{}", impact.render_zh());
         }
         println!("{}", audit.render_zh());
+        if let Some(residue) = &residue {
+            println!("{}", residue.render_zh());
+        }
     }
 
     let emission_incomplete = emission
         .as_ref()
         .map(|emission| !emission.complete())
         .unwrap_or(false);
-    if strict && (audit.verdict != AuditVerdict::Clean || emission_incomplete) {
+    let residue_risky = residue
+        .as_ref()
+        .map(|report| report.verdict != AuditVerdict::Clean)
+        .unwrap_or(false);
+    if strict && (audit.verdict != AuditVerdict::Clean || emission_incomplete || residue_risky) {
         std::process::exit(1);
     }
+}
+
+/// 读取 `NAME=PATH` 形式的扫描表面；`-` 表示标准输入。失败即退出，
+/// 避免调用方误以为扫描覆盖了全部表面。
+fn load_claim_surfaces(
+    specs: &[String],
+    active: bool,
+) -> Vec<know_prolog::claim_lifecycle::Surface> {
+    let mut surfaces = Vec::new();
+    for spec in specs {
+        let Some((name, path)) = spec.split_once('=') else {
+            eprintln!("扫描表面格式应为 NAME=PATH：{}", spec);
+            std::process::exit(2);
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            eprintln!("扫描表面缺少名称：{}", spec);
+            std::process::exit(2);
+        }
+        let text = if path == "-" {
+            use std::io::Read as _;
+            let mut text = String::new();
+            if let Err(error) = std::io::stdin().read_to_string(&mut text) {
+                eprintln!("读取扫描表面 {} 失败：{}", name, error);
+                std::process::exit(1);
+            }
+            text
+        } else {
+            match std::fs::read_to_string(path) {
+                Ok(text) => text,
+                Err(error) => {
+                    eprintln!("读取扫描表面 {} 失败：{}", name, error);
+                    std::process::exit(1);
+                }
+            }
+        };
+        surfaces.push(if active {
+            know_prolog::claim_lifecycle::Surface::active(name, text)
+        } else {
+            know_prolog::claim_lifecycle::Surface::archival(name, text)
+        });
+    }
+    surfaces
 }
 
 /// `scenario`：离线回放查询板剧本；任一步失败以非零码退出（可直接进 CI）。

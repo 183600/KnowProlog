@@ -156,6 +156,9 @@ async fn main() {
         reason,
         impact_fact,
         expected_emissions,
+        scan_surface,
+        archive_surface,
+        scan_term,
         strict,
         json,
     }) = &cli.command
@@ -171,6 +174,9 @@ async fn main() {
             reason,
             impact_fact,
             *expected_emissions,
+            scan_surface,
+            archive_surface,
+            scan_term,
             *strict,
             *json,
         );

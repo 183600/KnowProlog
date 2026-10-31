@@ -1747,7 +1747,16 @@ enum Commands {
         /// Expected emitted claims for the audit; omit when auditing only
         #[arg(long)]
         expected_emissions: Option<usize>,
-        /// Exit non-zero unless the audit is clean and every plan claim passed
+        /// Scan an active surface as NAME=PATH (repeatable; "-" reads stdin)
+        #[arg(long = "scan-surface", value_name = "NAME=PATH")]
+        scan_surface: Vec<String>,
+        /// Scan an archival surface as NAME=PATH (repeatable)
+        #[arg(long = "archive-surface", value_name = "NAME=PATH")]
+        archive_surface: Vec<String>,
+        /// Plaintext that must no longer appear on active surfaces (repeatable)
+        #[arg(long = "scan-term", value_name = "TERM")]
+        scan_term: Vec<String>,
+        /// Exit non-zero unless audit, emission and residue scan are clean
         #[arg(long)]
         strict: bool,
         /// Print the result as JSON
