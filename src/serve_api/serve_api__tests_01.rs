@@ -457,6 +457,30 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
             .expect("普通问答应成功");
         assert_ne!(before.source, "generation_plan");
         assert!(before.reply.contains("226"), "{}", before.reply);
+
+        let report = state
+            .take_turn(&session_id, "回答计划")
+            .await
+            .expect("计划报告应成功");
+        assert_eq!(report.source, "generation_plan", "{}", report.reply);
+        assert_eq!(report.kind.as_deref(), Some("plan_report"));
+        assert!(report.reply.contains("回答计划"), "{}", report.reply);
+        assert!(report.reply.contains("姚明"), "{}", report.reply);
+
+        let review = state
+            .take_turn(&session_id, "复核计划")
+            .await
+            .expect("计划复核应成功");
+        assert_eq!(review.source, "generation_plan", "{}", review.reply);
+        assert_eq!(review.kind.as_deref(), Some("plan_review"));
+        assert!(review.reply.contains("复核对象"), "{}", review.reply);
+
+        let ledger = state
+            .take_turn(&session_id, "信念账本")
+            .await
+            .expect("信念账本应成功");
+        assert_eq!(ledger.source, "belief_ledger", "{}", ledger.reply);
+        assert!(!ledger.reply.is_empty(), "信念账本不应为空输出");
     }
 
     #[tokio::test]

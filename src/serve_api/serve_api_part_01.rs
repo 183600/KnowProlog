@@ -323,6 +323,34 @@ fn parse_generation_request(input: &str) -> Option<&str> {
     None
 }
 
+/// 生成计划审计命令：只读报告、差异复核与跨轮信念账本。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenerationAuditCommand {
+    PlanReport,
+    PlanReview,
+    BeliefLedger,
+}
+
+/// 解析生成计划审计命令；与 CLI 使用同一组别名，避免两个入口语义漂移。
+fn parse_generation_audit_command(input: &str) -> Option<GenerationAuditCommand> {
+    let normalized = input
+        .trim()
+        .trim_end_matches(['？', '?', '。', '！', '!', '；', ';', '，', ',', ' '])
+        .trim();
+    match normalized {
+        "回答计划" | "计划台账" | "生成计划" | "回答方案" => {
+            Some(GenerationAuditCommand::PlanReport)
+        }
+        "复核计划" | "计划复核" | "核对计划" | "检查计划" => {
+            Some(GenerationAuditCommand::PlanReview)
+        }
+        "置信账本" | "信念账本" | "跨轮信念" | "belief-ledger" => {
+            Some(GenerationAuditCommand::BeliefLedger)
+        }
+        _ => None,
+    }
+}
+
 /// 截断到前 `limit` 个字符（按字符边界，尾部加省略号）。
 fn truncate_chars(text: &str, limit: usize) -> String {
     let mut out: String = text.chars().take(limit).collect();
@@ -824,6 +852,7 @@ impl Session {
         // 保证 HTTP 会话与 CLI 对同一句「预算：120字」给出同一份计划表达。
         let style_command = StyleDirective::parse(&raw_input);
         let generation_entity = parse_generation_request(&raw_input).map(str::to_string);
+        let audit_command = parse_generation_audit_command(&raw_input);
         // 上一轮确认/更正过的事实必须进入本轮推理前提（幂等，不写图谱）。
         let adopted = self.sync_recovery_confirmed_facts();
         // 补全回合与假设世界命令使用原始措辞，避免被插件改写；
@@ -851,6 +880,7 @@ impl Session {
         let pending_answer = if clarification_answer.is_none()
             && style_command.is_none()
             && generation_entity.is_none()
+            && audit_command.is_none()
             && completion_command.is_none()
             && constructive_command.is_none()
             && assumption_command.is_none()
@@ -886,6 +916,7 @@ impl Session {
         control.enter(TurnPhase::Recall)?;
         let dialogue = if style_command.is_some()
             || generation_entity.is_some()
+            || audit_command.is_some()
             || completion_command.is_some()
             || constructive_command.is_some()
             || assumption_command.is_some()
@@ -934,6 +965,36 @@ impl Session {
                         None,
                     ),
                 }
+            } else if let Some(command) = audit_command {
+                self.reasoner.clear_pending_awaiting();
+                let (source, kind, plan_tag, text) = match command {
+                    GenerationAuditCommand::PlanReport => (
+                        "generation_plan",
+                        "plan_report",
+                        "plan_report",
+                        self.reasoner.answer_plan_report(),
+                    ),
+                    GenerationAuditCommand::PlanReview => (
+                        "generation_plan",
+                        "plan_review",
+                        "plan_review",
+                        self.reasoner.review_generation_plan(),
+                    ),
+                    GenerationAuditCommand::BeliefLedger => (
+                        "belief_ledger",
+                        "belief_ledger",
+                        "belief_ledger",
+                        self.reasoner.belief_ledger_report(),
+                    ),
+                };
+                (
+                    "answered".to_string(),
+                    source.to_string(),
+                    Some(kind.to_string()),
+                    vec![plan_tag.to_string()],
+                    text,
+                    None,
+                )
             } else if let Some(text) = completion_command {
                 (
                     "answered".to_string(),
