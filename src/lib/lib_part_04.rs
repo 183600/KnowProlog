@@ -58,55 +58,48 @@ impl OxigraphManager {
     ) -> Result<Vec<PrologFact>, Box<dyn std::error::Error + Send + Sync>> {
         let mut relations = Vec::new();
 
-        match Query::parse(query, None) {
-            Ok(query_obj) => match store.query(query_obj) {
-                Ok(results) => {
-                    if let QueryResults::Solutions(solutions) = results {
-                        for solution in solutions {
-                            if let Ok(solution) = solution {
-                                if let (Some(from), Some(to), Some(rel)) = (
-                                    solution.get("from_name"),
-                                    solution.get("to_name"),
-                                    solution.get("rel"),
-                                ) {
-                                    let from_name = if let Term::Literal(lit) = from {
-                                        lit.value().to_string()
-                                    } else {
-                                        from.to_string()
-                                    };
+        let query_obj = Query::parse(query, None)?;
+        let results = store.query(query_obj)?;
+        if let QueryResults::Solutions(solutions) = results {
+            for solution in solutions {
+                let solution = solution?;
+                if let (Some(from), Some(to), Some(rel)) = (
+                    solution.get("from_name"),
+                    solution.get("to_name"),
+                    solution.get("rel"),
+                ) {
+                    let from_name = if let Term::Literal(lit) = from {
+                        lit.value().to_string()
+                    } else {
+                        from.to_string()
+                    };
 
-                                    let to_name = if let Term::Literal(lit) = to {
-                                        lit.value().to_string()
-                                    } else {
-                                        to.to_string()
-                                    };
+                    let to_name = if let Term::Literal(lit) = to {
+                        lit.value().to_string()
+                    } else {
+                        to.to_string()
+                    };
 
-                                    let rel_str = match rel {
-                                        Term::NamedNode(node) => node.as_str().to_string(),
-                                        other => other.to_string(),
-                                    };
-                                    let rel_type = if rel_str.contains(BASE_NS) {
-                                        rel_str
-                                            .replace(BASE_NS, "")
-                                            .trim_matches(|c| c == '<' || c == '>')
-                                            .to_string()
-                                    } else {
-                                        rel_str.trim_matches(|c| c == '<' || c == '>').to_string()
-                                    };
+                    let rel_str = match rel {
+                        Term::NamedNode(node) => node.as_str().to_string(),
+                        other => other.to_string(),
+                    };
+                    let rel_type = if rel_str.contains(BASE_NS) {
+                        rel_str
+                            .replace(BASE_NS, "")
+                            .trim_matches(|c| c == '<' || c == '>')
+                            .to_string()
+                    } else {
+                        rel_str.trim_matches(|c| c == '<' || c == '>').to_string()
+                    };
 
-                                    relations.push(PrologFact::Relation {
-                                        from: from_name,
-                                        rel_type,
-                                        to: to_name,
-                                    });
-                                }
-                            }
-                        }
-                    }
+                    relations.push(PrologFact::Relation {
+                        from: from_name,
+                        rel_type,
+                        to: to_name,
+                    });
                 }
-                Err(_) => {}
-            },
-            Err(_) => {}
+            }
         }
 
         Ok(relations)
@@ -1325,5 +1318,27 @@ mod fusion_tests {
             GraphName::DefaultGraph,
         );
         assert!(OxigraphManager::assertion_from_rdf_quad(&blank, "alice", "a.ttl").is_none());
+    }
+}
+
+#[cfg(test)]
+mod query_error_tests {
+    use super::*;
+    use crate::perf_ledger::PerfLedger;
+
+    #[tokio::test]
+    async fn malformed_sparql_surfaces_an_error_instead_of_an_empty_result() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = OxigraphManager::with_perf_ledger(
+            dir.path().to_str().unwrap(),
+            Arc::new(PerfLedger::new()),
+        )
+        .unwrap();
+        let store = Store::new().unwrap();
+        let error = manager
+            .query_relations(&store, "SELECT ?s WHERE {")
+            .await
+            .unwrap_err();
+        assert!(!error.to_string().is_empty());
     }
 }

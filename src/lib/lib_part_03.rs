@@ -1415,14 +1415,22 @@ impl OxigraphManager {
 
                                         return Some(answer);
                                     }
+                                } else {
+                                    self.perf.bump("direct_answer_solution_error");
                                 }
                             }
                         }
                     }
-                    Err(_) => return None,
+                    Err(_) => {
+                        self.perf.bump("direct_answer_query_error");
+                        return None;
+                    }
                 }
             }
-            Err(_) => return None,
+            Err(_) => {
+                self.perf.bump("direct_answer_parse_error");
+                return None;
+            }
         }
 
         None
@@ -1448,24 +1456,17 @@ impl OxigraphManager {
             sparql_literal(pattern)
         );
 
-        match Query::parse(&query, None) {
-            Ok(query_obj) => match store.query(query_obj) {
-                Ok(results) => {
-                    if let QueryResults::Solutions(solutions) = results {
-                        for solution in solutions {
-                            if let Ok(solution) = solution {
-                                if let Some(name) = solution.get("name") {
-                                    if let Term::Literal(lit) = name {
-                                        entities.push(lit.value().to_string());
-                                    }
-                                }
-                            }
-                        }
+        let query_obj = Query::parse(&query, None)?;
+        let results = store.query(query_obj)?;
+        if let QueryResults::Solutions(solutions) = results {
+            for solution in solutions {
+                let solution = solution?;
+                if let Some(name) = solution.get("name") {
+                    if let Term::Literal(lit) = name {
+                        entities.push(lit.value().to_string());
                     }
                 }
-                Err(_) => {}
-            },
-            Err(_) => {}
+            }
         }
 
         Ok(entities)
@@ -1518,24 +1519,17 @@ impl OxigraphManager {
             entity_filter, entity_filter, entity_filter, entity_filter
         );
 
-        match Query::parse(&query, None) {
-            Ok(query_obj) => match store.query(query_obj) {
-                Ok(results) => {
-                    if let QueryResults::Solutions(solutions) = results {
-                        for solution in solutions {
-                            if let Ok(solution) = solution {
-                                if let Some(name) = solution.get("neighbor_name") {
-                                    if let Term::Literal(lit) = name {
-                                        neighbors.push(lit.value().to_string());
-                                    }
-                                }
-                            }
-                        }
+        let query_obj = Query::parse(&query, None)?;
+        let results = store.query(query_obj)?;
+        if let QueryResults::Solutions(solutions) = results {
+            for solution in solutions {
+                let solution = solution?;
+                if let Some(name) = solution.get("neighbor_name") {
+                    if let Term::Literal(lit) = name {
+                        neighbors.push(lit.value().to_string());
                     }
                 }
-                Err(_) => {}
-            },
-            Err(_) => {}
+            }
         }
 
         Ok(neighbors)
@@ -1577,95 +1571,82 @@ impl OxigraphManager {
             name_filter
         );
 
-        match Query::parse(&query, None) {
-            Ok(query_obj) => {
-                match store.query(query_obj) {
-                    Ok(results) => {
-                        if let QueryResults::Solutions(solutions) = results {
-                            let mut entity_data: HashMap<
-                                String,
-                                (String, HashMap<String, String>),
-                            > = HashMap::new();
+        let query_obj = Query::parse(&query, None)?;
+        let results = store.query(query_obj)?;
+        if let QueryResults::Solutions(solutions) = results {
+            let mut entity_data: HashMap<String, (String, HashMap<String, String>)> =
+                HashMap::new();
 
-                            for solution in solutions {
-                                if let Ok(solution) = solution {
-                                    let entity_name = match solution.get("name") {
-                                        Some(Term::Literal(lit)) => lit.value().to_string(),
-                                        _ => continue,
-                                    };
+            for solution in solutions {
+                let solution = solution?;
+                let entity_name = match solution.get("name") {
+                    Some(Term::Literal(lit)) => lit.value().to_string(),
+                    _ => continue,
+                };
 
-                                    let entry = entity_data
-                                        .entry(entity_name)
-                                        .or_insert_with(|| (String::new(), HashMap::new()));
+                let entry = entity_data
+                    .entry(entity_name)
+                    .or_insert_with(|| (String::new(), HashMap::new()));
 
-                                    if let Some(type_term) = solution.get("type") {
-                                        let type_str = match type_term {
-                                            Term::NamedNode(node) => node.as_str().to_string(),
-                                            other => other.to_string(),
-                                        };
-                                        // 后续类型覆盖先前类型
-                                        entry.0 = if type_str.contains(BASE_NS) {
-                                            type_str
-                                                .replace(BASE_NS, "")
-                                                .trim_matches(|c| c == '<' || c == '>')
-                                                .to_lowercase()
-                                        } else {
-                                            type_str
-                                                .trim_matches(|c| c == '<' || c == '>')
-                                                .to_lowercase()
-                                        };
-                                    }
+                if let Some(type_term) = solution.get("type") {
+                    let type_str = match type_term {
+                        Term::NamedNode(node) => node.as_str().to_string(),
+                        other => other.to_string(),
+                    };
+                    // 后续类型覆盖先前类型
+                    entry.0 = if type_str.contains(BASE_NS) {
+                        type_str
+                            .replace(BASE_NS, "")
+                            .trim_matches(|c| c == '<' || c == '>')
+                            .to_lowercase()
+                    } else {
+                        type_str
+                            .trim_matches(|c| c == '<' || c == '>')
+                            .to_lowercase()
+                    };
+                }
 
-                                    if let (Some(prop), Some(value)) =
-                                        (solution.get("prop"), solution.get("value"))
-                                    {
-                                        let prop_str = match prop {
-                                            Term::NamedNode(node) => node.as_str().to_string(),
-                                            other => other.to_string(),
-                                        };
-                                        let prop_name = if prop_str.contains(BASE_NS) {
-                                            prop_str
-                                                .replace(BASE_NS, "")
-                                                .trim_matches(|c| c == '<' || c == '>')
-                                                .to_string()
-                                        } else {
-                                            prop_str
-                                                .trim_matches(|c| c == '<' || c == '>')
-                                                .to_string()
-                                        };
+                if let (Some(prop), Some(value)) = (solution.get("prop"), solution.get("value")) {
+                    let prop_str = match prop {
+                        Term::NamedNode(node) => node.as_str().to_string(),
+                        other => other.to_string(),
+                    };
+                    let prop_name = if prop_str.contains(BASE_NS) {
+                        prop_str
+                            .replace(BASE_NS, "")
+                            .trim_matches(|c| c == '<' || c == '>')
+                            .to_string()
+                    } else {
+                        prop_str
+                            .trim_matches(|c| c == '<' || c == '>')
+                            .to_string()
+                    };
 
-                                        let value_str = if let Term::Literal(lit) = value {
-                                            lit.value().to_string()
-                                        } else {
-                                            value
-                                                .to_string()
-                                                .trim_matches(|c| c == '<' || c == '>')
-                                                .to_string()
-                                        };
+                    let value_str = if let Term::Literal(lit) = value {
+                        lit.value().to_string()
+                    } else {
+                        value
+                            .to_string()
+                            .trim_matches(|c| c == '<' || c == '>')
+                            .to_string()
+                    };
 
-                                        entry.1.insert(prop_name, value_str);
-                                    }
-                                }
-                            }
-
-                            // 按传入顺序输出，跳过没有类型信息的实体
-                            for name in entity_names {
-                                if let Some((entity_type, properties)) = entity_data.remove(name) {
-                                    if !entity_type.is_empty() {
-                                        facts.push(PrologFact::Entity {
-                                            name: name.clone(),
-                                            entity_type,
-                                            properties,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(_) => {}
+                    entry.1.insert(prop_name, value_str);
                 }
             }
-            Err(_) => {}
+
+            // 按传入顺序输出，跳过没有类型信息的实体
+            for name in entity_names {
+                if let Some((entity_type, properties)) = entity_data.remove(name) {
+                    if !entity_type.is_empty() {
+                        facts.push(PrologFact::Entity {
+                            name: name.clone(),
+                            entity_type,
+                            properties,
+                        });
+                    }
+                }
+            }
         }
 
         Ok(facts)
