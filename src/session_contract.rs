@@ -304,6 +304,18 @@ impl SessionReport {
             if receipt.inherited {
                 output.push_str("（继承）");
             }
+            if !receipt.answer_schema.is_empty() {
+                output.push_str(&format!(" 图式 {}", schema_label(&receipt.answer_schema)));
+                if receipt.episode_turns > 1 {
+                    output.push_str(&format!(" 第 {} 轮", receipt.episode_turns));
+                }
+            }
+            if !receipt.missing_obligations.is_empty() {
+                output.push_str(&format!(
+                    " 欠 {}",
+                    receipt.missing_obligations.join("、")
+                ));
+            }
             if !receipt.gaps.is_empty() {
                 output.push_str(&format!(" 缺口 {}", receipt.gaps.join("、")));
             }
@@ -1185,6 +1197,25 @@ expect = { answered = true, focus = "姚明", focus_before = "姚明", inherited
 "#;
         let report = run_contract(&contract(source));
         assert!(report.passed, "{}", report.render_text());
+    }
+
+    #[test]
+    fn text_report_surfaces_schema_and_episode_debt() {
+        let source = r#"
+name = "图式与欠账"
+[[entities]]
+name = "姚明"
+type = "Person"
+attributes = { "身高" = "226" }
+[[turns]]
+input = "还有呢"
+expect = { answer_schema = "unknown", episode_turns = 1, missing_obligations_contains = ["clarification"] }
+"#;
+        let report = run_contract(&contract(source));
+        assert!(report.passed, "{}", report.render_text());
+        let text = report.render_text();
+        assert!(text.contains("图式 unknown"), "{}", text);
+        assert!(text.contains("欠 evidence"), "{}", text);
     }
 
     #[test]
