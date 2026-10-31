@@ -151,6 +151,7 @@ pub mod prolog_engine;
 pub mod prompt_spec;
 pub mod proof_bench;
 pub mod proof_journal;
+pub mod proof_memory;
 pub mod provenance;
 pub mod quality;
 pub mod quantifier;
