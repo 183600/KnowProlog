@@ -190,6 +190,7 @@ pub mod shared_memory;
 pub mod similarity_calculator;
 pub mod slot_ledger;
 pub mod soft_route;
+pub mod stage_bus;
 pub mod startup_ledger;
 pub mod streaming_draft;
 pub mod symbolic_generator;
