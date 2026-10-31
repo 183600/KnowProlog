@@ -418,9 +418,18 @@ enum Commands {
         /// Explicit refutation as SUBJECT|PREDICATE|OBJECT (repeatable)
         #[arg(long = "refute", value_name = "S|P|O")]
         refute: Vec<String>,
+        /// Retract an earlier refutation as SUBJECT|PREDICATE|OBJECT (repeatable)
+        #[arg(long = "retract-refute", value_name = "S|P|O")]
+        retract_refute: Vec<String>,
         /// Mark a predicate as single-valued for this session (repeatable)
         #[arg(long = "functional", value_name = "PREDICATE")]
         functional: Vec<String>,
+        /// Retract an earlier functional-predicate decision (repeatable)
+        #[arg(long = "unmark-functional", value_name = "PREDICATE")]
+        unmark_functional: Vec<String>,
+        /// Remove all adopted rule guards from the session ledger
+        #[arg(long)]
+        clear_guards: bool,
         /// Refine only this rule index (repeatable; defaults to every mined rule)
         #[arg(long = "rule", value_name = "INDEX")]
         rule: Vec<usize>,

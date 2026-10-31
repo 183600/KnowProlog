@@ -455,7 +455,10 @@ fn run_foil(
     facts: &[String],
     positives: &[String],
     refutations: &[String],
+    retract_refutations: &[String],
     functional: &[String],
+    unmark_functional: &[String],
+    clear_guards: bool,
     rule_indices: &[usize],
     adopt: bool,
     session_path: Option<&str>,
@@ -495,6 +498,20 @@ fn run_foil(
             }
         }
     }
+    let mut retracted_refutations = 0usize;
+    for raw in retract_refutations {
+        match open_closure::parse_fact(raw) {
+            Ok((subject, predicate, object, _)) => {
+                if ledger.retract_refutation(&subject, &predicate, &object) {
+                    retracted_refutations += 1;
+                }
+            }
+            Err(error) => {
+                eprintln!("{}", error);
+                std::process::exit(2);
+            }
+        }
+    }
     for raw in refutations {
         match open_closure::parse_fact(raw) {
             Ok((subject, predicate, object, _)) => {
@@ -506,9 +523,17 @@ fn run_foil(
             }
         }
     }
+    for predicate in unmark_functional {
+        ledger.unmark_functional(predicate);
+    }
     for predicate in functional {
         ledger.mark_functional(predicate);
     }
+    let cleared_guards = if clear_guards {
+        ledger.clear_all_guards()
+    } else {
+        0
+    };
 
     let mut hypotheses = Vec::new();
     for raw in positives {
@@ -585,6 +610,8 @@ fn run_foil(
             "refinements": &refinements,
             "ledger": &ledger,
             "adopted": adopted,
+            "retracted_refutations": retracted_refutations,
+            "cleared_guards": cleared_guards,
             "hypotheses_total": hypotheses_total,
             "hypotheses_inspected": reports.len(),
             "predictions_sampled": predictions.len(),
@@ -633,6 +660,12 @@ fn run_foil(
     println!("{}", ledger.render_report(&predictor));
     if adopt {
         println!("已采纳精化：{} 条规则。", adopted);
+    }
+    if retracted_refutations > 0 {
+        println!("已撤回 {} 条显式否认。", retracted_refutations);
+    }
+    if clear_guards {
+        println!("已清除 {} 条规则守卫。", cleared_guards);
     }
 }
 

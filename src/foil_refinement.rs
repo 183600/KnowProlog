@@ -1342,6 +1342,12 @@ impl FoilLedger {
         self.guards.remove(rule_key).is_some()
     }
 
+    pub fn clear_all_guards(&mut self) -> usize {
+        let removed = self.guards.len();
+        self.guards.clear();
+        removed
+    }
+
     /// 该账本是否会阻断一次预测（按预测携带的规则下标定位守卫）。
     pub fn blocks_prediction(&self, predictor: &LinkPredictor, prediction: &Prediction) -> bool {
         let Some(rule) = predictor.rules().get(prediction.rule_index) else {
@@ -1700,6 +1706,35 @@ mod tests {
         assert!(filtered
             .iter()
             .all(|prediction| prediction.triple.object != "赵六"));
+    }
+
+    #[test]
+    fn clear_all_guards_keeps_refutations() {
+        let predictor = predictor();
+        let negatives = [Triple::new("李四", "师祖", "赵六")];
+        let index = predictor
+            .rules()
+            .iter()
+            .position(|rule| {
+                rule.head == "师祖"
+                    && rule.template == RuleTemplate::Compose
+                    && rule.body == vec!["师傅".to_string(), "师傅".to_string()]
+            })
+            .expect("应挖出组合规则");
+        let refinement = refine_rule(
+            &predictor,
+            index,
+            &negatives,
+            &BTreeSet::new(),
+            &RefineOptions::default(),
+        );
+        let mut ledger = FoilLedger::new();
+        ledger.refute("李四", "师祖", "赵六");
+        assert!(ledger.adopt_refinement(&refinement));
+        assert_eq!(ledger.guarded_rule_count(), 1);
+        assert_eq!(ledger.clear_all_guards(), 1);
+        assert_eq!(ledger.guarded_rule_count(), 0);
+        assert!(ledger.is_refuted(&Triple::new("李四", "师祖", "赵六")));
     }
 
     #[test]
