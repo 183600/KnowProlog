@@ -129,6 +129,9 @@ pub struct SessionPolicy {
     /// 让位轮给出确定性澄清问句（status = needs_clarification）。
     #[serde(default)]
     pub strict_clarify: bool,
+    /// 回答字符硬上限；只约束生成式计划，按完整命题取舍并显式披露省略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_answer_chars: Option<usize>,
     /// 命中的规则标签（按出现顺序去重）。
     #[serde(default)]
     pub recognized: Vec<String>,
@@ -192,6 +195,17 @@ impl SessionPolicy {
                 }
                 let lowered = clause.to_lowercase();
                 let mut matched = false;
+                let budget_clause = clause
+                    .strip_prefix("回答")
+                    .map(str::trim)
+                    .unwrap_or(clause);
+                if let Some(StyleDirective::Budget(limit)) =
+                    StyleDirective::parse(budget_clause)
+                {
+                    policy.max_answer_chars = Some(limit);
+                    Self::record(&mut policy.recognized, &format!("budget:{}", limit));
+                    matched = true;
+                }
                 if STYLE_CONCISE_PHRASES.iter().any(|p| lowered.contains(p)) {
                     policy.style = PolicyStyle::Concise;
                     Self::record(&mut policy.recognized, "style:concise");
@@ -230,6 +244,7 @@ impl SessionPolicy {
         self.style == PolicyStyle::Normal
             && !self.require_evidence
             && !self.strict_clarify
+            && self.max_answer_chars.is_none()
             && self.recognized.is_empty()
             && self.warnings.is_empty()
     }
@@ -238,11 +253,16 @@ impl SessionPolicy {
         if self.is_default() {
             return "默认策略（风格 normal）".to_string();
         }
+        let budget = self
+            .max_answer_chars
+            .map(|limit| format!("·回答预算 {} 字", limit))
+            .unwrap_or_default();
         format!(
-            "风格 {}·依据 {}·严格澄清 {}·命中 [{}]",
+            "风格 {}·依据 {}·严格澄清 {}{}·命中 [{}]",
             self.style.label(),
             if self.require_evidence { "开" } else { "关" },
             if self.strict_clarify { "开" } else { "关" },
+            budget,
             self.recognized.join(", ")
         )
     }
@@ -930,7 +950,7 @@ impl Session {
         };
 
         control.enter(TurnPhase::Reason)?;
-        let (status, source, kind, plan, mut reply, derivation) =
+        let (status, source, kind, mut plan, mut reply, derivation) =
             if let Some(directive) = style_command {
                 self.reasoner.clear_pending_awaiting();
                 let text = self
@@ -1126,6 +1146,28 @@ impl Session {
                     )
                 }
             };
+        // 系统级回答预算是硬上限：生成与重述都走同一份计划，按完整命题
+        // 取舍；若用户已给出更小的显式预算则保留用户预算。
+        if let (Some(limit), "answered") = (self.policy.max_answer_chars, status.as_str()) {
+            let generated =
+                source == "generation" && kind.as_deref() == Some("generate_about");
+            let restyled =
+                source == "generation_plan" && kind.as_deref() == Some("style_directive");
+            let explicit_budget = plan.iter().find_map(|tag| {
+                tag.strip_prefix("style:budget:")
+                    .and_then(|value| value.parse::<usize>().ok())
+            });
+            let policy_is_stricter = explicit_budget.map(|budget| limit < budget).unwrap_or(true);
+            if (generated || restyled) && policy_is_stricter {
+                if let Some(text) = self
+                    .reasoner
+                    .restyle_generation(StyleDirective::Budget(limit))
+                {
+                    reply = text;
+                    plan.push(format!("budget_policy:{}", limit));
+                }
+            }
+        }
         // 失败即立悬问：回答/对话路径诚实报告「没有记录」时，把
         // 「目标 + 缺哪条前提」留给下一轮；成功回答则关闭同题悬问。
         if (source == "reasoner" || source == "dialogue") && !reply.is_empty() {

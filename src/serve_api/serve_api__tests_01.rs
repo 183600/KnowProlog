@@ -481,6 +481,24 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
             .expect("信念账本应成功");
         assert_eq!(ledger.source, "belief_ledger", "{}", ledger.reply);
         assert!(!ledger.reply.is_empty(), "信念账本不应为空输出");
+
+        let policy = SessionPolicy::from_system_texts(&["回答控制在80字以内".to_string()]);
+        let capped = state
+            .take_turn_with_policy(&session_id, "介绍：叶莉", Some(&policy))
+            .await
+            .expect("预算策略轮应成功");
+        assert_eq!(capped.source, "generation", "{}", capped.reply);
+        assert!(capped.reply.contains("预算版"), "{}", capped.reply);
+        assert!(
+            capped.plan.iter().any(|tag| tag == "budget_policy:80"),
+            "{:?}",
+            capped.plan
+        );
+        assert!(
+            capped.reply.chars().count() <= 80,
+            "系统预算必须约束最终回复：{}",
+            capped.reply
+        );
     }
 
     #[tokio::test]

@@ -564,6 +564,15 @@
         assert!(empty.is_default());
         let detailed = SessionPolicy::from_system_texts(&["请详细展开".to_string()]);
         assert_eq!(detailed.style, PolicyStyle::Detailed);
+
+        let budgeted = SessionPolicy::from_system_texts(&["回答控制在100字以内".to_string()]);
+        assert_eq!(budgeted.max_answer_chars, Some(100));
+        assert!(budgeted.recognized.contains(&"budget:100".to_string()));
+        assert!(
+            budgeted.render_text().contains("回答预算 100 字"),
+            "{}",
+            budgeted.render_text()
+        );
     }
 
     #[tokio::test]
