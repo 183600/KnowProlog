@@ -1,0 +1,28 @@
+name = "焦点接力与元对话"
+description = "显式实体 → 代词继承 → 换实体 → 回顾；断言意图、焦点前后、继承标记与回答摘要，不钉死整句措辞"
+
+[[entities]]
+name = "姚明"
+type = "Person"
+attributes = { "身高" = "226", "国籍" = "中国" }
+
+[[entities]]
+name = "叶莉"
+type = "Person"
+attributes = { "身高" = "190", "国籍" = "中国" }
+
+[[turns]]
+input = "姚明的身高是多少"
+expect = { answered = true, intent = "ask_attribute", focus_before = "", focus = "姚明", inherited = false, plan_contains = ["direct_answer"], answer_contains = ["226"] }
+
+[[turns]]
+input = "他的国籍呢"
+expect = { answered = true, intent = "ask_attribute", focus_before = "姚明", focus = "姚明", inherited = true, plan_contains = ["direct_answer"], answer_contains = ["中国"] }
+
+[[turns]]
+input = "叶莉的国籍呢"
+expect = { answered = true, intent = "ask_attribute", focus_before = "姚明", focus = "叶莉", inherited = false, answer_contains = ["中国"] }
+
+[[turns]]
+input = "我们聊过什么？"
+expect = { answered = true, intent = "meta_recap", plan_contains = ["recap"], answer_contains = ["姚明"] }

@@ -187,6 +187,7 @@ pub mod semantic_entailment;
 pub mod semantic_grammar;
 pub mod semantic_monitor;
 pub mod serve_api;
+pub mod session_contract;
 pub mod shape_dialogue;
 pub mod shape_eval;
 pub mod shape_gate;

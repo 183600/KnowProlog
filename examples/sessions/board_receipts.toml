@@ -1,0 +1,37 @@
+name = "查询板过程回执"
+description = "扫描 → 筛选 → 排序 → 选行 → 依据；断言查询板计划、焦点与证据，防止跨轮状态丢失"
+
+[[entities]]
+name = "姚明"
+type = "Person"
+attributes = { "身高" = "226", "国籍" = "中国" }
+
+[[entities]]
+name = "王治郅"
+type = "Person"
+attributes = { "身高" = "214", "国籍" = "中国" }
+
+[[entities]]
+name = "诺维茨基"
+type = "Person"
+attributes = { "身高" = "213", "国籍" = "德国" }
+
+[[turns]]
+input = "列出所有人的身高"
+expect = { answered = true, plan_contains = ["board:scan"], answer_contains = ["姚明"], evidence_contains = ["身高"] }
+
+[[turns]]
+input = "只看中国的"
+expect = { answered = true, plan_contains = ["board:filter"], answer_excludes = ["诺维茨基"] }
+
+[[turns]]
+input = "按身高从高到低排"
+expect = { answered = true, plan_contains = ["board:sort"], answer_contains = ["姚明"] }
+
+[[turns]]
+input = "第二个呢"
+expect = { answered = true, plan_contains = ["board:select"], focus = "王治郅", evidence_contains = ["身高"] }
+
+[[turns]]
+input = "依据"
+expect = { answered = true, plan_contains = ["board:explain"], answer_contains = ["身高"], evidence_contains = ["身高"] }

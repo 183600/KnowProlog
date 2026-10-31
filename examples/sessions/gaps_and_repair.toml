@@ -1,0 +1,23 @@
+name = "缺口与继续"
+description = "未知实体让位 → 已知实体缺少属性 → 继续聊 → 解释依据；缺口是稳定标签而不是空回答"
+
+[[entities]]
+name = "姚明"
+type = "Person"
+attributes = { "身高" = "226" }
+
+[[turns]]
+input = "张三的身高是多少"
+expect = { answered = false, reply_kind = "unhandled", focus_before = "", focus = "", inherited = false, gaps_contains = ["unhandled"] }
+
+[[turns]]
+input = "姚明的体重是多少"
+expect = { answered = true, intent = "ask_attribute", focus = "姚明", plan_contains = ["admit_ignorance"], gaps_contains = ["knowledge_gap"], answer_contains = ["没有记录"] }
+
+[[turns]]
+input = "还有呢"
+expect = { answered = true, intent = "continue", focus = "姚明", plan_contains = ["continue_topic"], answer_contains = ["身高"] }
+
+[[turns]]
+input = "你怎么知道的？"
+expect = { answered = true, intent = "meta_why", plan_contains = ["why_no_evidence"], gaps_contains = ["evidence_gap"] }
