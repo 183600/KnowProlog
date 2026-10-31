@@ -13,7 +13,7 @@ attributes = { "身高" = "190", "国籍" = "中国" }
 
 [[turns]]
 input = "姚明的身高是多少"
-expect = { answered = true, intent = "ask_attribute", focus_before = "", focus = "姚明", inherited = false, plan_contains = ["direct_answer"], answer_contains = ["226"] }
+expect = { answered = true, intent = "ask_attribute", focus_before = "", focus = "姚明", inherited = false, plan_contains = ["direct_answer"], answer_contains = ["226"], grounded = true, quoted_contains = ["姚明", "身高"] }
 
 [[turns]]
 input = "他的国籍呢"

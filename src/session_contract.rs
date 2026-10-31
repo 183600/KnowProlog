@@ -121,6 +121,12 @@ pub struct ReceiptExpectation {
     /// 缺口必须包含的稳定标签（`unhandled` / `knowledge_gap` / ...）。
     #[serde(default)]
     pub gaps_contains: Vec<String>,
+    /// 回答中的引号词条是否全部可回溯到知识源（`true` = 无未接地词条）。
+    #[serde(default)]
+    pub grounded: Option<bool>,
+    /// 回答必须引用的词条（逐字匹配）。
+    #[serde(default)]
+    pub quoted_contains: Vec<String>,
     /// 本轮回执摘要锁。
     #[serde(default)]
     pub digest: Option<String>,
@@ -140,6 +146,12 @@ pub struct TurnReceipt {
     pub plan: Vec<String>,
     pub evidence: Vec<String>,
     pub gaps: Vec<String>,
+    /// 回答中出现的引号词条（去重、有界）。
+    #[serde(default)]
+    pub quoted_terms: Vec<String>,
+    /// 无法在知识源中回溯的引号词条（空 = 全部接地）。
+    #[serde(default)]
+    pub ungrounded_terms: Vec<String>,
     pub answer_excerpt: String,
     pub answer_digest: String,
     pub state_digest: String,
@@ -215,6 +227,9 @@ impl SessionReport {
             }
             if !receipt.gaps.is_empty() {
                 output.push_str(&format!(" 缺口 {}", receipt.gaps.join("、")));
+            }
+            if !receipt.ungrounded_terms.is_empty() {
+                output.push_str(&format!(" 未接地 {}", receipt.ungrounded_terms.join("、")));
             }
             for failure in &step.failures {
                 output.push_str(&format!("\n       {}", failure));
@@ -374,6 +389,12 @@ fn capture_turn(
         .map(|reply| reply.text.clone())
         .unwrap_or_default();
     let answer_digest = canonical_digest(&answer).unwrap_or_default();
+    let quoted = quoted_terms(&answer);
+    let ungrounded = quoted
+        .iter()
+        .filter(|term| !knowledge.traceable_token(term))
+        .cloned()
+        .collect();
     let state_digest = canonical_digest(&manager.snapshot()).unwrap_or_default();
     let reply_kind = reply
         .as_ref()
@@ -391,6 +412,8 @@ fn capture_turn(
         plan: bounded_tokens(plan.clone()),
         evidence: bounded_tokens(evidence),
         gaps: gaps_for(reply.as_ref(), &plan),
+        quoted_terms: bounded_tokens(quoted),
+        ungrounded_terms: bounded_tokens(ungrounded),
         answer_excerpt: excerpt(&answer, 80),
         answer_digest,
         state_digest,
@@ -513,6 +536,28 @@ fn check_expectations(
             failures.push(format!("缺口缺少「{}」（实际 {:?}）", needle, receipt.gaps));
         }
     }
+    if let Some(expected) = expect.grounded {
+        let actual = receipt.ungrounded_terms.is_empty();
+        if expected != actual {
+            failures.push(format!(
+                "期望引号词条{}，实际未接地 {:?}",
+                if expected {
+                    "全部接地"
+                } else {
+                    "存在未接地"
+                },
+                receipt.ungrounded_terms
+            ));
+        }
+    }
+    for needle in &expect.quoted_contains {
+        if !receipt.quoted_terms.iter().any(|term| term == needle) {
+            failures.push(format!(
+                "回答未引用「{}」（引号词条 {:?}）",
+                needle, receipt.quoted_terms
+            ));
+        }
+    }
     if let Some(expected) = expect.digest.as_deref() {
         if expected != receipt.digest {
             failures.push(format!(
@@ -587,6 +632,8 @@ fn receipt_digest(receipt: &TurnReceipt) -> String {
         plan: &'a [String],
         evidence: &'a [String],
         gaps: &'a [String],
+        quoted_terms: &'a [String],
+        ungrounded_terms: &'a [String],
         answer_excerpt: &'a str,
         answer_digest: &'a str,
         state_digest: &'a str,
@@ -603,11 +650,32 @@ fn receipt_digest(receipt: &TurnReceipt) -> String {
         plan: &receipt.plan,
         evidence: &receipt.evidence,
         gaps: &receipt.gaps,
+        quoted_terms: &receipt.quoted_terms,
+        ungrounded_terms: &receipt.ungrounded_terms,
         answer_excerpt: &receipt.answer_excerpt,
         answer_digest: &receipt.answer_digest,
         state_digest: &receipt.state_digest,
     })
     .unwrap_or_default()
+}
+
+fn quoted_terms(text: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    for (open, close) in [('「', '」'), ('『', '』'), ('“', '”'), ('"', '"')] {
+        let mut rest = text;
+        while let Some(start) = rest.find(open) {
+            let after = &rest[start + open.len_utf8()..];
+            let Some(end) = after.find(close) else {
+                break;
+            };
+            let term = after[..end].trim();
+            if !term.is_empty() && !terms.iter().any(|known| known == term) {
+                terms.push(term.to_string());
+            }
+            rest = &after[end + close.len_utf8()..];
+        }
+    }
+    terms
 }
 
 fn bounded(text: &str, limit: usize) -> String {
@@ -818,6 +886,27 @@ expect = { answered = true, plan_contains = ["board:scan"], answer_contains = ["
     }
 
     #[test]
+    fn quoted_terms_are_deduplicated_and_grounded() {
+        assert_eq!(
+            quoted_terms("「姚明」的「身高」是 226；再说一次「姚明」。"),
+            vec!["姚明", "身高"]
+        );
+        let source = r#"
+name = "接地"
+[[entities]]
+name = "姚明"
+type = "Person"
+attributes = { "身高" = "226" }
+[[turns]]
+input = "姚明的身高是多少"
+expect = { answered = true, grounded = true, quoted_contains = ["姚明", "身高"] }
+"#;
+        let report = run_contract(&contract(source));
+        assert!(report.passed, "{}", report.render_text());
+        assert!(report.steps[0].receipt.ungrounded_terms.is_empty());
+    }
+
+    #[test]
     fn receipts_are_bounded() {
         let long = "很".repeat(RECEIPT_TEXT_LIMIT * 2);
         let receipt = TurnReceipt {
@@ -836,6 +925,8 @@ expect = { answered = true, plan_contains = ["board:scan"], answer_contains = ["
             ),
             evidence: Vec::new(),
             gaps: vec!["unhandled".to_string()],
+            quoted_terms: Vec::new(),
+            ungrounded_terms: Vec::new(),
             answer_excerpt: excerpt(&long, 80),
             answer_digest: canonical_digest(&long).unwrap(),
             state_digest: String::new(),
