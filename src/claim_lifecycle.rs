@@ -24,7 +24,7 @@
 //! 事件链沿用规范 JSON + FNV-1a 64 做完整性自检，不声称密码学安全；编年史
 //! 历史字节不可擦除，本模块删除的是**活跃表面**上的可再生成断言。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::io::Write as _;
 use std::path::Path;
@@ -307,8 +307,22 @@ impl FactKey {
         )
     }
 
+    /// 无歧义的索引键：字段长度前缀消除分隔符碰撞。
+    pub fn key(&self) -> String {
+        format!(
+            "{}|{}:{}|{}:{}|{}:{}",
+            if self.session { "s" } else { "g" },
+            self.subject.len(),
+            self.subject,
+            self.predicate.len(),
+            self.predicate,
+            self.object.len(),
+            self.object
+        )
+    }
+
     pub fn digest(&self) -> String {
-        fnv1a_hex(self.render().as_bytes())
+        fnv1a_hex(self.key().as_bytes())
     }
 }
 
@@ -401,13 +415,6 @@ impl ClaimShape {
             structure: structure.into().trim().to_string(),
             session,
         }
-    }
-
-    fn material(&self) -> String {
-        format!(
-            "{}|{}|{}|{}",
-            self.subject, self.predicate, self.structure, self.session
-        )
     }
 }
 
@@ -560,13 +567,6 @@ impl ClaimEventTarget {
     pub fn fact(fact: &FactKey) -> Self {
         ClaimEventTarget::Fact { fact: fact.clone() }
     }
-
-    fn render(&self) -> String {
-        match self {
-            ClaimEventTarget::Claim { id } => format!("claim:{}", id),
-            ClaimEventTarget::Fact { fact } => format!("fact:{}", fact.render()),
-        }
-    }
 }
 
 /// 追加式生命周期事件。
@@ -590,18 +590,17 @@ pub struct ClaimEvent {
 
 impl ClaimEvent {
     fn material(&self) -> String {
-        format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}",
-            self.seq,
-            self.turn,
-            self.revision,
-            self.kind.code(),
-            self.target.render(),
-            self.from.as_deref().unwrap_or("-"),
-            self.to.as_deref().unwrap_or("-"),
-            self.reason,
-            self.prev_hash
-        )
+        canonical_json(&serde_json::json!({
+            "seq": self.seq,
+            "turn": self.turn,
+            "revision": self.revision,
+            "kind": self.kind.code(),
+            "target": self.target,
+            "from": self.from,
+            "to": self.to,
+            "reason": self.reason,
+            "prev_hash": self.prev_hash,
+        }))
     }
 
     fn compute_hash(&self) -> String {
@@ -1492,7 +1491,7 @@ impl ClaimLedger {
     }
 
     pub fn fact(&self, key: &FactKey) -> Option<&FactRecord> {
-        self.facts.get(&key.render())
+        self.facts.get(&key.key())
     }
 
     /// claim 身份：规范结构 + 排序后的支撑集合。
@@ -1500,16 +1499,11 @@ impl ClaimLedger {
         let mut support = support.to_vec();
         support.sort();
         support.dedup();
-        let material = format!(
-            "v{}|{}|{}",
-            CLAIM_LEDGER_VERSION,
-            shape.material(),
-            support
-                .iter()
-                .map(ClaimSupport::render)
-                .collect::<Vec<_>>()
-                .join("||")
-        );
+        let material = canonical_json(&serde_json::json!({
+            "version": CLAIM_LEDGER_VERSION,
+            "shape": shape,
+            "support": support,
+        }));
         format!(
             "{}{}",
             CLAIM_ID_PREFIX,
@@ -1554,12 +1548,12 @@ impl ClaimLedger {
         seq
     }
 
-    fn ensure_fact(&mut self, key: &FactKey, turn: u64) -> bool {
-        if self.facts.contains_key(&key.render()) {
+    fn ensure_fact(&mut self, key: &FactKey, turn: u64, revision: u64) -> bool {
+        if self.facts.contains_key(&key.key()) {
             return false;
         }
         self.facts.insert(
-            key.render(),
+            key.key(),
             FactRecord {
                 key: key.clone(),
                 status: FactStatus::Alive,
@@ -1575,7 +1569,7 @@ impl ClaimLedger {
             Some(FactStatus::Alive.code()),
             "登记事实",
             turn,
-            0,
+            revision,
         );
         true
     }
@@ -1651,7 +1645,7 @@ impl ClaimLedger {
         }
 
         for fact in &seen_facts {
-            self.ensure_fact(fact, turn);
+            self.ensure_fact(fact, turn, revision);
         }
         for parent in &seen_claims {
             if parent == &id {
@@ -1664,7 +1658,7 @@ impl ClaimLedger {
             match item {
                 ClaimSupport::Fact { .. } => {
                     if let Some(fact) = item.as_fact() {
-                        if let Some(record) = self.facts.get(&fact.render()) {
+                        if let Some(record) = self.facts.get(&fact.key()) {
                             if let Some(kind) = match record.status {
                                 FactStatus::Alive => None,
                                 FactStatus::Retracted => Some(RetirementKind::Retracted),
@@ -1737,7 +1731,7 @@ impl ClaimLedger {
                 ClaimSupport::Fact { .. } => {
                     if let Some(fact) = item.as_fact() {
                         self.fact_claims
-                            .entry(fact.render())
+                            .entry(fact.key())
                             .or_default()
                             .insert(id.clone());
                     }
@@ -1807,7 +1801,7 @@ impl ClaimLedger {
                     let Some(fact) = item.as_fact() else {
                         continue;
                     };
-                    let Some(fact_record) = self.facts.get(&fact.render()) else {
+                    let Some(fact_record) = self.facts.get(&fact.key()) else {
                         return Some((
                             GateFindingCode::UnknownSupport,
                             format!("事实未登记：{}", fact.render()),
@@ -2055,15 +2049,15 @@ impl ClaimLedger {
                 kind.label_zh()
             )));
         };
-        self.ensure_fact(fact, turn);
+        self.ensure_fact(fact, turn, revision);
         let already = self
             .facts
-            .get(&fact.render())
+            .get(&fact.key())
             .map(|record| record.status.is_terminal())
             .unwrap_or(false);
         if !already {
             let seq = self.events.len() as u64 + 1;
-            if let Some(record) = self.facts.get_mut(&fact.render()) {
+            if let Some(record) = self.facts.get_mut(&fact.key()) {
                 record.status = status;
                 record.last_turn = record.last_turn.max(turn);
                 record.retirement = Some(Retirement {
@@ -2085,7 +2079,7 @@ impl ClaimLedger {
             );
             let direct: BTreeSet<String> = self
                 .fact_claims
-                .get(&fact.render())
+                .get(&fact.key())
                 .cloned()
                 .unwrap_or_default();
             for id in direct {
@@ -2237,9 +2231,9 @@ impl ClaimLedger {
         let mut plans = BTreeSet::new();
         let mut replies = BTreeSet::new();
         let mut visited = BTreeSet::new();
-        let mut frontier: Vec<(String, usize)> = start.into_iter().map(|id| (id, 1usize)).collect();
-        frontier.sort();
-        while let Some((id, depth)) = frontier.pop() {
+        let mut frontier: VecDeque<(String, usize)> =
+            start.into_iter().map(|id| (id, 1usize)).collect();
+        while let Some((id, depth)) = frontier.pop_front() {
             if !visited.insert(id.clone()) {
                 continue;
             }
@@ -2266,10 +2260,9 @@ impl ClaimLedger {
             if let Some(children) = self.children.get(&id) {
                 for child in children {
                     if !visited.contains(child) {
-                        frontier.push((child.clone(), depth + 1));
+                        frontier.push_back((child.clone(), depth + 1));
                     }
                 }
-                frontier.sort();
             }
         }
         affected.sort_by(|left, right| {
@@ -2290,13 +2283,13 @@ impl ClaimLedger {
     pub fn impact_of_fact(&self, fact: &FactKey) -> Impact {
         let direct = self
             .fact_claims
-            .get(&fact.render())
+            .get(&fact.key())
             .cloned()
             .unwrap_or_default();
         let mut impact = self.collect_impact(&fact.render(), direct);
         impact.status = self
             .facts
-            .get(&fact.render())
+            .get(&fact.key())
             .map(|record| record.status.code().to_string())
             .unwrap_or_else(|| "unregistered".to_string());
         impact
@@ -2357,7 +2350,7 @@ impl ClaimLedger {
                     ClaimSupport::Fact { .. } => {
                         if let Some(fact) = item.as_fact() {
                             self.fact_claims
-                                .entry(fact.render())
+                                .entry(fact.key())
                                 .or_default()
                                 .insert(id.clone());
                         }
@@ -2452,6 +2445,9 @@ impl ClaimLedger {
                 });
             }
             if let Some((code, detail)) = self.support_problem(record) {
+                if code == GateFindingCode::UnknownSupport {
+                    unknown_reasons.insert(format!("{} 的支撑无法解析：{}", id, detail));
+                }
                 if record.status.is_active() {
                     findings.insert(AuditFinding {
                         code,
@@ -3186,6 +3182,19 @@ mod tests {
         let report = scan_residue(&surfaces, &["张三".to_string()]);
         assert_eq!(report.verdict, AuditVerdict::Clean);
         assert!(report.active_hits.is_empty());
+    }
+
+    #[test]
+    fn fact_keys_and_claim_ids_disambiguate_embedded_separators() {
+        let left = FactKey::new("a b", "c", "d", false);
+        let right = FactKey::new("a", "b c", "d", false);
+        assert_ne!(left.key(), right.key());
+        let left_shape = ClaimShape::new("x", "p", "slot:s", false);
+        let right_shape = ClaimShape::new("x", "p", "slot:s", false);
+        assert_ne!(
+            ClaimLedger::claim_id(&left_shape, &[ClaimSupport::fact(&left)]),
+            ClaimLedger::claim_id(&right_shape, &[ClaimSupport::fact(&right)])
+        );
     }
 
     #[test]
