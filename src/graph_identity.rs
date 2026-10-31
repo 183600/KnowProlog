@@ -55,6 +55,9 @@ pub struct AlignmentOptions {
     pub accept_margin_bps: u16,
     /// 接受所需的最低置信度。
     pub min_confidence_bps: u16,
+    /// 谓词别名 → 规范谓词；结构比较前先归一（空映射表示不归一）。
+    #[serde(default)]
+    pub predicate_aliases: BTreeMap<String, String>,
 }
 
 impl Default for AlignmentOptions {
@@ -68,6 +71,7 @@ impl Default for AlignmentOptions {
             max_bucket_nodes: 256,
             accept_margin_bps: 1_000,
             min_confidence_bps: 7_000,
+            predicate_aliases: BTreeMap::new(),
         }
     }
 }
@@ -86,6 +90,21 @@ impl AlignmentOptions {
 
     pub fn with_accept_margin_bps(mut self, value: u16) -> Self {
         self.accept_margin_bps = value.min(10_000);
+        self
+    }
+
+    pub fn with_predicate_aliases<I>(mut self, aliases: I) -> Self
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        for (alias, canonical) in aliases {
+            let alias = alias.trim();
+            let canonical = canonical.trim();
+            if !alias.is_empty() && !canonical.is_empty() && alias != canonical {
+                self.predicate_aliases
+                    .insert(alias.to_string(), canonical.to_string());
+            }
+        }
         self
     }
 }
@@ -582,7 +601,8 @@ pub fn align_assertions(
         let scope = &assertion.namespace;
         let subject = NodeKey::new(scope, &assertion.subject);
         nodes.entry(subject.clone()).or_default();
-        if assertion.predicate == TYPE_PREDICATE {
+        let predicate = canonical_predicate(&options.predicate_aliases, &assertion.predicate);
+        if predicate == TYPE_PREDICATE {
             if let Some(node) = nodes.get_mut(&subject) {
                 node.types.insert(assertion.object.clone());
             }
@@ -593,17 +613,15 @@ pub fn align_assertions(
                 let object = NodeKey::new(scope, &assertion.object);
                 nodes.entry(object.clone()).or_default();
                 if let Some(node) = nodes.get_mut(&subject) {
-                    node.out_entity
-                        .push((assertion.predicate.clone(), object.clone()));
+                    node.out_entity.push((predicate.clone(), object.clone()));
                 }
                 if let Some(node) = nodes.get_mut(&object) {
-                    node.in_entity
-                        .push((assertion.predicate.clone(), subject.clone()));
+                    node.in_entity.push((predicate, subject.clone()));
                 }
             }
             ObjectKind::Literal => {
                 if let Some(node) = nodes.get_mut(&subject) {
-                    node.out_literal.push(assertion.predicate.clone());
+                    node.out_literal.push(predicate);
                 }
             }
         }
@@ -1015,6 +1033,21 @@ fn compare_candidates(
         .then_with(|| compare_nodes(&left.to, &right.to, scope_rank))
 }
 
+fn canonical_predicate(aliases: &BTreeMap<String, String>, predicate: &str) -> String {
+    let mut current = predicate.trim().to_string();
+    let mut seen = BTreeSet::new();
+    for _ in 0..16 {
+        if !seen.insert(current.clone()) {
+            break;
+        }
+        match aliases.get(&current) {
+            Some(next) if next != &current => current = next.clone(),
+            _ => break,
+        }
+    }
+    current
+}
+
 fn color_of(parts: &[String]) -> u64 {
     let mut hash = FNV_OFFSET;
     for part in parts {
@@ -1163,6 +1196,29 @@ mod tests {
         assert!(certificate
             .blockers
             .contains(&AlignmentBlocker::AmbiguousMargin));
+    }
+
+    #[test]
+    fn predicate_aliases_let_different_wording_meet() {
+        let namespaces = store();
+        let assertions = vec![
+            assertion("alice", "张三", "type", "Person", ObjectKind::Entity),
+            assertion("alice", "张三", "老师", "李四", ObjectKind::Entity),
+            assertion("alice", "李四", "type", "Person", ObjectKind::Entity),
+            assertion("bob", "Zhang San", "type", "Person", ObjectKind::Entity),
+            assertion("bob", "Zhang San", "师傅", "Li Si", ObjectKind::Entity),
+            assertion("bob", "Li Si", "type", "Person", ObjectKind::Entity),
+        ];
+        let options = AlignmentOptions::default()
+            .with_predicate_aliases([("老师".to_string(), "师傅".to_string())]);
+        let plan = align_assertions(&namespaces, &assertions, &options);
+        let certificate = plan
+            .certificates
+            .iter()
+            .find(|certificate| certificate.from == "张三" && certificate.to == "Zhang San")
+            .expect("谓词归一后应产生公司/人物证书");
+        assert_eq!(certificate.status, AlignmentStatus::Accepted);
+        assert!(certificate.shared_predicates.contains(&"师傅".to_string()));
     }
 
     #[test]

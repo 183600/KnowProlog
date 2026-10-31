@@ -726,6 +726,29 @@ fn run_artifact_audit(
     }
 }
 
+/// 由同义词表与谓词画像构造结构对齐的谓词归一映射（画像优先）。
+fn alignment_options(
+    config: &know_prolog::SystemConfig,
+    rounds: usize,
+    min_confidence_bps: u16,
+) -> AlignmentOptions {
+    let mut aliases = BTreeMap::new();
+    if let Some(synonyms) = &config.synonyms {
+        for (alias, canonical) in &synonyms.mappings {
+            aliases.insert(alias.clone(), canonical.clone());
+        }
+    }
+    for profile in &config.predicate_profiles {
+        for alias in &profile.aliases {
+            aliases.insert(alias.clone(), profile.name.clone());
+        }
+    }
+    AlignmentOptions::default()
+        .with_rounds(rounds)
+        .with_min_confidence_bps(min_confidence_bps)
+        .with_predicate_aliases(aliases)
+}
+
 /// 配置声明的功能谓词（融合冲突判定的默认策略来源）。
 fn functional_predicates(config: &know_prolog::SystemConfig) -> Vec<String> {
     config
@@ -916,7 +939,7 @@ async fn run_fuse(
 
     let policy = FusionPolicy::new().with_functional(functional_predicates(config));
     let (alignment, plan, inserted, removed) = if align_view {
-        let options = AlignmentOptions::default();
+        let options = alignment_options(config, 2, 7_000);
         if apply {
             let (alignment, outcome) = manager.apply_fusion_with_identity(&policy, &options).await?;
             (
@@ -989,6 +1012,7 @@ async fn run_fuse(
 /// `align`：按图结构发现跨来源实体身份，可选写入已确认别名册。
 async fn run_align(
     manager: &OxigraphManager,
+    config: &SystemConfig,
     store_path: &str,
     rounds: usize,
     min_confidence_bps: u16,
@@ -997,9 +1021,7 @@ async fn run_align(
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let ledger = manager.load_fusion_ledger().await?;
-    let options = AlignmentOptions::default()
-        .with_rounds(rounds)
-        .with_min_confidence_bps(min_confidence_bps);
+    let options = alignment_options(config, rounds, min_confidence_bps);
     let plan = align_ledger(&ledger, &options);
 
     let registry_path = format!("{}/entity_registry.json", store_path);

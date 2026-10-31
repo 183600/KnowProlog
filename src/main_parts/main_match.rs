@@ -1951,6 +1951,7 @@
         }) => {
             if let Err(e) = run_align(
                 &oxigraph_manager,
+                &config,
                 &store_path,
                 rounds,
                 min_confidence_bps,
