@@ -47,6 +47,15 @@ impl SymbolicReasoner {
                     .insert(object.to_string());
             }
         }
+        // 退役事实仍留在知识图谱里；生成前把 claim 账本的墓碑投影成抑制项，
+        // 避免续说/换角度/重新介绍把已撤回或已遗忘的事实再说一遍。
+        for fact in self.claims.retired_facts() {
+            overlay
+                .suppress
+                .entry((fact.subject, fact.predicate))
+                .or_default()
+                .insert(fact.object);
+        }
         overlay
     }
 

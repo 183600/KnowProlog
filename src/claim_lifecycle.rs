@@ -1535,6 +1535,15 @@ impl ClaimLedger {
     pub fn claim(&self, id: &str) -> Option<&ClaimRecord> {
         self.claims.get(id)
     }
+    /// 已退役事实的键快照；生成前用它把墓碑投影成抑制项。
+    pub fn retired_facts(&self) -> Vec<FactKey> {
+        self.facts
+            .values()
+            .filter(|record| record.status.is_terminal())
+            .map(|record| record.key.clone())
+            .collect()
+    }
+
     /// 会话内 claim 台账的文本视图：确定性审计 + 最近更新的断言。
     pub fn render_report(&self) -> String {
         let mut output = self

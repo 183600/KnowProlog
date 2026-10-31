@@ -1767,3 +1767,30 @@ rules = [
             .expect("其余断言仍应可复述");
         assert!(!text.contains(plan.claims[0].text.trim()), "{}", text);
     }
+
+    #[test]
+    fn generation_overlay_suppresses_retired_facts() {
+        use crate::claim_lifecycle::{FactKey, RetirementKind};
+
+        let facts = vec![
+            PrologFact::Relation {
+                from: "孙五十".to_string(),
+                rel_type: "职业".to_string(),
+                to: "教师".to_string(),
+            },
+            PrologFact::Relation {
+                from: "孙五十".to_string(),
+                rel_type: "师傅".to_string(),
+                to: "李四".to_string(),
+            },
+        ];
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&facts);
+        let retired = FactKey::new("孙五十", "职业", "教师", false);
+        reasoner
+            .retire_generation_fact(&retired, RetirementKind::Redacted, "测试遗忘")
+            .expect("事实应可退役");
+        let text = reasoner.generate_about("孙五十").expect("其余事实仍应可介绍");
+        assert!(!text.contains("教师"), "{}", text);
+        assert!(text.contains("李四"), "{}", text);
+    }
