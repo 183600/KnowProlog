@@ -521,6 +521,8 @@ pub enum ClaimEventKind {
     ClaimExpired,
     ClaimRedacted,
     ClaimRevalidated,
+    /// 同一 claim 被再次观察：新增表达变体或出处，不改变生命周期状态。
+    ClaimObserved,
     FactRegistered,
     FactRetired,
 }
@@ -536,6 +538,7 @@ impl ClaimEventKind {
             ClaimEventKind::ClaimExpired => "claim_expired",
             ClaimEventKind::ClaimRedacted => "claim_redacted",
             ClaimEventKind::ClaimRevalidated => "claim_revalidated",
+            ClaimEventKind::ClaimObserved => "claim_observed",
             ClaimEventKind::FactRegistered => "fact_registered",
             ClaimEventKind::FactRetired => "fact_retired",
         }
@@ -1634,22 +1637,45 @@ impl ClaimLedger {
             return Err(ClaimError::SelfParent(id));
         }
         let text_digest = fnv1a_hex(canonical_statement(&draft.text).as_bytes());
-        if let Some(record) = self.claims.get_mut(&id) {
+        if let Some(record) = self.claims.get(&id) {
             let created = false;
-            if record.text_digests.insert(text_digest) {
-                record.updated_seq = self.events.len() as u64;
-            }
-            if let Some(origin) = draft.origin {
-                if record.origins.insert(origin) {
-                    record.updated_seq = self.events.len() as u64;
+            let terminal = record.status.is_terminal();
+            let slot = record.shape.structure.clone();
+            let status = record.status;
+            let mut observed = false;
+            // 终止态不可复活：再次登记既不改状态，也不追加出处/表达变体。
+            // 否则一次被闸门拒绝的提交会把「说出口」写进退役 claim 的谱系。
+            if !terminal {
+                let record = self.claims.get_mut(&id).expect("record exists");
+                if record.text_digests.insert(text_digest) {
+                    observed = true;
+                }
+                if let Some(origin) = draft.origin {
+                    if record.origins.insert(origin) {
+                        observed = true;
+                    }
+                }
+                record.last_turn = record.last_turn.max(turn);
+                record.revision = record.revision.max(revision);
+                if observed {
+                    record.updated_seq = self.events.len() as u64 + 1;
                 }
             }
-            record.last_turn = record.last_turn.max(turn);
-            record.revision = record.revision.max(revision);
+            if observed {
+                self.append_event(
+                    ClaimEventKind::ClaimObserved,
+                    ClaimEventTarget::claim(&id),
+                    Some(status.code()),
+                    Some(status.code()),
+                    "再次观察命题表达或出处",
+                    turn,
+                    revision,
+                );
+            }
             return Ok(RegisteredClaim {
-                slot: record.shape.structure.clone(),
+                slot,
                 id,
-                status: record.status,
+                status,
                 created,
                 plan_index: 0,
             });
@@ -1916,6 +1942,11 @@ impl ClaimLedger {
 
     /// 提交前闸门；不改状态，只给出 allow / refresh / deny 与可复核发现。
     pub fn gate(&self, id: &str, context: &GateContext) -> GateDecision {
+        self.gate_inner(id, context, false)
+    }
+
+    /// `chain_verified` 为真时跳过重复的整链校验；仅供同批提交使用。
+    fn gate_inner(&self, id: &str, context: &GateContext, chain_verified: bool) -> GateDecision {
         let mut findings = Vec::new();
         if self.version != CLAIM_LEDGER_VERSION {
             findings.push(GateFinding::new(
@@ -1923,7 +1954,7 @@ impl ClaimLedger {
                 format!("账本版本 {}，支持 {}", self.version, CLAIM_LEDGER_VERSION),
             ));
         }
-        if !context.chain_intact || !self.verify_chain(None).intact {
+        if !context.chain_intact || (!chain_verified && !self.verify_chain(None).intact) {
             findings.push(GateFinding::new(
                 GateFindingCode::ChainDamaged,
                 "事件链校验失败",
@@ -2008,7 +2039,19 @@ impl ClaimLedger {
         revision: u64,
         context: &GateContext,
     ) -> GateDecision {
-        let decision = self.gate(id, context);
+        self.authorize_emission_inner(id, origin, turn, revision, context, false)
+    }
+
+    fn authorize_emission_inner(
+        &mut self,
+        id: &str,
+        origin: ClaimOrigin,
+        turn: u64,
+        revision: u64,
+        context: &GateContext,
+        chain_verified: bool,
+    ) -> GateDecision {
+        let decision = self.gate_inner(id, context, chain_verified);
         if !decision.allowed() {
             return decision;
         }
@@ -2044,15 +2087,19 @@ impl ClaimLedger {
         context: &GateContext,
     ) -> PlanEmission {
         let registration = self.register_plan(plan, turn, revision);
+        // 同批提交只校验一次事件链，避免逐 claim 重复 O(events) 扫描。
+        let mut batch_context = context.clone();
+        batch_context.chain_intact = context.chain_intact && self.verify_chain(None).intact;
         let mut emitted = Vec::new();
         let mut refused = Vec::new();
         for claim in &registration.claims {
-            let decision = self.authorize_emission(
+            let decision = self.authorize_emission_inner(
                 &claim.id,
                 ClaimOrigin::reply(reply_seq, claim.plan_index as u32 + 1),
                 turn,
                 revision,
-                context,
+                &batch_context,
+                true,
             );
             if decision.allowed() {
                 emitted.push(decision.claim_id);
@@ -2573,6 +2620,31 @@ impl ClaimLedger {
             unknown_reasons.insert("重放窗口被截断，旧事件未参与审计".to_string());
         }
 
+        // 一次扫描事件流，建立 claim → 首次退役序号 / 全部提交序号。
+        // 审计因此保持 O(claims + events)，并能发现「退役—提交—再退役」
+        // 这种只看最后一次退役会漏掉的迟发提交。
+        let mut first_retirement_seq: BTreeMap<&str, u64> = BTreeMap::new();
+        let mut emission_seqs: BTreeMap<&str, Vec<u64>> = BTreeMap::new();
+        for event in &self.events {
+            let ClaimEventTarget::Claim { id } = &event.target else {
+                continue;
+            };
+            match event.kind {
+                ClaimEventKind::ClaimEmitted => {
+                    emission_seqs.entry(id.as_str()).or_default().push(event.seq);
+                }
+                ClaimEventKind::ClaimRetracted
+                | ClaimEventKind::ClaimSuperseded
+                | ClaimEventKind::ClaimExpired
+                | ClaimEventKind::ClaimRedacted => {
+                    first_retirement_seq
+                        .entry(id.as_str())
+                        .or_insert(event.seq);
+                }
+                _ => {}
+            }
+        }
+
         let mut active = 0usize;
         let mut emitted = 0usize;
         let mut retired = 0usize;
@@ -2624,24 +2696,18 @@ impl ClaimLedger {
                     detail: format!("支撑命中外部墓碑：{}", fact.render()),
                 });
             }
-            let last_emitted_seq = self
-                .events
-                .iter()
-                .rev()
-                .find(|event| {
-                    event.kind == ClaimEventKind::ClaimEmitted
-                        && event.target == ClaimEventTarget::claim(id)
-                })
-                .map(|event| event.seq);
-            if let (Some(retirement), Some(emitted_seq)) = (&record.retirement, last_emitted_seq) {
-                if emitted_seq > retirement.seq {
+            if let Some(first_seq) = first_retirement_seq.get(id.as_str()) {
+                if let Some(late) = emission_seqs
+                    .get(id.as_str())
+                    .and_then(|seqs| seqs.iter().copied().find(|seq| seq > first_seq))
+                {
                     late_emissions += 1;
                     findings.insert(AuditFinding {
                         code: GateFindingCode::ClaimRetired,
                         claim_id: id.clone(),
                         detail: format!(
-                            "序号 {} 在退役（{}）之后仍被提交",
-                            emitted_seq, retirement.seq
+                            "序号 {} 在首次退役（{}）之后仍被提交",
+                            late, first_seq
                         ),
                     });
                 }
@@ -3590,6 +3656,140 @@ mod tests {
                 "clm_deadbeefdeadbeef".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn repeated_observation_appends_event_only_when_origin_or_text_changes() {
+        let mut ledger = ClaimLedger::new();
+        let fact_key = fact("秦十五", "职业", "药师");
+        let first = ledger
+            .register(
+                draft(
+                    "秦十五",
+                    "职业",
+                    "s1",
+                    "秦十五是药师。",
+                    vec![ClaimSupport::fact(&fact_key)],
+                )
+                .with_origin(ClaimOrigin::reply(1, 1)),
+                1,
+                1,
+            )
+            .unwrap();
+        let events = ledger.events.len();
+        let second = ledger
+            .register(
+                draft(
+                    "秦十五",
+                    "职业",
+                    "s1",
+                    "秦十五是一名药师。",
+                    vec![ClaimSupport::fact(&fact_key)],
+                )
+                .with_origin(ClaimOrigin::reply(1, 1)),
+                1,
+                1,
+            )
+            .unwrap();
+        assert_eq!(first.id, second.id);
+        assert_eq!(ledger.events.len(), events + 1);
+        assert_eq!(
+            ledger.events.last().unwrap().kind,
+            ClaimEventKind::ClaimObserved
+        );
+        let before = ledger.events.len();
+        ledger
+            .register(
+                draft(
+                    "秦十五",
+                    "职业",
+                    "s1",
+                    "秦十五是一名药师。",
+                    vec![ClaimSupport::fact(&fact_key)],
+                )
+                .with_origin(ClaimOrigin::reply(1, 1)),
+                2,
+                2,
+            )
+            .unwrap();
+        assert_eq!(ledger.events.len(), before, "完全重复的观察不应膨胀事件链");
+    }
+
+    #[test]
+    fn rejected_reemission_does_not_add_origin_to_retired_claim() {
+        let mut ledger = ClaimLedger::new();
+        let fact_key = fact("秦十六", "职业", "技师");
+        let plan = plan_with(vec![claim_with_evidence(
+            "s1",
+            "秦十六是技师。",
+            vec![("秦十六", "职业", "技师")],
+        )]);
+        let first = ledger.emit_plan(&plan, 1, 1, 1, &GateContext::default());
+        assert_eq!(first.emitted.len(), 1);
+        let id = first.emitted[0].clone();
+        ledger
+            .retire_fact(&fact_key, RetirementKind::Retracted, "更正", 2, 2)
+            .unwrap();
+        let second = ledger.emit_plan(&plan, 2, 3, 3, &GateContext::default());
+        assert_eq!(second.refused.len(), 1);
+        let record = ledger.claim(&id).unwrap();
+        assert_eq!(record.status, ClaimStatus::Retracted);
+        assert!(!record.origins.iter().any(|origin| matches!(
+            origin,
+            ClaimOrigin::Reply {
+                reply_seq: 2,
+                ..
+            }
+        )));
+        assert!(record.origins.iter().any(|origin| matches!(
+            origin,
+            ClaimOrigin::Reply {
+                reply_seq: 1,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn audit_catches_emission_between_two_retirements() {
+        let mut ledger = ClaimLedger::new();
+        let fact_key = fact("秦十七", "职业", "技师");
+        let claim = ledger
+            .register(
+                draft(
+                    "秦十七",
+                    "职业",
+                    "s1",
+                    "秦十七是技师。",
+                    vec![ClaimSupport::fact(&fact_key)],
+                ),
+                1,
+                1,
+            )
+            .unwrap();
+        ledger
+            .retire_fact(&fact_key, RetirementKind::Expired, "过期", 2, 2)
+            .unwrap();
+        ledger
+            .retire_fact(&fact_key, RetirementKind::Redacted, "遗忘", 3, 3)
+            .unwrap();
+        // 模拟一条在两次退役之间被写入的提交事件；链仍然自洽。
+        ledger.append_event(
+            ClaimEventKind::ClaimEmitted,
+            ClaimEventTarget::claim(&claim.id),
+            Some(ClaimStatus::Expired.code()),
+            Some(ClaimStatus::Emitted.code()),
+            "迟发提交",
+            4,
+            4,
+        );
+        let report = ledger.audit(Some(0), &AuditOptions::default());
+        assert_eq!(report.verdict, AuditVerdict::Findings);
+        assert_eq!(report.late_emissions, 1);
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.code == GateFindingCode::ClaimRetired));
     }
 
     #[test]
