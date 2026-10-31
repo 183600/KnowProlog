@@ -726,6 +726,7 @@ pub enum ClaimError {
     UnknownParent(String),
     SelfParent(String),
     UnknownClaim(String),
+    TerminalClaim(String),
     InvalidRetirement(String),
     StillUnsupported(String),
     LedgerVersion(u32),
@@ -740,6 +741,9 @@ impl fmt::Display for ClaimError {
             ClaimError::UnknownParent(id) => write!(formatter, "父 claim 不存在：{}", id),
             ClaimError::SelfParent(id) => write!(formatter, "claim 不能支撑自己：{}", id),
             ClaimError::UnknownClaim(id) => write!(formatter, "claim 不存在：{}", id),
+            ClaimError::TerminalClaim(id) => {
+                write!(formatter, "claim 已终止，不能再变更：{}", id)
+            }
             ClaimError::InvalidRetirement(detail) => {
                 write!(formatter, "非法的退役请求：{}", detail)
             }
@@ -817,6 +821,7 @@ pub enum GateFindingCode {
     ClaimRetired,
     SupportRetired,
     ParentRetired,
+    ParentStale,
     ExternalTombstone,
     StaleClaim,
 }
@@ -832,6 +837,7 @@ impl GateFindingCode {
             GateFindingCode::ClaimRetired => "claim_retired",
             GateFindingCode::SupportRetired => "support_retired",
             GateFindingCode::ParentRetired => "parent_retired",
+            GateFindingCode::ParentStale => "parent_stale",
             GateFindingCode::ExternalTombstone => "external_tombstone",
             GateFindingCode::StaleClaim => "stale_claim",
         }
@@ -847,6 +853,7 @@ impl GateFindingCode {
             GateFindingCode::ClaimRetired => "命题已退役",
             GateFindingCode::SupportRetired => "支撑已退役",
             GateFindingCode::ParentRetired => "父命题已退役",
+            GateFindingCode::ParentStale => "父命题待复核",
             GateFindingCode::ExternalTombstone => "外部墓碑命中",
             GateFindingCode::StaleClaim => "命题待复核",
         }
@@ -1797,6 +1804,15 @@ impl ClaimLedger {
     }
 
     fn support_problem(&self, record: &ClaimRecord) -> Option<(GateFindingCode, String)> {
+        let mut visiting = BTreeSet::new();
+        self.support_problem_inner(record, &mut visiting)
+    }
+
+    fn support_problem_inner(
+        &self,
+        record: &ClaimRecord,
+        visiting: &mut BTreeSet<String>,
+    ) -> Option<(GateFindingCode, String)> {
         if record.support.is_empty() {
             return Some((
                 GateFindingCode::MissingEvidence,
@@ -1835,6 +1851,23 @@ impl ClaimLedger {
                             format!("父 claim {} {}", id, parent.status.label_zh()),
                         ));
                     }
+                    if parent.status == ClaimStatus::Stale {
+                        return Some((
+                            GateFindingCode::ParentStale,
+                            format!("父 claim {} 待复核", id),
+                        ));
+                    }
+                    if !visiting.insert(id.clone()) {
+                        return Some((
+                            GateFindingCode::UnknownSupport,
+                            format!("父 claim 链存在环：{}", id),
+                        ));
+                    }
+                    if let Some((code, detail)) = self.support_problem_inner(parent, visiting) {
+                        visiting.remove(id);
+                        return Some((code, format!("父 claim {}：{}", id, detail)));
+                    }
+                    visiting.remove(id);
                 }
             }
         }
@@ -2240,6 +2273,43 @@ impl ClaimLedger {
         );
         self.retire_descendants(old, RetirementKind::Superseded, reason, turn, revision);
         Ok(self.impact_of_claim(old))
+    }
+
+    /// 把活跃 claim 标记为待复核；不改变支撑，也不允许复活终止态。
+    ///
+    /// 这用于来源可靠性下降等“尚未确定退役”的场景：闸门会要求刷新，
+    /// 审计会显式报告 stale，而不是继续把旧回答当作干净。
+    pub fn mark_stale(
+        &mut self,
+        id: &str,
+        reason: &str,
+        turn: u64,
+        revision: u64,
+    ) -> Result<ClaimStatus, ClaimError> {
+        let Some(record) = self.claims.get_mut(id) else {
+            return Err(ClaimError::UnknownClaim(id.to_string()));
+        };
+        if record.status.is_terminal() {
+            return Err(ClaimError::TerminalClaim(id.to_string()));
+        }
+        if record.status == ClaimStatus::Stale {
+            return Ok(ClaimStatus::Stale);
+        }
+        let from = record.status;
+        let seq = self.events.len() as u64 + 1;
+        record.status = ClaimStatus::Stale;
+        record.last_turn = record.last_turn.max(turn);
+        record.updated_seq = seq;
+        self.append_event(
+            ClaimEventKind::ClaimStale,
+            ClaimEventTarget::claim(id),
+            Some(from.code()),
+            Some(ClaimStatus::Stale.code()),
+            reason,
+            turn,
+            revision,
+        );
+        Ok(ClaimStatus::Stale)
     }
 
     /// 将 `stale` claim 重新核验；支撑仍失效时拒绝复活。
@@ -3318,6 +3388,134 @@ mod tests {
         assert_eq!(
             ledger.revalidate(&claim.id, 4, 4),
             Err(ClaimError::StillUnsupported(claim.id))
+        );
+    }
+
+    #[test]
+    fn stale_claims_require_refresh_and_are_visible_to_audit() {
+        let mut ledger = ClaimLedger::new();
+        let fact_key = fact("陈十三", "职业", "医生");
+        let claim = ledger
+            .register(
+                draft(
+                    "陈十三",
+                    "职业",
+                    "s1",
+                    "陈十三是医生。",
+                    vec![ClaimSupport::fact(&fact_key)],
+                ),
+                1,
+                1,
+            )
+            .unwrap();
+        assert!(ledger
+            .authorize_emission(
+                &claim.id,
+                ClaimOrigin::reply(1, 1),
+                1,
+                1,
+                &GateContext::default()
+            )
+            .allowed());
+        assert_eq!(
+            ledger.mark_stale(&claim.id, "来源可靠性下降", 2, 2),
+            Ok(ClaimStatus::Stale)
+        );
+        assert_eq!(
+            ledger.gate(&claim.id, &GateContext::default()).verdict,
+            GateVerdict::Refresh
+        );
+        let audit = ledger.audit(Some(1), &AuditOptions::default());
+        assert_eq!(audit.verdict, AuditVerdict::Findings);
+        assert!(audit
+            .findings
+            .iter()
+            .any(|finding| finding.code == GateFindingCode::StaleClaim));
+        assert_eq!(ledger.revalidate(&claim.id, 3, 3), Ok(ClaimStatus::Emitted));
+        ledger
+            .retire_fact(&fact_key, RetirementKind::Expired, "过期", 4, 4)
+            .unwrap();
+        assert_eq!(
+            ledger.mark_stale(&claim.id, "再次标记", 5, 5),
+            Err(ClaimError::TerminalClaim(claim.id))
+        );
+    }
+
+    #[test]
+    fn claim_support_requires_grounded_and_non_stale_ancestors() {
+        let mut ledger = ClaimLedger::new();
+        let parent = ledger
+            .register(
+                draft("孙十四", "职业", "s0", "孙十四可能有职业。", Vec::new()),
+                1,
+                1,
+            )
+            .unwrap();
+        let child = ledger
+            .register(
+                draft(
+                    "孙十四",
+                    "行业",
+                    "s1",
+                    "孙十四从事某行业。",
+                    vec![ClaimSupport::claim(&parent.id)],
+                ),
+                2,
+                1,
+            )
+            .unwrap();
+        let decision = ledger.gate(&child.id, &GateContext::default());
+        assert_eq!(decision.verdict, GateVerdict::Refresh);
+        assert!(decision
+            .findings
+            .iter()
+            .any(|finding| finding.code == GateFindingCode::MissingEvidence));
+
+        let fact_key = fact("孙十四", "职业", "医生");
+        let grounded = ledger
+            .register(
+                draft(
+                    "孙十四",
+                    "职业",
+                    "s2",
+                    "孙十四是医生。",
+                    vec![ClaimSupport::fact(&fact_key)],
+                ),
+                3,
+                1,
+            )
+            .unwrap();
+        let grounded_child = ledger
+            .register(
+                draft(
+                    "孙十四",
+                    "行业",
+                    "s3",
+                    "孙十四从事医疗行业。",
+                    vec![ClaimSupport::claim(&grounded.id)],
+                ),
+                4,
+                1,
+            )
+            .unwrap();
+        assert!(ledger
+            .gate(&grounded_child.id, &GateContext::default())
+            .allowed());
+        ledger.mark_stale(&grounded.id, "来源复核", 5, 2).unwrap();
+        let decision = ledger.gate(&grounded_child.id, &GateContext::default());
+        assert_eq!(decision.verdict, GateVerdict::Refresh);
+        assert!(decision
+            .findings
+            .iter()
+            .any(|finding| finding.code == GateFindingCode::ParentStale));
+        ledger
+            .retire_fact(&fact_key, RetirementKind::Expired, "过期", 6, 3)
+            .unwrap();
+        assert_eq!(
+            ledger
+                .gate(&grounded_child.id, &GateContext::default())
+                .verdict,
+            GateVerdict::Deny
         );
     }
 
