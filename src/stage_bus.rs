@@ -1088,9 +1088,13 @@ impl BeliefLedger {
             .find(|belief| belief.value == observation.value)
         {
             let current = existing.envelope_at(turn);
-            existing.envelope = merge_support(current, observation.envelope);
+            let (merged, incompatible) = merge_support(current, observation.envelope);
+            existing.envelope = merged;
             existing.last_turn = turn;
             existing.corroborations = existing.corroborations.saturating_add(1);
+            if incompatible {
+                existing.conflicts = existing.conflicts.saturating_add(1);
+            }
             if observation.grade > existing.grade {
                 existing.grade = observation.grade;
             }
@@ -1297,17 +1301,21 @@ fn normalized(mut observation: BeliefObservation) -> BeliefObservation {
     observation
 }
 
-fn merge_support(left: ClaimEnvelope, right: ClaimEnvelope) -> ClaimEnvelope {
+fn merge_support(left: ClaimEnvelope, right: ClaimEnvelope) -> (ClaimEnvelope, bool) {
     let lower = left.lower_bps().max(right.lower_bps());
     let upper = left.upper_bps().min(right.upper_bps());
     if lower <= upper {
-        ClaimEnvelope::new(lower, upper)
+        (ClaimEnvelope::new(lower, upper), false)
     } else {
-        // 两个「支持同一取值」的区间却互不相容：说明至少一方高估了自己，
-        // 用包络而不是硬选一个端点。
-        ClaimEnvelope::new(
-            left.lower_bps().min(right.lower_bps()),
-            left.upper_bps().max(right.upper_bps()),
+        // 两个「支持同一取值」的区间却互不相容：说明至少一方高估了自己。
+        // 用包络而不是硬选一个端点，并把这次支持记为一次内部冲突，
+        // 避免佐证计数把矛盾悄悄洗成确定性。
+        (
+            ClaimEnvelope::new(
+                left.lower_bps().min(right.lower_bps()),
+                left.upper_bps().max(right.upper_bps()),
+            ),
+            true,
         )
     }
 }
@@ -1761,6 +1769,39 @@ mod tests {
         let after = ledger.slot_beliefs("小明", "年龄")[0].envelope_at(63);
         assert!(after.lower_bps() < before.lower_bps());
         assert!(after.upper_bps() > before.upper_bps());
+    }
+
+    #[test]
+    fn belief_ledger_counts_incompatible_supports_as_conflicts() {
+        let mut ledger = BeliefLedger::new(4);
+        ledger.observe(
+            1,
+            BeliefObservation::new(
+                "小明",
+                "身高",
+                "170",
+                "来源甲",
+                EnvelopeGrade::Graph,
+                ClaimEnvelope::new(8_000, 9_000),
+            ),
+        );
+        ledger.observe(
+            2,
+            BeliefObservation::new(
+                "小明",
+                "身高",
+                "170",
+                "来源乙",
+                EnvelopeGrade::Graph,
+                ClaimEnvelope::new(1_000, 2_000),
+            ),
+        );
+        let beliefs = ledger.slot_beliefs("小明", "身高");
+        assert_eq!(beliefs.len(), 1);
+        assert_eq!(beliefs[0].corroborations, 1);
+        assert_eq!(beliefs[0].conflicts, 1);
+        assert_eq!(beliefs[0].envelope_at(2).lower_bps(), 1_000);
+        assert!(beliefs[0].envelope_at(2).upper_bps() >= 9_000);
     }
 
     #[test]
