@@ -220,11 +220,7 @@ impl AlignmentCertificate {
         };
         lines.push(format!(
             "  类型：{} / {}；结构：{}/{} 轮一致；指纹 {}",
-            from_types,
-            to_types,
-            self.matched_rounds,
-            self.total_rounds,
-            self.fingerprint
+            from_types, to_types, self.matched_rounds, self.total_rounds, self.fingerprint
         ));
         let shared = if self.shared_predicates.is_empty() {
             "无".to_string()
@@ -297,7 +293,10 @@ impl AlignmentPlan {
         for certificate in self.accepted() {
             let left = (certificate.from_scope.clone(), certificate.from.clone());
             let right = (certificate.to_scope.clone(), certificate.to.clone());
-            adjacency.entry(left.clone()).or_default().insert(right.clone());
+            adjacency
+                .entry(left.clone())
+                .or_default()
+                .insert(right.clone());
             adjacency.entry(right).or_default().insert(left);
         }
         let scope_rank: BTreeMap<&str, usize> = self
@@ -355,17 +354,19 @@ impl AlignmentPlan {
 
     /// 规范名在等价类成员的某个命名空间中若已被另一个节点占用，整个等价类
     /// 不投影：宁可保留两个词面，也不把无关实体吸并到规范名上。
-    fn component_can_use(&self, canonical: &(String, String), component: &[(String, String)]) -> bool {
+    fn component_can_use(
+        &self,
+        canonical: &(String, String),
+        component: &[(String, String)],
+    ) -> bool {
         component.iter().all(|(scope, _)| {
             *scope == canonical.0
                 || !self
                     .known_nodes
                     .contains(&(scope.clone(), canonical.1.clone()))
-                || component
-                    .iter()
-                    .any(|(member_scope, member_surface)| {
-                        member_scope == scope && member_surface == &canonical.1
-                    })
+                || component.iter().any(|(member_scope, member_surface)| {
+                    member_scope == scope && member_surface == &canonical.1
+                })
         })
     }
 
@@ -419,14 +420,9 @@ impl AlignmentPlan {
         edges
             .into_iter()
             .map(|(alias, canonical, confidence, source)| {
-                IdentityEdge::new(
-                    &alias,
-                    &canonical,
-                    IdentityKind::Structural,
-                    &canonical,
-                )
-                .with_source(&source)
-                .with_confidence(f64::from(confidence) / 10_000.0)
+                IdentityEdge::new(&alias, &canonical, IdentityKind::Structural, &canonical)
+                    .with_source(&source)
+                    .with_confidence(f64::from(confidence) / 10_000.0)
             })
             .collect()
     }
@@ -445,12 +441,7 @@ impl AlignmentPlan {
     pub fn render_zh(&self) -> String {
         let mut lines = vec![format!(
             "图间身份对齐：命名空间 {} / 实体 {} / 候选 {} / 接受 {} / 提案 {} / 拒绝 {}",
-            self.scopes,
-            self.nodes,
-            self.candidates,
-            self.accepted,
-            self.proposed,
-            self.rejected
+            self.scopes, self.nodes, self.candidates, self.accepted, self.proposed, self.rejected
         )];
         if self.oversized_buckets > 0 {
             lines.push(format!(
@@ -664,14 +655,8 @@ pub fn align_assertions(
                     (Some(left_build), Some(right_build)) => (left_build, right_build),
                     _ => continue,
                 };
-                let matched_rounds =
-                    matched_rounds(&fingerprints[left], &fingerprints[right]);
-                let confidence = confidence_bps(
-                    left_build,
-                    right_build,
-                    matched_rounds,
-                    options,
-                );
+                let matched_rounds = matched_rounds(&fingerprints[left], &fingerprints[right]);
+                let confidence = confidence_bps(left_build, right_build, matched_rounds, options);
                 let candidate = Candidate {
                     from: left.clone(),
                     to: right.clone(),
@@ -763,8 +748,8 @@ pub fn align_assertions(
         if known_nodes.contains(&(alias_scope.clone(), canonical.clone())) {
             blockers.push(AlignmentBlocker::NameCollision);
         }
-        let types_equal = !source_build.types.is_empty()
-            && source_build.types == target_build.types;
+        let types_equal =
+            !source_build.types.is_empty() && source_build.types == target_build.types;
         if !types_equal {
             if source_build.types.is_empty() || target_build.types.is_empty() {
                 blockers.push(AlignmentBlocker::MissingTypes);
@@ -779,8 +764,7 @@ pub fn align_assertions(
         if source_fingerprint.truncated || target_fingerprint.truncated {
             blockers.push(AlignmentBlocker::HubTruncated);
         }
-        if source_build.degree() < options.min_degree
-            || target_build.degree() < options.min_degree
+        if source_build.degree() < options.min_degree || target_build.degree() < options.min_degree
         {
             blockers.push(AlignmentBlocker::Sparse);
         }
@@ -875,10 +859,8 @@ fn fingerprint_nodes(
     options: &AlignmentOptions,
 ) -> BTreeMap<NodeKey, Fingerprint> {
     let initial = color_of(&["node".to_string()]);
-    let mut colors: BTreeMap<NodeKey, u64> = nodes
-        .keys()
-        .map(|key| (key.clone(), initial))
-        .collect();
+    let mut colors: BTreeMap<NodeKey, u64> =
+        nodes.keys().map(|key| (key.clone(), initial)).collect();
     let mut traces: BTreeMap<NodeKey, Vec<u64>> = colors
         .keys()
         .map(|key| (key.clone(), vec![initial]))
@@ -986,16 +968,10 @@ fn canonical_pair(
     right: &NodeKey,
     scope_rank: &BTreeMap<String, usize>,
 ) -> (String, String) {
-    let left_rank = scope_rank
-        .get(&left.scope)
-        .copied()
-        .unwrap_or(usize::MAX);
-    let right_rank = scope_rank
-        .get(&right.scope)
-        .copied()
-        .unwrap_or(usize::MAX);
-    let left_first = left_rank < right_rank
-        || (left_rank == right_rank && left.surface <= right.surface);
+    let left_rank = scope_rank.get(&left.scope).copied().unwrap_or(usize::MAX);
+    let right_rank = scope_rank.get(&right.scope).copied().unwrap_or(usize::MAX);
+    let left_first =
+        left_rank < right_rank || (left_rank == right_rank && left.surface <= right.surface);
     if left_first {
         (left.surface.clone(), right.surface.clone())
     } else {
@@ -1012,12 +988,7 @@ fn compare_nodes(
         .get(&left.scope)
         .copied()
         .unwrap_or(usize::MAX)
-        .cmp(
-            &scope_rank
-                .get(&right.scope)
-                .copied()
-                .unwrap_or(usize::MAX),
-        )
+        .cmp(&scope_rank.get(&right.scope).copied().unwrap_or(usize::MAX))
         .then_with(|| left.surface.cmp(&right.surface))
         .then_with(|| left.scope.cmp(&right.scope))
 }
@@ -1123,11 +1094,15 @@ mod tests {
         let certificate = plan
             .certificates
             .iter()
-            .find(|certificate| certificate.from.contains("苹果") || certificate.to.contains("苹果"))
+            .find(|certificate| {
+                certificate.from.contains("苹果") || certificate.to.contains("苹果")
+            })
             .expect("公司应出现身份证书");
         assert_eq!(certificate.status, AlignmentStatus::Accepted);
         assert_eq!(certificate.from_types, vec!["Company".to_string()]);
-        assert!(certificate.shared_predicates.contains(&"创始人".to_string()));
+        assert!(certificate
+            .shared_predicates
+            .contains(&"创始人".to_string()));
         assert!(certificate.confidence_bps >= 7_000);
         assert!(certificate.matched_rounds >= 2);
     }
@@ -1145,9 +1120,7 @@ mod tests {
         let certificate = plan
             .certificates
             .iter()
-            .find(|certificate| {
-                certificate.from == "苹果" && certificate.to == "苹果公司"
-            })
+            .find(|certificate| certificate.from == "苹果" && certificate.to == "苹果公司")
             .expect("同构但类型互斥的实体应留下拒绝证书");
         assert_eq!(certificate.status, AlignmentStatus::Rejected);
         assert!(certificate
