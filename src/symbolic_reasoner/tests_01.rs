@@ -26,6 +26,8 @@
             abduction_max_hypotheses: 5,
             abduction_max_scenario_size: 2,
             enable_clarification: true,
+            enable_clarification_lookahead: true,
+            clarification_lookahead_branches: crate::lookahead::DEFAULT_BRANCHES,
             enable_graph_walk: true,
             graph_walk_damping: 0.85,
             graph_walk_iterations: 12,

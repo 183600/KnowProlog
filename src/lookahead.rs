@@ -194,6 +194,8 @@ impl BranchSeal {
 pub struct BranchEvidence {
     /// 探针会话（已重放回答并完成重排；不写真实会话）。
     pub session: ClarificationSession,
+    /// 重放后、重排前的会话承诺摘要；真实路径必须逐位一致才可复用。
+    pub state: u64,
     /// 重放后探针引擎的摘要；真实路径必须逐位一致才可复用。
     pub engine: u64,
     /// 重放后的解释空间大小。
@@ -210,6 +212,16 @@ pub struct BranchEvidence {
 
 impl BranchEvidence {
     pub fn new(session: ClarificationSession, engine: u64, goal_proved: bool) -> Self {
+        let state = session_state_digest(&session);
+        Self::with_state(session, engine, state, goal_proved)
+    }
+
+    pub fn with_state(
+        session: ClarificationSession,
+        engine: u64,
+        state: u64,
+        goal_proved: bool,
+    ) -> Self {
         let (explanation_count, explanation_bounded) = session
             .explanation_space()
             .map(|space| (space.len(), space.is_bounded()))
@@ -218,6 +230,7 @@ impl BranchEvidence {
             next_question: session.current().map(|h| h.atom.display()),
             remaining: session.remaining(),
             session,
+            state,
             engine,
             explanation_count,
             explanation_bounded,
@@ -277,15 +290,19 @@ impl LookaheadBoard {
         self.entries.get(key)
     }
 
+    /// 取走一条证据：命中即从板上删除，避免同一证据被重复消费。
+    pub fn take(&mut self, seal: &BranchSeal, key: &BranchKey) -> Option<BranchEvidence> {
+        if self.seal.as_ref() != Some(seal) {
+            return None;
+        }
+        self.order.retain(|cached| cached != key);
+        self.entries.remove(key)
+    }
+
     /// 写入一条证据；封印变化时整体清空，容量溢出淘汰最久未用者。
     ///
     /// 返回被淘汰的条目数（0 或 1）。
-    pub fn insert(
-        &mut self,
-        seal: &BranchSeal,
-        key: BranchKey,
-        evidence: BranchEvidence,
-    ) -> usize {
+    pub fn insert(&mut self, seal: &BranchSeal, key: BranchKey, evidence: BranchEvidence) -> usize {
         if self.seal.as_ref() != Some(seal) {
             self.entries.clear();
             self.order.clear();
@@ -309,6 +326,32 @@ impl LookaheadBoard {
         self.order.clear();
         self.seal = None;
     }
+}
+
+/// 会话承诺摘要：回答推进后、重排之前的可观测状态。
+///
+/// 真实路径重放同一回答后必须与此摘要一致，才能采用分支证据。
+pub fn session_state_digest(session: &ClarificationSession) -> u64 {
+    let mut parts = vec![
+        format!("asked:{}", session.questions_asked()),
+        format!("remaining:{}", session.remaining()),
+        format!(
+            "current:{}",
+            session
+                .current()
+                .map(|h| h.atom.display())
+                .unwrap_or_default()
+        ),
+    ];
+    parts.push("queue".to_string());
+    parts.extend(session.queue().iter().map(|h| h.atom.display()));
+    parts.push("confirmed".to_string());
+    parts.extend(session.confirmed.iter().map(|h| h.atom.display()));
+    parts.push("rejected".to_string());
+    parts.extend(session.rejected.iter().map(|h| h.atom.display()));
+    parts.push("deferred".to_string());
+    parts.extend(session.deferred.iter().map(|h| h.atom.display()));
+    digest_list(&parts)
 }
 
 /// 归结引擎的确定性摘要：排序后的事实与规则，不依赖 `HashSet` 遍历序。
@@ -464,10 +507,7 @@ mod tests {
         let evidence = BranchEvidence::new(session(), 9, false);
         assert_eq!(board.insert(&base, key.clone(), evidence.clone()), 0);
         assert!(board.lookup(&base, &key).is_some());
-        assert!(
-            board.lookup(&seal(2), &key).is_none(),
-            "不同封印不得命中"
-        );
+        assert!(board.lookup(&seal(2), &key).is_none(), "不同封印不得命中");
 
         let other = BranchKey::Reject("师傅(张三, 李四)".to_string());
         let third = BranchKey::Defer("师傅(张三, 李四)".to_string());
@@ -485,7 +525,11 @@ mod tests {
     fn new_seal_invalidates_the_whole_board() {
         let mut board = LookaheadBoard::new(4);
         let key = BranchKey::Confirm("a".to_string());
-        board.insert(&seal(1), key.clone(), BranchEvidence::new(session(), 1, false));
+        board.insert(
+            &seal(1),
+            key.clone(),
+            BranchEvidence::new(session(), 1, false),
+        );
         assert!(board.lookup(&seal(2), &key).is_none());
         board.insert(
             &seal(2),
@@ -516,7 +560,11 @@ mod tests {
         engine.add_fact("师傅", "张三", "李四");
         assert_eq!(engine_digest(&engine), with_fact, "幂等写入不改变摘要");
         engine.add_clause(Clause::new(
-            Atom::pattern("师祖", crate::resolution_engine::Term::var("X"), crate::resolution_engine::Term::var("Z")),
+            Atom::pattern(
+                "师祖",
+                crate::resolution_engine::Term::var("X"),
+                crate::resolution_engine::Term::var("Z"),
+            ),
             vec![Atom::pattern(
                 "师傅",
                 crate::resolution_engine::Term::var("X"),

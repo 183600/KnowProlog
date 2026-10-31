@@ -432,6 +432,7 @@ impl SymbolicReasoner {
         }
         // 图谱变化后，上一张模式的见证下标与结果页不再可信：整体作废。
         *self.graph_session.lock() = None;
+        self.clarification_lookahead.lock().clear();
         self.revision += 1;
         self.perf.bump("observe_changed");
         if triples_added {

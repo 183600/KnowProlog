@@ -195,6 +195,7 @@ impl SymbolicReasoner {
             session_receipts: Vec::new(),
             batch_pending: None,
             clarification: None,
+            clarification_lookahead: parking_lot::Mutex::new(LookaheadBoard::default()),
             last_abduction_goal: None,
             last_abduction_vars: Vec::new(),
             known_predicates_cache: Vec::new(),
@@ -280,6 +281,7 @@ impl SymbolicReasoner {
         fresh.clarification = clarification;
         fresh.last_abduction_goal = last_goal;
         fresh.last_abduction_vars = last_vars;
+        fresh.prefetch_clarification_lookahead();
         fresh.engine_fault = engine_fault;
         *self = fresh;
     }
@@ -324,6 +326,7 @@ impl SymbolicReasoner {
         self.entity_mentions_memo.lock().clear();
         self.predicate_canonicals_memo.lock().clear();
         self.prediction_drafts.lock().clear();
+        self.clarification_lookahead.lock().clear();
         self.proof_memory.lock().clear();
         self.read_traces.clear();
         self.semantic.clear();

@@ -483,6 +483,12 @@ pub struct ReasoningConfig {
     pub abduction_max_scenario_size: usize,
     #[serde(default = "default_enable_clarification")]
     pub enable_clarification: bool,
+    /// 澄清分支前瞻：为下一句常见短答预计算派生证据包；默认开启。
+    #[serde(default = "default_enable_clarification_lookahead")]
+    pub enable_clarification_lookahead: bool,
+    /// 每个澄清问题预计算的分支数（1-5，默认 2：先覆盖「是 / 不是」）。
+    #[serde(default = "default_clarification_lookahead_branches")]
+    pub clarification_lookahead_branches: usize,
     #[serde(default = "default_enable_graph_walk")]
     pub enable_graph_walk: bool,
     #[serde(default = "default_graph_walk_damping")]
@@ -632,6 +638,12 @@ fn default_abduction_max_scenario_size() -> usize {
 fn default_enable_clarification() -> bool {
     true
 }
+fn default_enable_clarification_lookahead() -> bool {
+    true
+}
+fn default_clarification_lookahead_branches() -> usize {
+    crate::lookahead::DEFAULT_BRANCHES
+}
 fn default_enable_graph_walk() -> bool {
     true
 }
@@ -713,6 +725,8 @@ impl Default for ReasoningConfig {
             abduction_max_hypotheses: default_abduction_max_hypotheses(),
             abduction_max_scenario_size: default_abduction_max_scenario_size(),
             enable_clarification: default_enable_clarification(),
+            enable_clarification_lookahead: default_enable_clarification_lookahead(),
+            clarification_lookahead_branches: default_clarification_lookahead_branches(),
             enable_graph_walk: default_enable_graph_walk(),
             graph_walk_damping: default_graph_walk_damping(),
             graph_walk_iterations: default_graph_walk_iterations(),

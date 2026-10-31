@@ -821,6 +821,19 @@
             continue;
         }
 
+        // 澄清分支前瞻：下一句常见短答的派生证据包（只读回执，不进知识图谱）
+        if matches!(input, "澄清前瞻" | "澄清前瞻报告" | "前瞻报告") {
+            println!("{}", symbolic_reasoner.clarification_lookahead_report());
+            println!();
+            continue;
+        }
+        if matches!(input, "清空澄清前瞻" | "清空前瞻") {
+            let cleared = symbolic_reasoner.clear_clarification_lookahead();
+            println!("已清空澄清分支前瞻（{} 条）。", cleared);
+            println!();
+            continue;
+        }
+
         // 证明日志：从编年史回放已具体化的证明凭证（稳定 id，可再叙述）
         if matches!(input, "证明日志" | "证明档案" | "证明记录") {
             match chronicle.as_ref() {

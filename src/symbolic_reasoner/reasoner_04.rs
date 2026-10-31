@@ -5,6 +5,7 @@ impl SymbolicReasoner {
         *self.graph_session.lock() = None;
         // 会话事实/假设可能已直接注入归结引擎：旧证明不再可复用。
         self.proof_memory.lock().clear();
+        self.clarification_lookahead.lock().clear();
     }
 
     fn unindex_session_atom(&mut self, atom: &Atom) {
@@ -396,6 +397,7 @@ impl SymbolicReasoner {
             session.reprioritize(&self.resolver, &goals, &self.last_abduction_vars);
         }
         self.clarification = Some(session);
+        self.prefetch_clarification_lookahead();
         Some(self.render_clarification_prompt())
     }
 
@@ -416,6 +418,7 @@ impl SymbolicReasoner {
 
     /// 处理用户对当前澄清问题的回答（是 / 不是 / 不知道）
     pub fn answer_clarification(&mut self, text: &str) -> Option<String> {
+        let mut lookahead = self.take_clarification_lookahead(text);
         let reply = {
             let session = self.clarification.as_mut()?;
             session.respond(text)
@@ -459,7 +462,9 @@ impl SymbolicReasoner {
                                 ));
                             }
                         }
-                        self.reprioritize_clarification();
+                        if !self.apply_clarification_lookahead(lookahead.take()) {
+                            self.reprioritize_clarification();
+                        }
                         output.push_str(&self.clarification_follow_up());
                         Some(output)
                     }
@@ -509,7 +514,9 @@ impl SymbolicReasoner {
                                 ));
                             }
                         }
-                        self.reprioritize_clarification();
+                        if !self.apply_clarification_lookahead(lookahead.take()) {
+                            self.reprioritize_clarification();
+                        }
                         output.push_str(&self.clarification_follow_up());
                         Some(output)
                     }
@@ -549,7 +556,9 @@ impl SymbolicReasoner {
                                 ));
                             }
                         }
-                        self.reprioritize_clarification();
+                        if !self.apply_clarification_lookahead(lookahead.take()) {
+                            self.reprioritize_clarification();
+                        }
                         output.push_str(&self.clarification_follow_up());
                         Some(output)
                     }
@@ -563,12 +572,16 @@ impl SymbolicReasoner {
                         self.render_atom_nl(&hypothesis.atom)
                     ));
                 }
-                self.reprioritize_clarification();
+                if !self.apply_clarification_lookahead(lookahead.take()) {
+                    self.reprioritize_clarification();
+                }
                 output.push_str(&self.clarification_follow_up());
                 Some(output)
             }
             ClarificationReply::Rejected(hypothesis) => {
-                self.reprioritize_clarification();
+                if !self.apply_clarification_lookahead(lookahead.take()) {
+                    self.reprioritize_clarification();
+                }
                 Some(format!(
                     "✗ 已排除假设：{}。{}",
                     self.render_atom_nl(&hypothesis.atom),
@@ -576,7 +589,9 @@ impl SymbolicReasoner {
                 ))
             }
             ClarificationReply::Deferred(hypothesis) => {
-                self.reprioritize_clarification();
+                if !self.apply_clarification_lookahead(lookahead.take()) {
+                    self.reprioritize_clarification();
+                }
                 Some(format!(
                     "？暂记为不确定：{}。{}",
                     self.render_atom_nl(&hypothesis.atom),
@@ -643,6 +658,7 @@ impl SymbolicReasoner {
         if let Some(session) = self.clarification.as_mut() {
             session.refresh_explanation_space(space);
         }
+        self.prefetch_clarification_lookahead();
     }
 
     /// 澄清推进：若原始目标已得证则汇报答案并结束会话；否则继续下一问。
@@ -691,6 +707,7 @@ impl SymbolicReasoner {
             );
         }
         if self.clarification_active() {
+            self.prefetch_clarification_lookahead();
             format!("\n{}", self.render_clarification_prompt())
         } else {
             format!("\n{}", self.finish_clarification_session())
@@ -714,6 +731,7 @@ impl SymbolicReasoner {
     }
 
     fn finish_clarification_session(&mut self) -> String {
+        self.clarification_lookahead.lock().clear();
         let Some(session) = self.clarification.take() else {
             return "【对话式澄清】没有进行中的澄清会话。".to_string();
         };

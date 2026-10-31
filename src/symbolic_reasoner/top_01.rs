@@ -59,6 +59,7 @@ use crate::lexical_trace::{
     self, LexicalTrace, ReadFailureKind, ReadStage, ReadTraceLedger, TraceFidelity, TraceReceipt,
 };
 use crate::link_prediction::{HornRule, LinkPredictor, Prediction, RuleTemplate, Triple};
+use crate::lookahead::{self, BranchEvidence, BranchKey, BranchSeal, LookaheadBoard};
 use crate::markov_logic::{MarkovLogicEngine, SoftFact, WeightedRule};
 use crate::mention_lexicon::MentionLexicon;
 use crate::neuro_symbolic_contrast::ContrastSnapshot;
@@ -1388,6 +1389,8 @@ pub struct SymbolicReasoner {
     batch_pending: Option<BatchPendingTurn>,
     // 当前澄清对话（把待定假设逆转为系统主动提问）
     clarification: Option<ClarificationSession>,
+    // 澄清分支前瞻：下一句常见短答的派生证据包；按封印整体失效，不写图谱。
+    clarification_lookahead: parking_lot::Mutex<LookaheadBoard>,
     // 最近一次溯因的目标合取与查询变量（澄清确认真后验证整个目标是否得证）
     last_abduction_goal: Option<Vec<Atom>>,
     last_abduction_vars: Vec<String>,

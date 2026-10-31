@@ -54,6 +54,8 @@ impl Clone for SymbolicReasoner {
             session_receipts: self.session_receipts.clone(),
             batch_pending: self.batch_pending.clone(),
             clarification: self.clarification.clone(),
+            // 前瞻是纯派生缓存：分叉时留空，由新会话按需重建。
+            clarification_lookahead: parking_lot::Mutex::new(LookaheadBoard::default()),
             last_abduction_goal: self.last_abduction_goal.clone(),
             last_abduction_vars: self.last_abduction_vars.clone(),
             known_predicates_cache: self.known_predicates_cache.clone(),
