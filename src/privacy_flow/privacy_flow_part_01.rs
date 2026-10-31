@@ -1452,6 +1452,33 @@ impl Tombstone {
         }
         constrained
     }
+
+    /// 不依赖披露分类的保守匹配。
+    ///
+    /// 调用方没有分类信息时（例如扫描 claim 的支撑事实），分类限定的墓碑
+    /// 视为可能命中：宁可多降级，也不让被遗忘的值沿分类裂缝泄漏。
+    fn matches_ignoring_category(&self, subject: &str, predicate: &str, digest: &str) -> bool {
+        let mut constrained = false;
+        if let Some(wanted) = &self.subject {
+            constrained = true;
+            if wanted != subject {
+                return false;
+            }
+        }
+        if let Some(wanted) = &self.predicate {
+            constrained = true;
+            if wanted != predicate {
+                return false;
+            }
+        }
+        if let Some(wanted) = &self.fact_digest {
+            constrained = true;
+            if wanted != digest {
+                return false;
+            }
+        }
+        constrained
+    }
 }
 /// 会话级隐私台账：授权、已披露精度与墓碑。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

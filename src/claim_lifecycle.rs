@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::answer_plan::{AnswerPlan, ClaimEvidence, PlanClaim};
 use crate::context_image::{canonical_json, fnv1a_hex};
+use crate::privacy_flow::PrivacyLedger;
 
 /// 生命周期账本的当前结构版本。
 pub const CLAIM_LEDGER_VERSION: u32 = 1;
@@ -898,6 +899,25 @@ impl GateContext {
         self.extra_retired.extend(facts);
         self
     }
+
+    /// 用隐私台账的墓碑扩充外部退役集合。
+    pub fn with_privacy_ledger(self, ledger: &PrivacyLedger, facts: &[FactKey]) -> Self {
+        let retired = privacy_retired_facts(ledger, facts.iter().cloned());
+        self.with_retired_facts(retired)
+    }
+}
+
+/// 返回隐私台账中命中墓碑的事实；无分类信息时保守匹配。
+pub fn privacy_retired_facts(
+    ledger: &PrivacyLedger,
+    facts: impl IntoIterator<Item = FactKey>,
+) -> BTreeSet<FactKey> {
+    facts
+        .into_iter()
+        .filter(|fact| {
+            ledger.is_tombstoned_any_category(&fact.subject, &fact.predicate, &fact.object)
+        })
+        .collect()
 }
 
 /// 提交前裁决；digest 覆盖全部字段（不含 digest 自身），可逐字节复核。
@@ -2083,6 +2103,28 @@ impl ClaimLedger {
         Ok(self.impact_of_fact(fact))
     }
 
+    /// 把隐私台账命中的事实登记为遗忘，并返回每条事实的影响面。
+    ///
+    /// 未命中的事实不产生事件；重复调用幂等。分类信息缺失时由
+    /// [`privacy_retired_facts`] 做保守匹配。
+    pub fn retire_with_privacy(
+        &mut self,
+        ledger: &PrivacyLedger,
+        facts: &[FactKey],
+        reason: &str,
+        turn: u64,
+        revision: u64,
+    ) -> Vec<Impact> {
+        let retired = privacy_retired_facts(ledger, facts.iter().cloned());
+        retired
+            .into_iter()
+            .filter_map(|fact| {
+                self.retire_fact(&fact, RetirementKind::Redacted, reason, turn, revision)
+                    .ok()
+            })
+            .collect()
+    }
+
     fn retire_descendants(
         &mut self,
         id: &str,
@@ -3144,5 +3186,65 @@ mod tests {
         let report = scan_residue(&surfaces, &["张三".to_string()]);
         assert_eq!(report.verdict, AuditVerdict::Clean);
         assert!(report.active_hits.is_empty());
+    }
+
+    #[test]
+    fn privacy_tombstones_retire_supporting_claims_conservatively() {
+        let phone = FactKey::new("李四", "电话", "13800138000", false);
+        let job = FactKey::new("李四", "职业", "教师", false);
+        let mut privacy = PrivacyLedger::new();
+        privacy.forget_fact("李四", "电话", "13800138000", "用户要求遗忘联系方式");
+        let retired = privacy_retired_facts(&privacy, [phone.clone(), job.clone()]);
+        assert!(retired.contains(&phone));
+        assert!(!retired.contains(&job));
+
+        let mut ledger = ClaimLedger::new();
+        let phone_claim = ledger
+            .register(
+                draft(
+                    "李四",
+                    "电话",
+                    "s1",
+                    "李四的电话是 13800138000。",
+                    vec![ClaimSupport::fact(&phone)],
+                ),
+                1,
+                1,
+            )
+            .unwrap();
+        let job_claim = ledger
+            .register(
+                draft(
+                    "李四",
+                    "职业",
+                    "s2",
+                    "李四是教师。",
+                    vec![ClaimSupport::fact(&job)],
+                ),
+                1,
+                1,
+            )
+            .unwrap();
+        let impacts =
+            ledger.retire_with_privacy(&privacy, &[phone.clone(), job.clone()], "隐私台账", 2, 2);
+        assert_eq!(impacts.len(), 1);
+        assert_eq!(
+            ledger.claim(&phone_claim.id).unwrap().status,
+            ClaimStatus::Redacted
+        );
+        assert_eq!(
+            ledger.claim(&job_claim.id).unwrap().status,
+            ClaimStatus::Planned
+        );
+        let context =
+            GateContext::default().with_privacy_ledger(&privacy, &[phone.clone(), job.clone()]);
+        assert_eq!(
+            ledger.gate(&phone_claim.id, &context).verdict,
+            GateVerdict::Deny
+        );
+        assert_eq!(
+            ledger.gate(&job_claim.id, &context).verdict,
+            GateVerdict::Allow
+        );
     }
 }

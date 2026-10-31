@@ -104,6 +104,14 @@ impl PrivacyLedger {
             .any(|tombstone| tombstone.matches(subject, predicate, category, &digest))
     }
 
+    /// 无分类信息时的保守墓碑检查；分类限定的墓碑也视为可能命中。
+    pub fn is_tombstoned_any_category(&self, subject: &str, predicate: &str, object: &str) -> bool {
+        let digest = fact_digest(subject, predicate, object);
+        self.tombstones
+            .iter()
+            .any(|tombstone| tombstone.matches_ignoring_category(subject, predicate, &digest))
+    }
+
     /// 返回可用的显式授权（一次性授权未消费才算可用）。
     pub fn consent_permits(&self, subject: &str, category: PrivacyCategory, purpose: &str) -> bool {
         for record in self.consents.iter().rev() {
