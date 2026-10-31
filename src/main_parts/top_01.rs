@@ -1735,7 +1735,13 @@ enum Commands {
         /// Retire a fact as SUBJECT|PREDICATE|OBJECT|SESSION (repeatable)
         #[arg(long = "retire-fact", value_name = "S|P|O")]
         retire_fact: Vec<String>,
-        /// Retirement kind: retracted / expired / redacted
+        /// Retire a claim by id (repeatable)
+        #[arg(long = "retire-claim", value_name = "CLAIM_ID")]
+        retire_claim: Vec<String>,
+        /// Replace OLD claim id with NEW claim id as OLD=NEW (repeatable)
+        #[arg(long = "supersede", value_name = "OLD=NEW")]
+        supersede: Vec<String>,
+        /// Retirement kind: retracted / superseded / expired / redacted
         #[arg(long, default_value = "retracted")]
         retire_kind: String,
         /// Reason recorded in retirement events

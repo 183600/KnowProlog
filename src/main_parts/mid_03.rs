@@ -1026,6 +1026,8 @@ fn run_claim_ledger(
     turn: u64,
     revision: u64,
     retire_facts: &[String],
+    retire_claims: &[String],
+    supersessions: &[String],
     retire_kind: &str,
     reason: &str,
     impact_facts: &[String],
@@ -1037,22 +1039,11 @@ fn run_claim_ledger(
     json: bool,
 ) {
     use know_prolog::claim_lifecycle::{
-        scan_residue, AuditOptions, AuditVerdict, ClaimLedger, GateContext, RetirementKind, Surface,
+        scan_residue, AuditOptions, AuditVerdict, ClaimLedger, GateContext,
     };
 
-    let retirement = match retire_kind.trim().to_ascii_lowercase().as_str() {
-        "retracted" | "撤回" => RetirementKind::Retracted,
-        "expired" | "过期" => RetirementKind::Expired,
-        "redacted" | "forgotten" | "遗忘" => RetirementKind::Redacted,
-        "superseded" | "取代" => {
-            eprintln!("事实退役不支持 superseded；请用 claim 级取代");
-            std::process::exit(2);
-        }
-        other => {
-            eprintln!("未知的退役种类：{}", other);
-            std::process::exit(2);
-        }
-    };
+    let retirement = parse_claim_retirement(retire_kind, false);
+    let claim_retirement = parse_claim_retirement(retire_kind, true);
 
     let path = std::path::Path::new(ledger_path);
     let mut ledger = if path.exists() {
@@ -1114,6 +1105,35 @@ fn run_claim_ledger(
         dirty = true;
     }
 
+    let mut claim_impacts = Vec::new();
+    for id in retire_claims {
+        let id = id.trim();
+        match ledger.retire_claim(id, claim_retirement, reason, turn, revision) {
+            Ok(impact) => claim_impacts.push(impact),
+            Err(error) => {
+                eprintln!("退役命题失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+        dirty = true;
+    }
+
+    let mut supersession_impacts = Vec::new();
+    for raw in supersessions {
+        let Some((old, new)) = raw.split_once('=') else {
+            eprintln!("取代格式应为 OLD=NEW：{}", raw);
+            std::process::exit(2);
+        };
+        match ledger.supersede(old.trim(), new.trim(), reason, turn, revision) {
+            Ok(impact) => supersession_impacts.push(impact),
+            Err(error) => {
+                eprintln!("取代命题失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+        dirty = true;
+    }
+
     let mut inspected = Vec::new();
     for raw in impact_facts {
         let Some(fact) = parse_claim_fact(raw) else {
@@ -1157,6 +1177,18 @@ fn run_claim_ledger(
                 serde_json::to_value(&impacts).unwrap_or(serde_json::Value::Null),
             );
         }
+        if !claim_impacts.is_empty() {
+            object.insert(
+                "claim_impacts".to_string(),
+                serde_json::to_value(&claim_impacts).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        if !supersession_impacts.is_empty() {
+            object.insert(
+                "supersessions".to_string(),
+                serde_json::to_value(&supersession_impacts).unwrap_or(serde_json::Value::Null),
+            );
+        }
         if !inspected.is_empty() {
             object.insert(
                 "inspected".to_string(),
@@ -1185,6 +1217,12 @@ fn run_claim_ledger(
             println!("{}", emission.render_zh());
         }
         for impact in &impacts {
+            println!("{}", impact.render_zh());
+        }
+        for impact in &claim_impacts {
+            println!("{}", impact.render_zh());
+        }
+        for impact in &supersession_impacts {
             println!("{}", impact.render_zh());
         }
         for impact in &inspected {
@@ -1250,6 +1288,27 @@ fn load_claim_surfaces(
         });
     }
     surfaces
+}
+
+fn parse_claim_retirement(
+    raw: &str,
+    allow_superseded: bool,
+) -> know_prolog::claim_lifecycle::RetirementKind {
+    use know_prolog::claim_lifecycle::RetirementKind;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "retracted" | "撤回" => RetirementKind::Retracted,
+        "expired" | "过期" => RetirementKind::Expired,
+        "redacted" | "forgotten" | "遗忘" => RetirementKind::Redacted,
+        "superseded" | "取代" if allow_superseded => RetirementKind::Superseded,
+        "superseded" | "取代" => {
+            eprintln!("事实退役不支持 superseded；请用 --supersede OLD=NEW");
+            std::process::exit(2);
+        }
+        other => {
+            eprintln!("未知的退役种类：{}", other);
+            std::process::exit(2);
+        }
+    }
 }
 
 /// `scenario`：离线回放查询板剧本；任一步失败以非零码退出（可直接进 CI）。
