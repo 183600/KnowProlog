@@ -591,7 +591,17 @@ impl OxigraphManager {
         Box<dyn std::error::Error + Send + Sync>,
     > {
         let ledger = Self::fusion_ledger_from_store(store)?;
-        let plan = knowledge_fusion::fusion_plan(
+        let plan = self.fusion_plan_for_ledger_locked(store, &ledger, policy)?;
+        Ok((ledger, plan))
+    }
+
+    fn fusion_plan_for_ledger_locked(
+        &self,
+        store: &Store,
+        ledger: &knowledge_fusion::FusionLedger,
+        policy: &knowledge_fusion::FusionPolicy,
+    ) -> Result<knowledge_fusion::FusionPlan, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(knowledge_fusion::fusion_plan(
             &ledger.namespaces,
             &ledger.assertions,
             &ledger.adjudications,
@@ -606,8 +616,47 @@ impl OxigraphManager {
                 Ok(quad) => store.contains(&quad).unwrap_or(false),
                 Err(_) => false,
             },
-        );
-        Ok((ledger, plan))
+        ))
+    }
+
+    /// 把账本中的断言按结构身份对齐结果投影后再融合（只读）。
+    pub async fn fusion_plan_with_identity(
+        &self,
+        policy: &knowledge_fusion::FusionPolicy,
+        options: &crate::graph_identity::AlignmentOptions,
+    ) -> Result<
+        (
+            crate::graph_identity::AlignmentPlan,
+            knowledge_fusion::FusionPlan,
+        ),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let store = self.store.lock().await;
+        let mut ledger = Self::fusion_ledger_from_store(&store)?;
+        let alignment = crate::graph_identity::align_ledger(&ledger, options);
+        ledger.assertions = alignment.project_assertions(&ledger.assertions);
+        let plan = self.fusion_plan_for_ledger_locked(&store, &ledger, policy)?;
+        Ok((alignment, plan))
+    }
+
+    /// 把结构对齐投影后的融合视图物化进默认图。
+    pub async fn apply_fusion_with_identity(
+        &self,
+        policy: &knowledge_fusion::FusionPolicy,
+        options: &crate::graph_identity::AlignmentOptions,
+    ) -> Result<
+        (
+            crate::graph_identity::AlignmentPlan,
+            knowledge_fusion::FusionApplyOutcome,
+        ),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        let store = self.store.lock().await;
+        let mut ledger = Self::fusion_ledger_from_store(&store)?;
+        let alignment = crate::graph_identity::align_ledger(&ledger, options);
+        ledger.assertions = alignment.project_assertions(&ledger.assertions);
+        let outcome = self.apply_fusion_ledger_locked(&store, ledger, policy)?;
+        Ok((alignment, outcome))
     }
 
     /// 把融合视图物化进默认图：写入赢家、回收被替换的旧赢家。
@@ -620,7 +669,18 @@ impl OxigraphManager {
     ) -> Result<knowledge_fusion::FusionApplyOutcome, Box<dyn std::error::Error + Send + Sync>>
     {
         let store = self.store.lock().await;
-        let (mut ledger, plan) = self.fusion_plan_locked(&store, policy)?;
+        let ledger = Self::fusion_ledger_from_store(&store)?;
+        self.apply_fusion_ledger_locked(&store, ledger, policy)
+    }
+
+    fn apply_fusion_ledger_locked(
+        &self,
+        store: &Store,
+        mut ledger: knowledge_fusion::FusionLedger,
+        policy: &knowledge_fusion::FusionPolicy,
+    ) -> Result<knowledge_fusion::FusionApplyOutcome, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let plan = self.fusion_plan_for_ledger_locked(store, &ledger, policy)?;
         let winners = plan.materialize_keys();
 
         let mut removed = 0usize;
@@ -1215,6 +1275,67 @@ mod fusion_tests {
             .applied
             .iter()
             .any(|winner| winner.predicate == "年龄" && winner.object == "19"));
+    }
+
+    /// 结构身份投影把跨来源的不同词面合并到同一槽位，产生真实佐证。
+    #[tokio::test]
+    async fn identity_projection_makes_cross_namespace_assertions_corroborate() {
+        let (manager, _dir) = temp_manager().await;
+        let entity = |namespace: &str, subject: &str, predicate: &str, object: &str| {
+            ScopedAssertion::new(
+                namespace,
+                subject,
+                predicate,
+                object,
+                ObjectKind::Entity,
+                "test",
+            )
+        };
+        manager
+            .record_namespace_assertions(
+                &ns("alice", TrustLevel::Curated),
+                &[
+                    entity("alice", "苹果公司", "type", "Company"),
+                    entity("alice", "苹果公司", "创始人", "史蒂夫·乔布斯"),
+                    entity("alice", "史蒂夫·乔布斯", "type", "Person"),
+                    literal("alice", "史蒂夫·乔布斯", "国籍", "美国"),
+                ],
+            )
+            .await
+            .unwrap();
+        manager
+            .record_namespace_assertions(
+                &ns("bob", TrustLevel::Imported),
+                &[
+                    entity("bob", "Apple Inc.", "type", "Company"),
+                    entity("bob", "Apple Inc.", "创始人", "Steve Jobs"),
+                    entity("bob", "Steve Jobs", "type", "Person"),
+                    literal("bob", "Steve Jobs", "国籍", "美国"),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let policy = FusionPolicy::new();
+        let plain = manager.fusion_plan(&policy).await.unwrap();
+        assert_eq!(plain.materialize.len(), 8, "词面不同时每条断言各占一槽");
+
+        let (alignment, plan) = manager
+            .fusion_plan_with_identity(&policy, &crate::graph_identity::AlignmentOptions::default())
+            .await
+            .unwrap();
+        assert!(alignment.accepted >= 2, "公司与人物都应获得结构身份");
+        assert_eq!(plan.materialize.len(), 4, "投影后只剩四个规范槽位");
+        assert!(plan.stats.corroborated >= 1);
+        assert!(plan.slots.iter().any(|slot| {
+            slot.subject == "苹果公司"
+                && slot.predicate == "创始人"
+                && slot.accepted.iter().any(|cluster| cluster.object == "史蒂夫·乔布斯")
+        }));
+        assert!(!plan
+            .slots
+            .iter()
+            .any(|slot| slot.subject == "Apple Inc." || slot.subject == "Steve Jobs"));
     }
 
     /// 历史默认图事实不被融合触碰（只增不删非托管数据）。

@@ -1932,12 +1932,35 @@
             apply,
             prefer,
             arbitrate,
+            align,
             json,
         }) => {
             if let Err(e) =
-                run_fuse(&oxigraph_manager, &config, apply, &prefer, arbitrate, json).await
+                run_fuse(&oxigraph_manager, &config, apply, &prefer, arbitrate, align, json).await
             {
                 eprintln!("知识融合失败: {}", e);
+                std::process::exit(1);
+            }
+        }
+        Some(Commands::Align {
+            rounds,
+            min_confidence_bps,
+            accepted_only,
+            apply,
+            json,
+        }) => {
+            if let Err(e) = run_align(
+                &oxigraph_manager,
+                &store_path,
+                rounds,
+                min_confidence_bps,
+                accepted_only,
+                apply,
+                json,
+            )
+            .await
+            {
+                eprintln!("图间身份对齐失败: {}", e);
                 std::process::exit(1);
             }
         }

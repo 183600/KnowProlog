@@ -56,6 +56,7 @@ use know_prolog::{
     frontier, fulfillment,
     fusion_arbitration::{arbitrate, ArbitrationInput},
     grammar_extractor::GrammarExtractor,
+    graph_identity::{align_ledger, AlignmentOptions},
     history_trust::TrustAssessment,
     holographic_memory::{HoloAnalogyHit, HoloHit},
     identity_eval::{
@@ -1432,6 +1433,29 @@ enum Commands {
         /// components, trusted winners, contested slots)
         #[arg(long)]
         arbitrate: bool,
+        /// Project cross-namespace entity identities before fusing
+        #[arg(long)]
+        align: bool,
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Discover cross-namespace entity identities from graph structure and
+    /// emit auditable certificates. `--apply` confirms accepted aliases in
+    /// the entity registry; nothing is written without it
+    Align {
+        /// Neighbourhood colour refinement rounds
+        #[arg(long, default_value_t = 2)]
+        rounds: usize,
+        /// Minimum confidence in basis points required for acceptance
+        #[arg(long, default_value_t = 7000)]
+        min_confidence_bps: u16,
+        /// Only print accepted certificates
+        #[arg(long)]
+        accepted_only: bool,
+        /// Confirm accepted aliases in the entity registry
+        #[arg(long)]
+        apply: bool,
         /// Print the report as JSON
         #[arg(long)]
         json: bool,

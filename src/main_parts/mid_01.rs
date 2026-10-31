@@ -884,6 +884,7 @@ async fn run_fuse(
     apply: bool,
     prefer: &[String],
     arbitrate_view: bool,
+    align_view: bool,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut ledger = manager.load_fusion_ledger().await?;
@@ -914,11 +915,25 @@ async fn run_fuse(
     }
 
     let policy = FusionPolicy::new().with_functional(functional_predicates(config));
-    let (plan, inserted, removed) = if apply {
+    let (alignment, plan, inserted, removed) = if align_view {
+        let options = AlignmentOptions::default();
+        if apply {
+            let (alignment, outcome) = manager.apply_fusion_with_identity(&policy, &options).await?;
+            (
+                Some(alignment),
+                outcome.plan,
+                outcome.inserted,
+                outcome.removed,
+            )
+        } else {
+            let (alignment, plan) = manager.fusion_plan_with_identity(&policy, &options).await?;
+            (Some(alignment), plan, 0, 0)
+        }
+    } else if apply {
         let outcome = manager.apply_fusion(&policy).await?;
-        (outcome.plan, outcome.inserted, outcome.removed)
+        (None, outcome.plan, outcome.inserted, outcome.removed)
     } else {
-        (manager.fusion_plan(&policy).await?, 0, 0)
+        (None, manager.fusion_plan(&policy).await?, 0, 0)
     };
     if apply {
         ledger = manager.load_fusion_ledger().await?;
@@ -949,9 +964,15 @@ async fn run_fuse(
         if let Some(arbitration) = &arbitration {
             report["arbitration"] = serde_json::to_value(arbitration)?;
         }
+        if let Some(alignment) = &alignment {
+            report["alignment"] = serde_json::to_value(alignment)?;
+        }
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!("{}", ledger.render_zh());
+        if let Some(alignment) = &alignment {
+            println!("{}", alignment.render_zh());
+        }
         println!("{}", plan.render_zh());
         if let Some(arbitration) = &arbitration {
             println!("{}", arbitration.render_zh());
@@ -960,6 +981,75 @@ async fn run_fuse(
             println!("已物化：写入 {} 条，回收 {} 条", inserted, removed);
         } else {
             println!("（预览模式：加 --apply 才会写入默认图）");
+        }
+    }
+    Ok(())
+}
+
+/// `align`：按图结构发现跨来源实体身份，可选写入已确认别名册。
+async fn run_align(
+    manager: &OxigraphManager,
+    store_path: &str,
+    rounds: usize,
+    min_confidence_bps: u16,
+    accepted_only: bool,
+    apply: bool,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let ledger = manager.load_fusion_ledger().await?;
+    let options = AlignmentOptions::default()
+        .with_rounds(rounds)
+        .with_min_confidence_bps(min_confidence_bps);
+    let plan = align_ledger(&ledger, &options);
+
+    let registry_path = format!("{}/entity_registry.json", store_path);
+    let registry_loaded = apply && manager.load_entity_registry(&registry_path);
+    let mut applied = 0usize;
+    let mut changed = 0usize;
+    if apply {
+        for (alias, canonical) in plan.aliases() {
+            applied += 1;
+            if manager.confirm_entity_alias(&alias, &canonical) {
+                changed += 1;
+            }
+        }
+        if applied > 0 {
+            manager.save_entity_registry(&registry_path)?;
+        }
+    }
+
+    let shown = if accepted_only {
+        let mut filtered = plan.clone();
+        filtered
+            .certificates
+            .retain(|certificate| certificate.is_accepted());
+        filtered
+    } else {
+        plan
+    };
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "plan": shown,
+                "apply": apply,
+                "registry_loaded": registry_loaded,
+                "aliases_applied": applied,
+                "aliases_changed": changed,
+            }))?
+        );
+    } else {
+        println!("{}", shown.render_zh());
+        if apply {
+            if applied == 0 {
+                println!("没有可写入的已接受别名。");
+            } else {
+                println!(
+                    "已写入别名册：{} 个（新增或变更 {} 个），保存到 {}",
+                    applied, changed, registry_path
+                );
+            }
         }
     }
     Ok(())
