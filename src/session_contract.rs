@@ -848,10 +848,11 @@ fn focus_label(focus: Option<&str>) -> &str {
 }
 
 fn reports_digest(reports: &[SessionReport]) -> String {
-    let rows: Vec<(&str, &str)> = reports
+    let mut rows: Vec<(&str, &str)> = reports
         .iter()
         .map(|report| (report.name.as_str(), report.digest.as_str()))
         .collect();
+    rows.sort();
     canonical_digest(&rows).unwrap_or_default()
 }
 
