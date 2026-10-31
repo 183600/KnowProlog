@@ -405,7 +405,7 @@ fn replay(
         });
     }
     let receipts: Vec<&TurnReceipt> = steps.iter().map(|step| &step.receipt).collect();
-    let digest = canonical_digest(&receipts).unwrap_or_default();
+    let digest = canonical_digest(&(contract.name.as_str(), &receipts)).unwrap_or_default();
     (steps, digest)
 }
 
@@ -1210,6 +1210,26 @@ input = "姚明的身高是多少"
         assert!(text.contains("焦点"));
         assert!(text.contains("计划"));
         assert!(text.contains("回执摘要变化"));
+    }
+
+    #[test]
+    fn session_digest_identifies_the_contract() {
+        let left = contract(
+            "name = \"甲\"\n[[entities]]\nname = \"姚明\"\ntype = \"Person\"\nattributes = { \"身高\" = \"226\" }\n[[turns]]\ninput = \"姚明的身高是多少\"\n",
+        );
+        let right = contract(
+            "name = \"乙\"\n[[entities]]\nname = \"姚明\"\ntype = \"Person\"\nattributes = { \"身高\" = \"226\" }\n[[turns]]\ninput = \"姚明的身高是多少\"\n",
+        );
+        assert_eq!(
+            run_contract(&left).steps,
+            run_contract(&right).steps,
+            "同一事实与回合的行为回执应相同"
+        );
+        assert_ne!(
+            run_contract(&left).digest,
+            run_contract(&right).digest,
+            "会话摘要必须包含契约身份"
+        );
     }
 
     #[test]
