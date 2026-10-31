@@ -29,6 +29,7 @@ pub mod abduction;
 pub mod advanced_nlu;
 pub mod alignment_memory;
 pub mod answer_plan;
+pub mod answer_taxonomy;
 pub mod artifact_audit;
 pub mod attribute_bridge;
 pub mod association_miner;

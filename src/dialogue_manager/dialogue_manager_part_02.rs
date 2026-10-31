@@ -251,6 +251,11 @@ impl DialogueManager {
         self.focus.last().map(String::as_str)
     }
 
+    /// 最近一次回答回合的分类投影（只读派生，不改变快照字节）。
+    pub fn answer_episode(&self) -> Option<crate::answer_taxonomy::AnswerEpisode> {
+        crate::answer_taxonomy::AnswerEpisode::from_turns(&self.turns)
+    }
+
     /// 语境指称绑定账本（只读；供宿主持久化与审计）。
     pub fn reference_ledger(&self) -> &BindingLedger {
         &self.references
