@@ -1033,6 +1033,10 @@ fn run_claim_ledger(
     retire_kind: &str,
     reason: &str,
     impact_facts: &[String],
+    impact_plans: &[String],
+    impact_replies: &[u64],
+    retire_plans: &[String],
+    retire_replies: &[u64],
     expected_emissions: Option<usize>,
     privacy_ledger: Option<&str>,
     forget_facts: &[String],
@@ -1213,6 +1217,37 @@ fn run_claim_ledger(
         inspected.push(ledger.impact_of_fact(&fact));
     }
 
+    let mut plan_impacts = Vec::new();
+    for plan_id in retire_plans {
+        match ledger.retire_plan(plan_id.trim(), claim_retirement, reason, turn, revision) {
+            Ok(impact) => plan_impacts.push(impact),
+            Err(error) => {
+                eprintln!("退役计划失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+        dirty = true;
+    }
+    let mut reply_impacts = Vec::new();
+    for reply_seq in retire_replies {
+        match ledger.retire_reply(*reply_seq, claim_retirement, reason, turn, revision) {
+            Ok(impact) => reply_impacts.push(impact),
+            Err(error) => {
+                eprintln!("退役回答失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+        dirty = true;
+    }
+    let mut inspected_plans = Vec::new();
+    for plan_id in impact_plans {
+        inspected_plans.push(ledger.impact_of_plan(plan_id.trim()));
+    }
+    let mut inspected_replies = Vec::new();
+    for reply_seq in impact_replies {
+        inspected_replies.push(ledger.impact_of_reply(*reply_seq));
+    }
+
     if dirty {
         if let Err(error) = ledger.save(path) {
             eprintln!("写入 claim 账本失败：{}", error);
@@ -1283,6 +1318,30 @@ fn run_claim_ledger(
                 serde_json::to_value(&inspected).unwrap_or(serde_json::Value::Null),
             );
         }
+        if !plan_impacts.is_empty() {
+            object.insert(
+                "plan_impacts".to_string(),
+                serde_json::to_value(&plan_impacts).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        if !reply_impacts.is_empty() {
+            object.insert(
+                "reply_impacts".to_string(),
+                serde_json::to_value(&reply_impacts).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        if !inspected_plans.is_empty() {
+            object.insert(
+                "inspected_plans".to_string(),
+                serde_json::to_value(&inspected_plans).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        if !inspected_replies.is_empty() {
+            object.insert(
+                "inspected_replies".to_string(),
+                serde_json::to_value(&inspected_replies).unwrap_or(serde_json::Value::Null),
+            );
+        }
         object.insert(
             "audit".to_string(),
             serde_json::to_value(&audit).unwrap_or(serde_json::Value::Null),
@@ -1323,6 +1382,18 @@ fn run_claim_ledger(
             println!("{}", impact.render_zh());
         }
         for impact in &inspected {
+            println!("{}", impact.render_zh());
+        }
+        for impact in &plan_impacts {
+            println!("{}", impact.render_zh());
+        }
+        for impact in &reply_impacts {
+            println!("{}", impact.render_zh());
+        }
+        for impact in &inspected_plans {
+            println!("{}", impact.render_zh());
+        }
+        for impact in &inspected_replies {
             println!("{}", impact.render_zh());
         }
         println!("{}", audit.render_zh());

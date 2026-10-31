@@ -1756,6 +1756,18 @@ enum Commands {
         /// Show the impact of a fact as SUBJECT|PREDICATE|OBJECT (repeatable)
         #[arg(long = "impact-fact", value_name = "S|P|O")]
         impact_fact: Vec<String>,
+        /// Show every claim and reply affected by a plan id (repeatable)
+        #[arg(long = "impact-plan", value_name = "PLAN_ID")]
+        impact_plan: Vec<String>,
+        /// Show every claim and plan affected by a reply sequence (repeatable)
+        #[arg(long = "impact-reply", value_name = "REPLY_SEQ")]
+        impact_reply: Vec<u64>,
+        /// Retire every claim emitted by a plan id (repeatable)
+        #[arg(long = "retire-plan", value_name = "PLAN_ID")]
+        retire_plan: Vec<String>,
+        /// Retire every claim emitted by a reply sequence (repeatable)
+        #[arg(long = "retire-reply", value_name = "REPLY_SEQ")]
+        retire_reply: Vec<u64>,
         /// Expected emitted claims for the audit; omit when auditing only
         #[arg(long)]
         expected_emissions: Option<usize>,

@@ -729,6 +729,8 @@ pub enum ClaimError {
     UnknownParent(String),
     SelfParent(String),
     UnknownClaim(String),
+    UnknownPlan(String),
+    UnknownReply(u64),
     TerminalClaim(String),
     InvalidRetirement(String),
     StillUnsupported(String),
@@ -744,6 +746,8 @@ impl fmt::Display for ClaimError {
             ClaimError::UnknownParent(id) => write!(formatter, "父 claim 不存在：{}", id),
             ClaimError::SelfParent(id) => write!(formatter, "claim 不能支撑自己：{}", id),
             ClaimError::UnknownClaim(id) => write!(formatter, "claim 不存在：{}", id),
+            ClaimError::UnknownPlan(id) => write!(formatter, "计划不存在：{}", id),
+            ClaimError::UnknownReply(seq) => write!(formatter, "回答不存在：{}", seq),
             ClaimError::TerminalClaim(id) => {
                 write!(formatter, "claim 已终止，不能再变更：{}", id)
             }
@@ -1470,6 +1474,12 @@ pub struct ClaimLedger {
     pub parents: BTreeMap<String, BTreeSet<String>>,
     #[serde(default)]
     pub children: BTreeMap<String, BTreeSet<String>>,
+    /// 计划 → claim 的反向索引；用于退役/影响面按计划聚合。
+    #[serde(default)]
+    pub plan_claims: BTreeMap<String, BTreeSet<String>>,
+    /// 回答序号 → claim 的反向索引。
+    #[serde(default)]
+    pub reply_claims: BTreeMap<u64, BTreeSet<String>>,
 }
 
 impl Default for ClaimLedger {
@@ -1488,6 +1498,8 @@ impl ClaimLedger {
             fact_claims: BTreeMap::new(),
             parents: BTreeMap::new(),
             children: BTreeMap::new(),
+            plan_claims: BTreeMap::new(),
+            reply_claims: BTreeMap::new(),
         }
     }
 
@@ -1559,6 +1571,24 @@ impl ClaimLedger {
         event.hash = event.compute_hash();
         self.events.push(event);
         seq
+    }
+
+    fn index_origin(&mut self, claim_id: &str, origin: &ClaimOrigin) {
+        match origin {
+            ClaimOrigin::Plan { plan_id, .. } => {
+                self.plan_claims
+                    .entry(plan_id.clone())
+                    .or_default()
+                    .insert(claim_id.to_string());
+            }
+            ClaimOrigin::Reply { reply_seq, .. } => {
+                self.reply_claims
+                    .entry(*reply_seq)
+                    .or_default()
+                    .insert(claim_id.to_string());
+            }
+            ClaimOrigin::Manual { .. } => {}
+        }
     }
 
     fn ensure_fact(&mut self, key: &FactKey, turn: u64, revision: u64) -> bool {
@@ -1645,13 +1675,15 @@ impl ClaimLedger {
             let mut observed = false;
             // 终止态不可复活：再次登记既不改状态，也不追加出处/表达变体。
             // 否则一次被闸门拒绝的提交会把「说出口」写进退役 claim 的谱系。
+            let mut new_origins = Vec::new();
             if !terminal {
                 let record = self.claims.get_mut(&id).expect("record exists");
                 if record.text_digests.insert(text_digest) {
                     observed = true;
                 }
                 if let Some(origin) = draft.origin {
-                    if record.origins.insert(origin) {
+                    if record.origins.insert(origin.clone()) {
+                        new_origins.push(origin);
                         observed = true;
                     }
                 }
@@ -1660,6 +1692,9 @@ impl ClaimLedger {
                 if observed {
                     record.updated_seq = self.events.len() as u64 + 1;
                 }
+            }
+            for origin in &new_origins {
+                self.index_origin(&id, origin);
             }
             if observed {
                 self.append_event(
@@ -1746,13 +1781,14 @@ impl ClaimLedger {
             seq,
             cause,
         });
+        let origins: BTreeSet<ClaimOrigin> = draft.origin.into_iter().collect();
         let record = ClaimRecord {
             id: id.clone(),
             shape,
             text_digests: BTreeSet::from([text_digest]),
             status,
             support: support.clone(),
-            origins: draft.origin.into_iter().collect(),
+            origins: origins.clone(),
             first_turn: turn,
             last_turn: turn,
             revision,
@@ -1763,6 +1799,9 @@ impl ClaimLedger {
         };
         let slot = record.shape.structure.clone();
         self.claims.insert(id.clone(), record);
+        for origin in &origins {
+            self.index_origin(&id, origin);
+        }
         for item in &support {
             match item {
                 ClaimSupport::Fact { .. } => {
@@ -2512,6 +2551,79 @@ impl ClaimLedger {
         impact
     }
 
+    /// 从一份计划反向查出它涉及的全部 claim 与回答。
+    pub fn impact_of_plan(&self, plan_id: &str) -> Impact {
+        let start = self.plan_claims.get(plan_id).cloned().unwrap_or_default();
+        let mut impact = self.collect_impact(&format!("计划 {}", plan_id), start);
+        impact.status = if self.plan_claims.contains_key(plan_id) {
+            "plan".to_string()
+        } else {
+            "unregistered".to_string()
+        };
+        impact
+    }
+
+    /// 从一条回答反向查出它涉及的全部 claim 与计划。
+    pub fn impact_of_reply(&self, reply_seq: u64) -> Impact {
+        let start = self
+            .reply_claims
+            .get(&reply_seq)
+            .cloned()
+            .unwrap_or_default();
+        let mut impact = self.collect_impact(&format!("回答 #{}", reply_seq), start);
+        impact.status = if self.reply_claims.contains_key(&reply_seq) {
+            "reply".to_string()
+        } else {
+            "unregistered".to_string()
+        };
+        impact
+    }
+
+    /// 退役一份计划涉及的全部 claim，并沿谱系传播。
+    ///
+    /// 同一 claim 若还被其他计划或回答引用，也会一并退役：claim 的状态是
+    /// 全局的，不能因为另一条出处仍存在就继续复用已失效的断言。
+    pub fn retire_plan(
+        &mut self,
+        plan_id: &str,
+        kind: RetirementKind,
+        reason: &str,
+        turn: u64,
+        revision: u64,
+    ) -> Result<Impact, ClaimError> {
+        let claims = self
+            .plan_claims
+            .get(plan_id)
+            .cloned()
+            .ok_or_else(|| ClaimError::UnknownPlan(plan_id.to_string()))?;
+        for id in &claims {
+            self.retire_claim_internal(id, kind, reason, RetirementCause::Manual, turn, revision);
+            self.retire_descendants(id, kind, reason, turn, revision);
+        }
+        Ok(self.impact_of_plan(plan_id))
+    }
+
+    /// 退役一条回答涉及的全部 claim，并沿谱系传播。
+    pub fn retire_reply(
+        &mut self,
+        reply_seq: u64,
+        kind: RetirementKind,
+        reason: &str,
+        turn: u64,
+        revision: u64,
+    ) -> Result<Impact, ClaimError> {
+        let claims = self
+            .reply_claims
+            .get(&reply_seq)
+            .cloned()
+            .ok_or(ClaimError::UnknownReply(reply_seq))?;
+        for id in &claims {
+            self.retire_claim_internal(id, kind, reason, RetirementCause::Manual, turn, revision);
+            self.retire_descendants(id, kind, reason, turn, revision);
+        }
+        Ok(self.impact_of_reply(reply_seq))
+    }
+
     /// 校验事件链；`window` 为只回放最近若干条事件时的显式截断窗口。
     pub fn verify_chain(&self, window: Option<usize>) -> ChainReport {
         let start = window
@@ -2552,7 +2664,26 @@ impl ClaimLedger {
         self.fact_claims.clear();
         self.parents.clear();
         self.children.clear();
+        self.plan_claims.clear();
+        self.reply_claims.clear();
         for (id, record) in &self.claims {
+            for origin in &record.origins {
+                match origin {
+                    ClaimOrigin::Plan { plan_id, .. } => {
+                        self.plan_claims
+                            .entry(plan_id.clone())
+                            .or_default()
+                            .insert(id.clone());
+                    }
+                    ClaimOrigin::Reply { reply_seq, .. } => {
+                        self.reply_claims
+                            .entry(*reply_seq)
+                            .or_default()
+                            .insert(id.clone());
+                    }
+                    ClaimOrigin::Manual { .. } => {}
+                }
+            }
             for item in &record.support {
                 match item {
                     ClaimSupport::Fact { .. } => {
@@ -3790,6 +3921,133 @@ mod tests {
             .findings
             .iter()
             .any(|finding| finding.code == GateFindingCode::ClaimRetired));
+    }
+
+    #[test]
+    fn plan_and_reply_indexes_retire_every_referenced_claim() {
+        let mut ledger = ClaimLedger::new();
+        let first_fact = fact("秦十八", "职业", "技师");
+        let second_fact = fact("秦十八", "城市", "杭州");
+        let first = ledger
+            .register(
+                draft(
+                    "秦十八",
+                    "职业",
+                    "s1",
+                    "秦十八是技师。",
+                    vec![ClaimSupport::fact(&first_fact)],
+                )
+                .with_origin(ClaimOrigin::plan("plan-a", "s1")),
+                1,
+                1,
+            )
+            .unwrap();
+        ledger
+            .register(
+                draft(
+                    "秦十八",
+                    "职业",
+                    "s1",
+                    "秦十八是技师。",
+                    vec![ClaimSupport::fact(&first_fact)],
+                )
+                .with_origin(ClaimOrigin::reply(7, 1)),
+                1,
+                1,
+            )
+            .unwrap();
+        let second = ledger
+            .register(
+                draft(
+                    "秦十八",
+                    "城市",
+                    "s2",
+                    "秦十八住在杭州。",
+                    vec![ClaimSupport::fact(&second_fact)],
+                )
+                .with_origin(ClaimOrigin::plan("plan-b", "s2")),
+                1,
+                1,
+            )
+            .unwrap();
+        ledger
+            .register(
+                draft(
+                    "秦十八",
+                    "城市",
+                    "s2",
+                    "秦十八住在杭州。",
+                    vec![ClaimSupport::fact(&second_fact)],
+                )
+                .with_origin(ClaimOrigin::reply(8, 1)),
+                1,
+                1,
+            )
+            .unwrap();
+        let plan_impact = ledger.impact_of_plan("plan-a");
+        assert_eq!(plan_impact.affected.len(), 1);
+        assert_eq!(plan_impact.affected[0].claim_id, first.id);
+        assert_eq!(plan_impact.replies, BTreeSet::from([7]));
+        let reply_impact = ledger.impact_of_reply(8);
+        assert_eq!(reply_impact.affected.len(), 1);
+        assert_eq!(reply_impact.affected[0].claim_id, second.id);
+        assert_eq!(reply_impact.plans, BTreeSet::from(["plan-b".to_string()]));
+
+        let retired = ledger
+            .retire_plan("plan-a", RetirementKind::Retracted, "计划作废", 2, 2)
+            .unwrap();
+        assert_eq!(retired.affected.len(), 1);
+        assert_eq!(
+            ledger.claim(&first.id).unwrap().status,
+            ClaimStatus::Retracted
+        );
+        assert_eq!(
+            ledger.claim(&second.id).unwrap().status,
+            ClaimStatus::Planned,
+            "退役一份计划不能误伤另一份计划"
+        );
+        assert_eq!(
+            ledger.retire_plan("missing", RetirementKind::Retracted, "无", 3, 3),
+            Err(ClaimError::UnknownPlan("missing".to_string()))
+        );
+        assert_eq!(
+            ledger.retire_reply(99, RetirementKind::Retracted, "无", 3, 3),
+            Err(ClaimError::UnknownReply(99))
+        );
+    }
+
+    #[test]
+    fn retired_reply_origin_is_rebuilt_after_roundtrip() {
+        let mut ledger = ClaimLedger::new();
+        let fact_key = fact("秦十九", "职业", "画师");
+        let claim = ledger
+            .register(
+                draft(
+                    "秦十九",
+                    "职业",
+                    "s1",
+                    "秦十九是画师。",
+                    vec![ClaimSupport::fact(&fact_key)],
+                )
+                .with_origin(ClaimOrigin::reply(3, 1)),
+                1,
+                1,
+            )
+            .unwrap();
+        let rebuilt = ClaimLedger::from_json(&ledger.to_json().unwrap()).unwrap();
+        assert_eq!(
+            rebuilt.reply_claims.get(&3),
+            Some(&BTreeSet::from([claim.id.clone()]))
+        );
+        let mut rebuilt = rebuilt;
+        rebuilt
+            .retire_reply(3, RetirementKind::Expired, "回答过期", 2, 2)
+            .unwrap();
+        assert_eq!(
+            rebuilt.claim(&claim.id).unwrap().status,
+            ClaimStatus::Expired
+        );
+        assert!(rebuilt.verify_chain(None).intact);
     }
 
     #[test]
