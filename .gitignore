@@ -13,6 +13,9 @@ Cargo.lock
 # Runtime Oxigraph data store
 oxigraph_data/
 
+# Runtime claim lifecycle ledger
+claim_ledger.json
+
 # Runtime evaluation baseline artifacts
 eval_baseline.json
 quality_baseline.json
