@@ -202,6 +202,12 @@
                 Ok(receipt) => {
                     println!("{}", receipt.render());
                     persist_pattern_evolution(&pattern_evolution, &evolution_path);
+                    if let Err(error) = oxigraph_manager
+                        .sync_pattern_evolution(&pattern_evolution)
+                        .await
+                    {
+                        eprintln!("演化台账落图失败：{}", error);
+                    }
                     if let Some(generation) = receipt.committed_generation {
                         match oxigraph_manager
                             .sync_pattern_ledger(pattern_library.entries())
@@ -224,6 +230,42 @@
                     }
                 }
                 Err(error) => println!("演化快照失败：{}", error),
+            }
+            println!();
+            continue;
+        }
+
+        // 演化落图：把代、回执与物化戳写入命名图，供 SPARQL/恢复使用
+        if matches!(input, "演化落图" | "模式演化落图") {
+            match oxigraph_manager.sync_pattern_evolution(&pattern_evolution).await {
+                Ok(generations) => println!(
+                    "演化台账已落图：{} 代、{} 份回执。",
+                    generations,
+                    pattern_evolution.receipts.len()
+                ),
+                Err(error) => println!("演化台账落图失败：{}", error),
+            }
+            println!();
+            continue;
+        }
+
+        // 演化载入：从命名图恢复台账（JSON 丢失或损坏时的兜底）
+        if matches!(
+            input,
+            "演化载入" | "演化读图" | "模式演化载入" | "模式演化读图"
+        ) {
+            match oxigraph_manager.load_pattern_evolution().await {
+                Ok(loaded) if loaded.is_empty() => {
+                    println!("模式演化图里还没有台账；先用「演化快照」记录一代。");
+                }
+                Ok(loaded) => {
+                    let generations = loaded.generations.len();
+                    let receipts = loaded.receipts.len();
+                    pattern_evolution = loaded;
+                    persist_pattern_evolution(&pattern_evolution, &evolution_path);
+                    println!("已从模式演化图恢复 {} 代、{} 份回执。", generations, receipts);
+                }
+                Err(error) => println!("模式演化图读取失败：{}", error),
             }
             println!();
             continue;
@@ -261,6 +303,12 @@
                         Ok(generation) => {
                             pattern_library = generation.library();
                             persist_pattern_evolution(&pattern_evolution, &evolution_path);
+                            if let Err(error) = oxigraph_manager
+                                .sync_pattern_evolution(&pattern_evolution)
+                                .await
+                            {
+                                eprintln!("演化台账落图失败：{}", error);
+                            }
                             println!(
                                 "已前向回滚：第{}代（内容来自第{}代，指纹 {}）。",
                                 generation.generation, target, generation.fingerprint

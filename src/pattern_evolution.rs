@@ -1690,6 +1690,216 @@ impl std::fmt::Display for EvolutionError {
 impl std::error::Error for EvolutionError {}
 
 // ---------------------------------------------------------------------------
+// RDF 演化台账
+// ---------------------------------------------------------------------------
+use oxigraph::model::{GraphName, Literal, NamedNode, Quad, Term};
+
+use crate::graph_ledger::LEDGER_NS;
+
+/// 模式演化台账命名图（代、回执与物化戳）。
+pub const EVOLUTION_GRAPH: &str = "http://example.org/kg/graphs/pattern-evolution";
+const GENERATION_CLASS: &str = "http://example.org/kg/ledger/PatternGeneration";
+const RECEIPT_CLASS: &str = "http://example.org/kg/ledger/EvolutionReceipt";
+const EVOLUTION_STAMP_SUBJECT: &str = "http://example.org/kg/ledger/evolutionStamp";
+const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+const P_JSON: &str = "http://example.org/kg/ledger/json";
+const P_FINGERPRINT: &str = "http://example.org/kg/ledger/fingerprint";
+const P_PARENT: &str = "http://example.org/kg/ledger/parent";
+const P_STATUS: &str = "http://example.org/kg/ledger/status";
+const P_VERDICT: &str = "http://example.org/kg/ledger/verdict";
+const P_COUNT: &str = "http://example.org/kg/ledger/count";
+const P_RECEIPT_INDEX: &str = "http://example.org/kg/ledger/receiptIndex";
+const P_LATEST: &str = "http://example.org/kg/ledger/latestGeneration";
+
+type LedgerResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+fn named_node(iri: &str) -> LedgerResult<NamedNode> {
+    Ok(NamedNode::new(iri)?)
+}
+
+fn literal_quad(
+    subject: &NamedNode,
+    predicate: &str,
+    value: &str,
+    graph: &GraphName,
+) -> LedgerResult<Quad> {
+    Ok(Quad::new(
+        subject.clone(),
+        named_node(predicate)?,
+        Literal::new_simple_literal(value),
+        graph.clone(),
+    ))
+}
+
+/// 演化台账指纹：按代序号折叠各代指纹与判定，与条目插入顺序无关。
+pub fn evolution_fingerprint(ledger: &EvolutionLedger) -> String {
+    let mut parts: Vec<String> = ledger
+        .generations
+        .iter()
+        .map(|generation| {
+            format!(
+                "{}\u{0}{}\u{0}{}",
+                generation.generation,
+                generation.fingerprint,
+                generation.status.label()
+            )
+        })
+        .collect();
+    parts.sort();
+    fnv1a_hex(parts.join("\n").as_bytes())
+}
+
+/// 生成演化台账的全部四元组（代 + 回执 + 物化戳）。
+pub fn evolution_quads(ledger: &EvolutionLedger) -> LedgerResult<Vec<Quad>> {
+    let graph = GraphName::NamedNode(named_node(EVOLUTION_GRAPH)?);
+    let rdf_type = named_node(RDF_TYPE)?;
+    let generation_class = Term::NamedNode(named_node(GENERATION_CLASS)?);
+    let receipt_class = Term::NamedNode(named_node(RECEIPT_CLASS)?);
+    let mut quads: Vec<Quad> =
+        Vec::with_capacity(ledger.generations.len() * 6 + ledger.receipts.len() * 4 + 5);
+    for generation in &ledger.generations {
+        let subject = named_node(&format!(
+            "{}evolution/generation/{}",
+            LEDGER_NS, generation.generation
+        ))?;
+        quads.push(Quad::new(
+            subject.clone(),
+            rdf_type.clone(),
+            generation_class.clone(),
+            graph.clone(),
+        ));
+        quads.push(literal_quad(
+            &subject,
+            P_JSON,
+            &serde_json::to_string(generation)?,
+            &graph,
+        )?);
+        quads.push(literal_quad(
+            &subject,
+            P_FINGERPRINT,
+            &generation.fingerprint,
+            &graph,
+        )?);
+        quads.push(literal_quad(
+            &subject,
+            P_STATUS,
+            generation.status.label(),
+            &graph,
+        )?);
+        if let Some(parent) = generation.parent {
+            quads.push(literal_quad(
+                &subject,
+                P_PARENT,
+                &parent.to_string(),
+                &graph,
+            )?);
+        }
+    }
+    for (index, receipt) in ledger.receipts.iter().enumerate() {
+        let subject = named_node(&format!(
+            "{}evolution/receipt/{:06}-{}",
+            LEDGER_NS, index, receipt.proposal_id
+        ))?;
+        quads.push(Quad::new(
+            subject.clone(),
+            rdf_type.clone(),
+            receipt_class.clone(),
+            graph.clone(),
+        ));
+        quads.push(literal_quad(
+            &subject,
+            P_JSON,
+            &serde_json::to_string(receipt)?,
+            &graph,
+        )?);
+        quads.push(literal_quad(
+            &subject,
+            P_VERDICT,
+            receipt.verdict.label(),
+            &graph,
+        )?);
+        quads.push(literal_quad(
+            &subject,
+            P_RECEIPT_INDEX,
+            &index.to_string(),
+            &graph,
+        )?);
+    }
+    let stamp = named_node(EVOLUTION_STAMP_SUBJECT)?;
+    quads.push(Quad::new(
+        stamp.clone(),
+        rdf_type,
+        Term::NamedNode(named_node("http://example.org/kg/ledger/Stamp")?),
+        graph.clone(),
+    ));
+    quads.push(literal_quad(
+        &stamp,
+        P_FINGERPRINT,
+        &evolution_fingerprint(ledger),
+        &graph,
+    )?);
+    quads.push(literal_quad(
+        &stamp,
+        P_COUNT,
+        &ledger.generations.len().to_string(),
+        &graph,
+    )?);
+    if let Some(latest) = ledger.current() {
+        quads.push(literal_quad(
+            &stamp,
+            P_LATEST,
+            &latest.generation.to_string(),
+            &graph,
+        )?);
+    }
+    Ok(quads)
+}
+
+/// 从演化命名图还原台账（代按序号、回执按写入下标排序）。
+pub fn parse_evolution_graph(quads: impl Iterator<Item = Quad>) -> EvolutionLedger {
+    let mut generations: BTreeMap<u64, PatternGeneration> = BTreeMap::new();
+    let mut receipt_json: BTreeMap<String, String> = BTreeMap::new();
+    let mut receipt_index: BTreeMap<String, usize> = BTreeMap::new();
+    for quad in quads {
+        let Term::Literal(value) = &quad.object else {
+            continue;
+        };
+        let raw = value.value();
+        match quad.predicate.as_str() {
+            P_JSON => {
+                if let Ok(generation) = serde_json::from_str::<PatternGeneration>(raw) {
+                    generations.insert(generation.generation, generation);
+                } else if serde_json::from_str::<EvolutionReceipt>(raw).is_ok() {
+                    receipt_json.insert(quad.subject.to_string(), raw.to_string());
+                }
+            }
+            P_RECEIPT_INDEX => {
+                if let Ok(index) = raw.parse::<usize>() {
+                    receipt_index.insert(quad.subject.to_string(), index);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut receipts: Vec<(usize, EvolutionReceipt)> = receipt_json
+        .into_iter()
+        .filter_map(|(subject, raw)| {
+            let index = receipt_index.get(&subject).copied().unwrap_or(usize::MAX);
+            serde_json::from_str::<EvolutionReceipt>(&raw)
+                .ok()
+                .map(|receipt| (index, receipt))
+        })
+        .collect();
+    receipts.sort_by_key(|(index, _)| *index);
+    EvolutionLedger {
+        dialect: EVOLUTION_DIALECT.to_string(),
+        generations: generations.into_values().collect(),
+        receipts: receipts.into_iter().map(|(_, receipt)| receipt).collect(),
+        ..EvolutionLedger::default()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 测试
 // ---------------------------------------------------------------------------
 
@@ -2019,6 +2229,86 @@ mod tests {
         let loaded = EvolutionLedger::load_from_path(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(loaded, ledger);
+    }
+
+    #[test]
+    fn rdf_evolution_ledger_roundtrips_generations_and_receipts() {
+        let base = base_generation();
+        let mut ledger = EvolutionLedger::default();
+        ledger.ensure_initial(&base.library(), base.clock, "初始");
+        let safe = entry(
+            "新年龄问法",
+            "taught#age2",
+            "age_query",
+            5,
+            &["李四", "几岁"],
+        );
+        let proposal = EvolutionProposal::new("safe", ProposalKind::Teach, &base, "补充问法")
+            .with_edit(ProposalEdit::add(safe))
+            .with_held_out(HeldOutCase {
+                input: "李四几岁".to_string(),
+                expected_query_type: "age_query".to_string(),
+                note: "留出".to_string(),
+            });
+        ledger
+            .transact(
+                &proposal,
+                &[],
+                &config(),
+                EvolutionClock::new(1, 2, 1, 3),
+                "补充",
+            )
+            .unwrap();
+        let quads = evolution_quads(&ledger).unwrap();
+        assert!(quads.iter().any(|quad| {
+            quad.predicate.as_str() == P_FINGERPRINT
+                && matches!(
+                    &quad.subject,
+                    oxigraph::model::Subject::NamedNode(node)
+                        if node.as_str() == EVOLUTION_STAMP_SUBJECT
+                )
+        }));
+        let loaded = parse_evolution_graph(quads.into_iter());
+        assert_eq!(loaded, ledger);
+        assert_eq!(
+            loaded.current().unwrap().fingerprint,
+            ledger.current().unwrap().fingerprint
+        );
+    }
+
+    #[tokio::test]
+    async fn manager_roundtrips_pattern_evolution_in_its_named_graph() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let manager = crate::OxigraphManager::new(dir.path().to_str().unwrap()).unwrap();
+        let base = base_generation();
+        let mut ledger = EvolutionLedger::default();
+        ledger.ensure_initial(&base.library(), base.clock, "初始");
+        let safe = entry(
+            "新年龄问法",
+            "taught#age2",
+            "age_query",
+            5,
+            &["李四", "几岁"],
+        );
+        let proposal = EvolutionProposal::new("safe", ProposalKind::Teach, &base, "补充问法")
+            .with_edit(ProposalEdit::add(safe));
+        ledger
+            .transact(
+                &proposal,
+                &[],
+                &config(),
+                EvolutionClock::new(1, 2, 1, 3),
+                "补充",
+            )
+            .unwrap();
+        manager.sync_pattern_evolution(&ledger).await.unwrap();
+        let loaded = manager.load_pattern_evolution().await.unwrap();
+        assert_eq!(loaded, ledger);
+        manager
+            .sync_pattern_evolution(&EvolutionLedger::default())
+            .await
+            .unwrap();
+        assert!(manager.load_pattern_evolution().await.unwrap().is_empty());
     }
 
     #[test]

@@ -219,6 +219,43 @@ impl OxigraphManager {
         Ok(pattern_ir::parse_episode_graph(quads.into_iter()))
     }
 
+    /// 同步模式演化台账：清空 `kg:graphs/pattern-evolution` 后全量重写
+    /// （幂等；不推进知识版本）。代、回执与物化戳都进命名图。
+    pub async fn sync_pattern_evolution(
+        &self,
+        ledger: &pattern_evolution::EvolutionLedger,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let quads = pattern_evolution::evolution_quads(ledger)?;
+        let graph =
+            GraphName::NamedNode(NamedNode::new(pattern_evolution::EVOLUTION_GRAPH)?);
+        let store = self.store.lock().await;
+        let existing: Vec<Quad> = store
+            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        for quad in existing {
+            store.remove(&quad)?;
+        }
+        for quad in &quads {
+            store.insert(quad)?;
+        }
+        self.perf.bump("pattern_evolution_sync");
+        Ok(ledger.generations.len())
+    }
+
+    /// 读取模式演化台账（代按序号、回执按下标；不触碰任何缓存）。
+    pub async fn load_pattern_evolution(
+        &self,
+    ) -> Result<pattern_evolution::EvolutionLedger, Box<dyn std::error::Error + Send + Sync>> {
+        let graph =
+            GraphName::NamedNode(NamedNode::new(pattern_evolution::EVOLUTION_GRAPH)?);
+        let store = self.store.lock().await;
+        let quads: Vec<Quad> = store
+            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.perf.bump("pattern_evolution_load");
+        Ok(pattern_evolution::parse_evolution_graph(quads.into_iter()))
+    }
+
     /// 同步词法记忆：清空 `kg:graphs/lexical-memory` 后全量重写
     /// （幂等；不推进知识版本）。词法证据是账本，不是事实。
     pub async fn sync_lexical_memory(

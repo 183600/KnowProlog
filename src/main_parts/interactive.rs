@@ -133,6 +133,23 @@ async fn run_interactive_mode(
         }
     };
     if pattern_evolution.is_empty() {
+        match oxigraph_manager.load_pattern_evolution().await {
+            Ok(from_graph) if !from_graph.is_empty() => {
+                println!(
+                    "已从模式演化图恢复 {} 代、{} 份回执。",
+                    from_graph.generations.len(),
+                    from_graph.receipts.len()
+                );
+                pattern_evolution = from_graph;
+                if let Err(error) = pattern_evolution.save_to_path(&evolution_path) {
+                    eprintln!("模式演化台账保存失败：{}", error);
+                }
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!("模式演化图读取失败：{}", error),
+        }
+    }
+    if pattern_evolution.is_empty() {
         let clock = EvolutionClock::new(
             0,
             oxigraph_manager.revision(),
@@ -142,6 +159,9 @@ async fn run_interactive_mode(
         pattern_evolution.ensure_initial(&pattern_library, clock, "启动快照");
         if let Err(error) = pattern_evolution.save_to_path(&evolution_path) {
             eprintln!("模式演化台账保存失败：{}", error);
+        }
+        if let Err(error) = oxigraph_manager.sync_pattern_evolution(&pattern_evolution).await {
+            eprintln!("模式演化台账落图失败：{}", error);
         }
     } else if let Some(current) = pattern_evolution.current() {
         let fingerprint = pattern_ir::library_fingerprint(pattern_library.entries());
