@@ -118,8 +118,19 @@ async fn main() {
     }
 
     // 会话契约同样完全离线：过程回执不依赖配置、存储或网络。
-    if let Some(Commands::Session { path, json }) = &cli.command {
-        run_session_contracts(path.as_deref(), *json);
+    if let Some(Commands::Session {
+        path,
+        json,
+        baseline,
+        update_baseline,
+    }) = &cli.command
+    {
+        run_session_contracts(
+            path.as_deref(),
+            *json,
+            baseline.as_deref(),
+            *update_baseline,
+        );
         return;
     }
 

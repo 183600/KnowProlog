@@ -887,7 +887,15 @@ fn run_prompt_lint(json: bool) {
 }
 
 /// `session`：离线回放会话契约；路径省略时运行 `examples/sessions`。
-fn run_session_contracts(path: Option<&str>, json: bool) {
+///
+/// 带 `--baseline` 时只输出与基线的结构差异；`--update-baseline` 仅在全部
+/// 契约通过后写入新基线，失败用例不会被 promotion 进回归集。
+fn run_session_contracts(
+    path: Option<&str>,
+    json: bool,
+    baseline: Option<&str>,
+    update_baseline: bool,
+) {
     let target = path.unwrap_or(know_prolog::session_contract::SESSION_CONTRACT_DIR);
     let reports = if std::path::Path::new(target).is_dir() {
         match know_prolog::session_contract::run_directory(target) {
@@ -910,23 +918,76 @@ fn run_session_contracts(path: Option<&str>, json: bool) {
         eprintln!("没有找到会话契约：{}", target);
         std::process::exit(1);
     }
+    let all_passed = reports.iter().all(|report| report.passed);
+
+    let Some(baseline_path) = baseline else {
+        if json {
+            match serde_json::to_string_pretty(&reports) {
+                Ok(text) => println!("{}", text),
+                Err(error) => {
+                    eprintln!("会话契约报告序列化失败：{}", error);
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            for (index, report) in reports.iter().enumerate() {
+                if index > 0 {
+                    println!();
+                }
+                println!("{}", report.render_text());
+            }
+        }
+        if !all_passed {
+            std::process::exit(1);
+        }
+        return;
+    };
+
+    if update_baseline {
+        if !all_passed {
+            eprintln!("存在失败契约，拒绝写入基线：{}", baseline_path);
+            std::process::exit(1);
+        }
+        if let Err(error) = know_prolog::session_contract::save_reports(baseline_path, &reports) {
+            eprintln!("写入会话基线失败：{}", error);
+            std::process::exit(1);
+        }
+        if json {
+            println!(
+                "{{\"baseline\":{},\"reports\":{}}}",
+                serde_json::to_string(baseline_path).unwrap_or_else(|_| "\"\"".to_string()),
+                reports.len()
+            );
+        } else {
+            println!(
+                "已写入会话基线：{}（{} 份契约）",
+                baseline_path,
+                reports.len()
+            );
+        }
+        return;
+    }
+
+    let previous = match know_prolog::session_contract::load_reports(baseline_path) {
+        Ok(reports) => reports,
+        Err(error) => {
+            eprintln!("读取会话基线失败：{}", error);
+            std::process::exit(1);
+        }
+    };
+    let comparison = know_prolog::session_contract::compare_reports(&previous, &reports);
     if json {
-        match serde_json::to_string_pretty(&reports) {
+        match serde_json::to_string_pretty(&comparison) {
             Ok(text) => println!("{}", text),
             Err(error) => {
-                eprintln!("会话契约报告序列化失败：{}", error);
+                eprintln!("会话比较序列化失败：{}", error);
                 std::process::exit(1);
             }
         }
     } else {
-        for (index, report) in reports.iter().enumerate() {
-            if index > 0 {
-                println!();
-            }
-            println!("{}", report.render_text());
-        }
+        println!("{}", comparison.render_text());
     }
-    if reports.iter().any(|report| !report.passed) {
+    if !all_passed || !comparison.identical {
         std::process::exit(1);
     }
 }

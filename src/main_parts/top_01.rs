@@ -1607,6 +1607,12 @@ enum Commands {
         /// Print the reports as a JSON array
         #[arg(long)]
         json: bool,
+        /// Compare against a saved JSON baseline; exits non-zero on drift
+        #[arg(long)]
+        baseline: Option<String>,
+        /// With --baseline, write the current reports after all contracts pass
+        #[arg(long, requires = "baseline")]
+        update_baseline: bool,
     },
     /// Mine, review, export or import OWL axioms proposed from the graph
     #[command(disable_help_flag = true)]

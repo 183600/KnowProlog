@@ -179,6 +179,64 @@ pub struct SessionReport {
     pub steps: Vec<SessionStep>,
 }
 
+/// 两次回放的差异：只列变化，不重复整份回执。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportComparison {
+    pub identical: bool,
+    pub baseline_digest: String,
+    pub current_digest: String,
+    pub sessions: Vec<SessionDiff>,
+}
+
+impl ReportComparison {
+    pub fn render_text(&self) -> String {
+        let mut output = format!(
+            "会话基线比较：{}（{} → {}）",
+            if self.identical {
+                "一致 ✓"
+            } else {
+                "有差异"
+            },
+            self.baseline_digest,
+            self.current_digest
+        );
+        for session in &self.sessions {
+            if session.changes.is_empty() && session.steps.is_empty() {
+                continue;
+            }
+            output.push_str(&format!("\n  会话「{}」", session.name));
+            for change in &session.changes {
+                output.push_str(&format!("\n    - {}", change));
+            }
+            for step in &session.steps {
+                output.push_str(&format!(
+                    "\n    - 第 {} 轮「{}」：{}",
+                    step.turn,
+                    step.input,
+                    step.changes.join("；")
+                ));
+            }
+        }
+        output
+    }
+}
+
+/// 单个会话的差异。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionDiff {
+    pub name: String,
+    pub changes: Vec<String>,
+    pub steps: Vec<StepDiff>,
+}
+
+/// 单轮差异：轮次、输入与变化列表。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepDiff {
+    pub turn: usize,
+    pub input: String,
+    pub changes: Vec<String>,
+}
+
 impl SessionReport {
     /// 面向终端的中文报告：每步一行，失败给出最小原因。
     pub fn render_text(&self) -> String {
@@ -618,6 +676,219 @@ pub fn run_directory(dir: impl AsRef<Path>) -> Result<Vec<SessionReport>, String
     Ok(contracts.iter().map(run_contract).collect())
 }
 
+/// 比较两份报告集：按会话名对齐，逐轮列出结构差异。
+pub fn compare_reports(baseline: &[SessionReport], current: &[SessionReport]) -> ReportComparison {
+    use std::collections::BTreeMap;
+    let baseline_digest = reports_digest(baseline);
+    let current_digest = reports_digest(current);
+    let before: BTreeMap<&str, &SessionReport> = baseline
+        .iter()
+        .map(|report| (report.name.as_str(), report))
+        .collect();
+    let after: BTreeMap<&str, &SessionReport> = current
+        .iter()
+        .map(|report| (report.name.as_str(), report))
+        .collect();
+    let mut names: Vec<&str> = before.keys().chain(after.keys()).copied().collect();
+    names.sort();
+    names.dedup();
+    let mut sessions = Vec::new();
+    for name in names {
+        let mut changes = Vec::new();
+        let mut steps = Vec::new();
+        match (before.get(name), after.get(name)) {
+            (None, Some(_)) => changes.push("新增会话".to_string()),
+            (Some(_), None) => changes.push("移除会话".to_string()),
+            (Some(old), Some(new)) => {
+                if old.passed != new.passed {
+                    changes.push(format!("通过状态 {} → {}", old.passed, new.passed));
+                }
+                if old.stable != new.stable {
+                    changes.push(format!("确定性 {} → {}", old.stable, new.stable));
+                }
+                if old.digest != new.digest {
+                    changes.push(format!("会话摘要 {} → {}", old.digest, new.digest));
+                }
+                let total = old.steps.len().max(new.steps.len());
+                for index in 0..total {
+                    match (old.steps.get(index), new.steps.get(index)) {
+                        (None, Some(new)) => steps.push(StepDiff {
+                            turn: new.receipt.turn,
+                            input: new.receipt.input.clone(),
+                            changes: vec!["新增回合".to_string()],
+                        }),
+                        (Some(old), None) => steps.push(StepDiff {
+                            turn: old.receipt.turn,
+                            input: old.receipt.input.clone(),
+                            changes: vec!["移除回合".to_string()],
+                        }),
+                        (Some(old), Some(new)) => {
+                            let changes = compare_receipts(&old.receipt, &new.receipt);
+                            if !changes.is_empty() {
+                                steps.push(StepDiff {
+                                    turn: new.receipt.turn,
+                                    input: new.receipt.input.clone(),
+                                    changes,
+                                });
+                            }
+                        }
+                        (None, None) => {}
+                    }
+                }
+            }
+            (None, None) => {}
+        }
+        if !changes.is_empty() || !steps.is_empty() {
+            sessions.push(SessionDiff {
+                name: name.to_string(),
+                changes,
+                steps,
+            });
+        }
+    }
+    let identical = baseline_digest == current_digest && sessions.is_empty();
+    ReportComparison {
+        identical,
+        baseline_digest,
+        current_digest,
+        sessions,
+    }
+}
+
+fn compare_receipts(baseline: &TurnReceipt, current: &TurnReceipt) -> Vec<String> {
+    let mut changes = Vec::new();
+    if baseline.answered != current.answered {
+        changes.push(format!("回答 {} → {}", baseline.answered, current.answered));
+    }
+    if baseline.intent != current.intent {
+        changes.push(format!("意图 {} → {}", baseline.intent, current.intent));
+    }
+    if baseline.reply_kind != current.reply_kind {
+        changes.push(format!(
+            "回答动作 {} → {}",
+            baseline.reply_kind, current.reply_kind
+        ));
+    }
+    if baseline.focus_before != current.focus_before {
+        changes.push(format!(
+            "改动前焦点 {} → {}",
+            focus_label(baseline.focus_before.as_deref()),
+            focus_label(current.focus_before.as_deref())
+        ));
+    }
+    if baseline.focus_after != current.focus_after {
+        changes.push(format!(
+            "焦点 {} → {}",
+            focus_label(baseline.focus_after.as_deref()),
+            focus_label(current.focus_after.as_deref())
+        ));
+    }
+    if baseline.inherited != current.inherited {
+        changes.push(format!(
+            "继承 {} → {}",
+            baseline.inherited, current.inherited
+        ));
+    }
+    changes.extend(compare_tokens("计划", &baseline.plan, &current.plan));
+    changes.extend(compare_tokens(
+        "证据",
+        &baseline.evidence,
+        &current.evidence,
+    ));
+    changes.extend(compare_tokens("缺口", &baseline.gaps, &current.gaps));
+    changes.extend(compare_tokens(
+        "引号词条",
+        &baseline.quoted_terms,
+        &current.quoted_terms,
+    ));
+    changes.extend(compare_tokens(
+        "未接地词条",
+        &baseline.ungrounded_terms,
+        &current.ungrounded_terms,
+    ));
+    if baseline.answer_digest != current.answer_digest {
+        changes.push(format!(
+            "回答 {} → {}",
+            excerpt(&baseline.answer_excerpt, 24),
+            excerpt(&current.answer_excerpt, 24)
+        ));
+    }
+    if baseline.state_digest != current.state_digest {
+        changes.push("状态摘要变化".to_string());
+    }
+    if baseline.digest != current.digest {
+        changes.push("回执摘要变化".to_string());
+    }
+    changes
+}
+
+fn compare_tokens(label: &str, baseline: &[String], current: &[String]) -> Vec<String> {
+    let removed: Vec<&str> = baseline
+        .iter()
+        .filter(|token| !current.contains(token))
+        .map(String::as_str)
+        .collect();
+    let added: Vec<&str> = current
+        .iter()
+        .filter(|token| !baseline.contains(token))
+        .map(String::as_str)
+        .collect();
+    let mut changes = Vec::new();
+    if !removed.is_empty() {
+        changes.push(format!("{} -{}", label, removed.join("、")));
+    }
+    if !added.is_empty() {
+        changes.push(format!("{} +{}", label, added.join("、")));
+    }
+    changes
+}
+
+fn focus_label(focus: Option<&str>) -> &str {
+    focus.unwrap_or("（空）")
+}
+
+fn reports_digest(reports: &[SessionReport]) -> String {
+    let rows: Vec<(&str, &str)> = reports
+        .iter()
+        .map(|report| (report.name.as_str(), report.digest.as_str()))
+        .collect();
+    canonical_digest(&rows).unwrap_or_default()
+}
+
+/// 读取报告集：既接受 `session --json` 的数组，也接受单份报告对象。
+pub fn parse_reports(text: &str) -> Result<Vec<SessionReport>, String> {
+    if let Ok(reports) = serde_json::from_str::<Vec<SessionReport>>(text) {
+        return Ok(reports);
+    }
+    serde_json::from_str::<SessionReport>(text)
+        .map(|report| vec![report])
+        .map_err(|error| format!("解析会话报告失败：{}", error))
+}
+
+/// 从路径读取报告集。
+pub fn load_reports(path: impl AsRef<Path>) -> Result<Vec<SessionReport>, String> {
+    let path = path.as_ref();
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("读取 {} 失败：{}", path.display(), error))?;
+    parse_reports(&text)
+}
+
+/// 把报告集写成稳定的 JSON（升序会话名 + 两空格缩进）。
+pub fn save_reports(path: impl AsRef<Path>, reports: &[SessionReport]) -> Result<(), String> {
+    let path = path.as_ref();
+    let mut sorted: Vec<&SessionReport> = reports.iter().collect();
+    sorted.sort_by(|left, right| left.name.cmp(&right.name));
+    let text = serde_json::to_string_pretty(&sorted)
+        .map_err(|error| format!("序列化会话报告失败：{}", error))?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("创建 {} 失败：{}", parent.display(), error))?;
+        }
+    }
+    std::fs::write(path, text).map_err(|error| format!("写入 {} 失败：{}", path.display(), error))
+}
+
 fn receipt_digest(receipt: &TurnReceipt) -> String {
     #[derive(Serialize)]
     struct Body<'a> {
@@ -904,6 +1175,55 @@ expect = { answered = true, grounded = true, quoted_contains = ["姚明", "身�
         let report = run_contract(&contract(source));
         assert!(report.passed, "{}", report.render_text());
         assert!(report.steps[0].receipt.ungrounded_terms.is_empty());
+    }
+
+    #[test]
+    fn baseline_comparison_lists_structural_changes() {
+        let source = r#"
+name = "比较"
+[[entities]]
+name = "姚明"
+type = "Person"
+attributes = { "身高" = "226" }
+[[turns]]
+input = "姚明的身高是多少"
+"#;
+        let baseline = run_contract(&contract(source));
+        let identical = compare_reports(&[baseline.clone()], &[baseline.clone()]);
+        assert!(identical.identical, "{}", identical.render_text());
+
+        let mut current = baseline.clone();
+        current.steps[0].receipt.focus_after = Some("叶莉".to_string());
+        current.steps[0].receipt.plan = vec!["board:filter".to_string()];
+        current.steps[0].receipt.digest = receipt_digest(&current.steps[0].receipt);
+        current.digest = canonical_digest(
+            &current
+                .steps
+                .iter()
+                .map(|step| &step.receipt)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let diff = compare_reports(&[baseline], &[current]);
+        assert!(!diff.identical);
+        let text = diff.render_text();
+        assert!(text.contains("焦点"));
+        assert!(text.contains("计划"));
+        assert!(text.contains("回执摘要变化"));
+    }
+
+    #[test]
+    fn reports_roundtrip_through_json() {
+        let reports = run_directory(SESSION_CONTRACT_DIR).expect("示例契约");
+        let dir = tempfile::TempDir::new().expect("临时目录");
+        let path = dir.path().join("baseline.json");
+        save_reports(&path, &reports).expect("写入基线");
+        let loaded = load_reports(&path).expect("读取基线");
+        assert_eq!(loaded.len(), reports.len());
+        let comparison = compare_reports(&reports, &loaded);
+        assert!(comparison.identical, "{}", comparison.render_text());
+        let single = serde_json::to_string(&reports[0]).unwrap();
+        assert_eq!(parse_reports(&single).unwrap().len(), 1);
     }
 
     #[test]
