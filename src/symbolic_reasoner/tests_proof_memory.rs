@@ -1,5 +1,3 @@
-use super::*;
-
 fn proof_reasoner() -> SymbolicReasoner {
     let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
     reasoner.observe_facts(&[

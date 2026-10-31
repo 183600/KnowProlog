@@ -783,8 +783,7 @@ pub fn canonical_key(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context_image::fnv1a_hex;
-use crate::delta_cache::DeltaFootprint;
+    use crate::delta_cache::DeltaFootprint;
     use crate::prolog_engine::PrologFact;
     use crate::resolution_engine::SearchStats;
 
