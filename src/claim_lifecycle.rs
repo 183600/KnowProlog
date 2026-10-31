@@ -2144,6 +2144,26 @@ impl ClaimLedger {
             .collect()
     }
 
+    fn is_descendant(&self, ancestor: &str, candidate: &str) -> bool {
+        let mut stack = vec![ancestor.to_string()];
+        let mut visited = BTreeSet::new();
+        while let Some(id) = stack.pop() {
+            if !visited.insert(id.clone()) {
+                continue;
+            }
+            let Some(children) = self.children.get(&id) else {
+                continue;
+            };
+            for child in children {
+                if child == candidate {
+                    return true;
+                }
+                stack.push(child.clone());
+            }
+        }
+        false
+    }
+
     fn retire_descendants(
         &mut self,
         id: &str,
@@ -2199,6 +2219,16 @@ impl ClaimLedger {
         }
         if !self.claims.contains_key(new) {
             return Err(ClaimError::UnknownClaim(new.to_string()));
+        }
+        if old == new {
+            return Err(ClaimError::InvalidRetirement(
+                "不能用 claim 取代自身".to_string(),
+            ));
+        }
+        if self.is_descendant(old, new) {
+            return Err(ClaimError::InvalidRetirement(
+                "新 claim 是旧 claim 的后代，会被一并退役".to_string(),
+            ));
         }
         self.retire_claim_internal(
             old,
@@ -3004,6 +3034,53 @@ mod tests {
         );
         assert_eq!(
             ledger.gate(&new.id, &GateContext::default()).verdict,
+            GateVerdict::Allow
+        );
+    }
+
+    #[test]
+    fn supersede_rejects_self_and_descendant_replacements() {
+        let mut ledger = ClaimLedger::new();
+        let root = ledger
+            .register(
+                draft(
+                    "赵六",
+                    "职业",
+                    "s1",
+                    "赵六是教师。",
+                    vec![ClaimSupport::fact(&fact("赵六", "职业", "教师"))],
+                ),
+                1,
+                1,
+            )
+            .unwrap();
+        let child = ledger
+            .register(
+                draft(
+                    "赵六",
+                    "行业",
+                    "s2",
+                    "赵六从事教育行业。",
+                    vec![ClaimSupport::claim(&root.id)],
+                ),
+                2,
+                1,
+            )
+            .unwrap();
+        assert!(matches!(
+            ledger.supersede(&root.id, &root.id, "自取代", 3, 2),
+            Err(ClaimError::InvalidRetirement(_))
+        ));
+        assert!(matches!(
+            ledger.supersede(&root.id, &child.id, "后代取代", 3, 2),
+            Err(ClaimError::InvalidRetirement(_))
+        ));
+        assert_eq!(
+            ledger.gate(&root.id, &GateContext::default()).verdict,
+            GateVerdict::Allow
+        );
+        assert_eq!(
+            ledger.gate(&child.id, &GateContext::default()).verdict,
             GateVerdict::Allow
         );
     }
