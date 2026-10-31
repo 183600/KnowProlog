@@ -632,10 +632,11 @@ impl OxigraphManager {
         Box<dyn std::error::Error + Send + Sync>,
     > {
         let store = self.store.lock().await;
-        let mut ledger = Self::fusion_ledger_from_store(&store)?;
+        let ledger = Self::fusion_ledger_from_store(&store)?;
         let alignment = crate::graph_identity::align_ledger(&ledger, options);
-        ledger.assertions = alignment.project_assertions(&ledger.assertions);
-        let plan = self.fusion_plan_for_ledger_locked(&store, &ledger, policy)?;
+        let mut view = ledger.clone();
+        view.assertions = alignment.project_assertions(&ledger.assertions);
+        let plan = self.fusion_plan_for_ledger_locked(&store, &view, policy)?;
         Ok((alignment, plan))
     }
 
@@ -654,8 +655,10 @@ impl OxigraphManager {
         let store = self.store.lock().await;
         let mut ledger = Self::fusion_ledger_from_store(&store)?;
         let alignment = crate::graph_identity::align_ledger(&ledger, options);
-        ledger.assertions = alignment.project_assertions(&ledger.assertions);
-        let outcome = self.apply_fusion_ledger_locked(&store, ledger, policy)?;
+        let mut view = ledger.clone();
+        view.assertions = alignment.project_assertions(&ledger.assertions);
+        let plan = self.fusion_plan_for_ledger_locked(&store, &view, policy)?;
+        let outcome = self.apply_fusion_plan_locked(&store, &mut ledger, plan)?;
         Ok((alignment, outcome))
     }
 
@@ -681,6 +684,16 @@ impl OxigraphManager {
     ) -> Result<knowledge_fusion::FusionApplyOutcome, Box<dyn std::error::Error + Send + Sync>>
     {
         let plan = self.fusion_plan_for_ledger_locked(store, &ledger, policy)?;
+        self.apply_fusion_plan_locked(store, &mut ledger, plan)
+    }
+
+    fn apply_fusion_plan_locked(
+        &self,
+        store: &Store,
+        ledger: &mut knowledge_fusion::FusionLedger,
+        plan: knowledge_fusion::FusionPlan,
+    ) -> Result<knowledge_fusion::FusionApplyOutcome, Box<dyn std::error::Error + Send + Sync>>
+    {
         let winners = plan.materialize_keys();
 
         let mut removed = 0usize;
@@ -730,7 +743,7 @@ impl OxigraphManager {
                 .collect(),
         );
         ledger.sort_and_dedup();
-        self.sync_fusion_ledger_locked(&store, &ledger)?;
+        self.sync_fusion_ledger_locked(store, ledger)?;
         if inserted + removed > 0 {
             let delta = footprint_from_quad_sets(&inserted_quads, &removed_quads);
             self.bump_revision_with(Some(delta));
@@ -1336,6 +1349,21 @@ mod fusion_tests {
             .slots
             .iter()
             .any(|slot| slot.subject == "Apple Inc." || slot.subject == "Steve Jobs"));
+
+        let (_, outcome) = manager
+            .apply_fusion_with_identity(&policy, &crate::graph_identity::AlignmentOptions::default())
+            .await
+            .unwrap();
+        assert!(outcome.inserted > 0);
+        let persisted = manager.load_fusion_ledger().await.unwrap();
+        assert_eq!(persisted.assertions.len(), 8, "物化不应改写来源账本");
+        assert!(persisted
+            .assertions
+            .iter()
+            .any(|assertion| assertion.namespace == "bob" && assertion.subject == "Apple Inc."));
+        assert!(persisted.applied.iter().any(|winner| {
+            winner.subject == "苹果公司" && winner.predicate == "创始人"
+        }));
     }
 
     /// 历史默认图事实不被融合触碰（只增不删非托管数据）。
