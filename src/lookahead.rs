@@ -356,33 +356,39 @@ pub fn session_state_digest(session: &ClarificationSession) -> u64 {
 
 /// 归结引擎的确定性摘要：排序后的事实与规则，不依赖 `HashSet` 遍历序。
 pub fn engine_digest(engine: &ResolutionEngine) -> u64 {
-    let mut facts: Vec<String> = engine.all_facts().map(Atom::display).collect();
+    let mut facts: Vec<String> = engine
+        .all_facts()
+        .map(|atom| format!("fact:{}", atom.display()))
+        .collect();
     facts.sort();
-    let mut clauses: Vec<String> = engine
+    let mut clauses: Vec<Vec<String>> = engine
         .all_clauses()
         .iter()
-        .map(clause_digest_text)
+        .map(clause_digest_parts)
         .collect();
     clauses.sort();
-    let mut parts: Vec<String> = Vec::with_capacity(facts.len() + clauses.len() + 2);
-    parts.push(format!("f{}", facts.len()));
+    let mut parts: Vec<String> = Vec::with_capacity(facts.len() + clauses.len() * 5 + 2);
+    parts.push(format!("facts:{}", facts.len()));
     parts.extend(facts);
-    parts.push(format!("c{}", clauses.len()));
-    parts.extend(clauses);
+    parts.push(format!("clauses:{}", clauses.len()));
+    for clause in clauses {
+        parts.extend(clause);
+    }
     digest_list(&parts)
 }
 
-fn clause_digest_text(clause: &Clause) -> String {
-    let mut out = clause.head.display();
-    out.push_str("<-");
+/// 把一条子句拆成带标签的独立片段：每个片段都会被 [`digest_list`] 长度前缀，
+/// 避免用户输入中的分隔符造成拼接歧义。
+fn clause_digest_parts(clause: &Clause) -> Vec<String> {
+    let mut parts = Vec::with_capacity(clause.body.len() + 4);
+    parts.push(format!("head:{}", clause.head.display()));
+    parts.push(format!("body:{}", clause.body.len()));
     for body in &clause.body {
-        out.push_str(&body.display());
-        out.push('&');
+        parts.push(format!("goal:{}", body.display()));
     }
-    out.push_str(&clause.confidence.to_bits().to_string());
-    out.push('|');
-    out.push_str(&clause.source);
-    out
+    parts.push(format!("confidence:{}", clause.confidence.to_bits()));
+    parts.push(format!("source:{}", clause.source));
+    parts
 }
 
 /// 长度前缀的稳定 FNV-1a 摘要：同输入同输出，不依赖随机种子。

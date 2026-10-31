@@ -57,6 +57,60 @@ fn clarification_lookahead_hits_and_preserves_observable_output() {
 }
 
 #[test]
+fn clarification_lookahead_rejects_when_engine_changed_after_prefetch() {
+    let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+    reasoner.observe_facts(&master_facts());
+    let _ = reasoner
+        .abduce_statement("张三的师祖是赵六")
+        .expect("应能溯因");
+    reasoner.start_clarification().expect("应开始澄清");
+    // 模拟前瞻之后、回答之前发生的知识变化：封印中的引擎摘要不再匹配。
+    reasoner.resolver.add_fact("临时", "甲", "乙");
+    let misses_before = reasoner.perf.count("clarification_lookahead_misses");
+    let output = reasoner.answer_clarification("是的").expect("应处理确认");
+    assert!(
+        reasoner.perf.count("clarification_lookahead_misses") > misses_before,
+        "引擎摘要变化必须让前瞻未命中"
+    );
+    assert!(
+        output.contains("已确认假设"),
+        "拒绝前瞻后仍应走正常确认路径：{}",
+        output
+    );
+    assert_eq!(
+        reasoner.session_facts().len(),
+        1,
+        "正常路径仍应写入一条会话事实"
+    );
+}
+
+#[test]
+fn clarification_lookahead_apply_rejects_mismatched_engine_digest() {
+    let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+    reasoner.observe_facts(&master_facts());
+    let _ = reasoner
+        .abduce_statement("张三的师祖是赵六")
+        .expect("应能溯因");
+    reasoner.start_clarification().expect("应开始澄清");
+    let session = reasoner.clarification.clone().expect("应有澄清会话");
+    let state = crate::lookahead::session_state_digest(&session);
+    let wrong_engine = crate::lookahead::engine_digest(&reasoner.resolver).wrapping_add(1);
+    let evidence =
+        crate::lookahead::BranchEvidence::with_state(session, wrong_engine, state, false);
+    let key = crate::lookahead::BranchKey::Confirm("测试假设".to_string());
+    let rejected_before = reasoner.perf.count("clarification_lookahead_rejected");
+    assert!(
+        !reasoner.apply_clarification_lookahead(Some((key, evidence))),
+        "引擎摘要不一致时必须拒绝证据"
+    );
+    assert!(
+        reasoner.perf.count("clarification_lookahead_rejected") > rejected_before,
+        "拒绝必须计入台账"
+    );
+    assert!(reasoner.clarification_active(), "拒绝证据不得改变真实会话");
+}
+
+#[test]
 fn clarification_lookahead_clears_on_finish_and_reset() {
     let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
     reasoner.observe_facts(&master_facts());

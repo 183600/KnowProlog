@@ -51,18 +51,19 @@ impl SymbolicReasoner {
                     .map(|atom| format!("frontier:{}", atom.display())),
             );
             for scenario in explanations.explanations() {
-                let members = scenario
-                    .atoms()
-                    .iter()
-                    .map(Atom::display)
-                    .collect::<Vec<_>>()
-                    .join("&");
+                space.push("scenario".to_string());
+                space.push(format!("verified:{}", scenario.verified));
                 space.push(format!(
-                    "scenario:{}:{}:{}",
-                    scenario.verified,
-                    scenario.joint_confidence.to_bits(),
-                    members
+                    "confidence:{}",
+                    scenario.joint_confidence.to_bits()
                 ));
+                space.push(format!("members:{}", scenario.hypotheses.len()));
+                space.extend(
+                    scenario
+                        .atoms()
+                        .iter()
+                        .map(|atom| format!("member:{}", atom.display())),
+                );
             }
         }
         BranchSeal::compute(
