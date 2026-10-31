@@ -1741,6 +1741,9 @@ enum Commands {
         /// Replace OLD claim id with NEW claim id as OLD=NEW (repeatable)
         #[arg(long = "supersede", value_name = "OLD=NEW")]
         supersede: Vec<String>,
+        /// Mark a claim as needing revalidation without retiring it (repeatable)
+        #[arg(long = "stale-claim", value_name = "CLAIM_ID")]
+        stale_claim: Vec<String>,
         /// Retirement kind: retracted / superseded / expired / redacted
         #[arg(long, default_value = "retracted")]
         retire_kind: String,

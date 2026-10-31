@@ -1028,6 +1028,7 @@ fn run_claim_ledger(
     retire_facts: &[String],
     retire_claims: &[String],
     supersessions: &[String],
+    stale_claims: &[String],
     retire_kind: &str,
     reason: &str,
     impact_facts: &[String],
@@ -1147,6 +1148,19 @@ fn run_claim_ledger(
         std::process::exit(2);
     }
 
+    let mut staled = Vec::new();
+    for id in stale_claims {
+        let id = id.trim();
+        match ledger.mark_stale(id, reason, turn, revision) {
+            Ok(_) => staled.push(id.to_string()),
+            Err(error) => {
+                eprintln!("标记待复核失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+        dirty = true;
+    }
+
     let mut claim_impacts = Vec::new();
     for id in retire_claims {
         let id = id.trim();
@@ -1225,6 +1239,12 @@ fn run_claim_ledger(
                 serde_json::to_value(&privacy_impacts).unwrap_or(serde_json::Value::Null),
             );
         }
+        if !staled.is_empty() {
+            object.insert(
+                "stale_claims".to_string(),
+                serde_json::to_value(&staled).unwrap_or(serde_json::Value::Null),
+            );
+        }
         if !claim_impacts.is_empty() {
             object.insert(
                 "claim_impacts".to_string(),
@@ -1269,6 +1289,9 @@ fn run_claim_ledger(
         }
         for impact in &privacy_impacts {
             println!("{}", impact.render_zh());
+        }
+        for id in &staled {
+            println!("命题 {} 已标记为待复核（{}）。", id, reason);
         }
         for impact in &claim_impacts {
             println!("{}", impact.render_zh());
