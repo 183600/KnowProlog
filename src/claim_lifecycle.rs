@@ -1545,6 +1545,7 @@ impl ClaimLedger {
     pub fn claim(&self, id: &str) -> Option<&ClaimRecord> {
         self.claims.get(id)
     }
+
     /// 已退役事实的键快照；生成前用它把墓碑投影成抑制项。
     pub fn retired_facts(&self) -> Vec<FactKey> {
         self.facts
