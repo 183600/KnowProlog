@@ -457,25 +457,10 @@ impl<'a> FoilSampler<'a> {
         let refuted = self.ledger.is_refuted(&foil);
         let functional = self.ledger.is_functional(&foil.predicate);
         let has_other_value = self
-            .predictor
-            .objects_of(&foil.subject, &foil.predicate)
-            .into_iter()
-            .filter(|object| object != &foil.object)
-            .any(|object| {
-                !self
-                    .ledger
-                    .is_refuted(&Triple::new(&foil.subject, &foil.predicate, &object))
-            })
-            || self
-                .ledger
-                .objects_of(&foil.subject, &foil.predicate)
-                .into_iter()
-                .filter(|object| object != &foil.object)
-                .any(|object| {
-                    !self
-                        .ledger
-                        .is_refuted(&Triple::new(&foil.subject, &foil.predicate, &object))
-                });
+            .ledger
+            .values_for(self.predictor, &foil.subject, &foil.predicate)
+            .iter()
+            .any(|object| object != &foil.object);
         let status = if known && refuted {
             FoilStatus::Conflict
         } else if refuted {
@@ -1370,8 +1355,42 @@ impl FoilLedger {
         removed
     }
 
-    /// 该账本是否会阻断一次预测（按预测携带的规则下标定位守卫）。
+    fn values_for(
+        &self,
+        predictor: &LinkPredictor,
+        subject: &str,
+        predicate: &str,
+    ) -> BTreeSet<String> {
+        let mut values: BTreeSet<String> = predictor
+            .objects_of(subject, predicate)
+            .into_iter()
+            .filter(|object| !self.is_refuted(&Triple::new(subject, predicate, object)))
+            .collect();
+        values.extend(
+            self.objects_of(subject, predicate)
+                .into_iter()
+                .filter(|object| !self.is_refuted(&Triple::new(subject, predicate, object))),
+        );
+        values
+    }
+
+    /// 该账本是否会阻断一次预测：显式否认、功能谓词冲突或已采纳的规则守卫。
     pub fn blocks_prediction(&self, predictor: &LinkPredictor, prediction: &Prediction) -> bool {
+        if self.is_refuted(&prediction.triple) {
+            return true;
+        }
+        if self.is_functional(&prediction.triple.predicate)
+            && self
+                .values_for(
+                    predictor,
+                    &prediction.triple.subject,
+                    &prediction.triple.predicate,
+                )
+                .iter()
+                .any(|value| value != &prediction.triple.object)
+        {
+            return true;
+        }
         let Some(rule) = predictor.rules().get(prediction.rule_index) else {
             return false;
         };
@@ -1385,7 +1404,7 @@ impl FoilLedger {
             .any(|guard| guard.blocks(&prediction.triple, predictor, &extras))
     }
 
-    /// 过滤预测：只保留未被任何已采纳守卫阻断的候选。
+    /// 过滤预测：只保留未被显式否认、功能冲突或规则守卫阻断的候选。
     pub fn filter_predictions<'a>(
         &self,
         predictor: &LinkPredictor,
@@ -1462,7 +1481,7 @@ impl FoilLedger {
                 .filter(|prediction| self.blocks_prediction(predictor, prediction))
                 .collect();
             output.push_str(&format!(
-                "\n  预测复核：抽样 {} 条，守卫阻断 {} 条。",
+                "\n  预测复核：抽样 {} 条，账本阻断 {} 条。",
                 predictions.len(),
                 blocked.len()
             ));
@@ -1522,21 +1541,7 @@ pub fn functional_conflict_negatives(
             if predictor.has_triple(&triple.subject, &triple.predicate, &triple.object) {
                 continue;
             }
-            let mut values: BTreeSet<String> = predictor
-                .objects_of(&triple.subject, &triple.predicate)
-                .into_iter()
-                .filter(|value| {
-                    !ledger.is_refuted(&Triple::new(&triple.subject, &triple.predicate, value))
-                })
-                .collect();
-            values.extend(
-                ledger
-                    .objects_of(&triple.subject, &triple.predicate)
-                    .into_iter()
-                    .filter(|value| {
-                        !ledger.is_refuted(&Triple::new(&triple.subject, &triple.predicate, value))
-                    }),
-            );
+            let values = ledger.values_for(predictor, &triple.subject, &triple.predicate);
             if values.iter().any(|value| value != &triple.object) {
                 out.insert(triple.clone());
             }
@@ -1737,6 +1742,26 @@ mod tests {
         assert!(negatives.contains(&Triple::new("李四", "师祖", "赵六")));
         assert!(!negatives.contains(&Triple::new("李四", "师祖", "王五")));
         assert!(functional_conflict_negatives(&predictor, &FoilLedger::new()).is_empty());
+    }
+
+    #[test]
+    fn ledger_blocks_refuted_and_functional_predictions() {
+        let predictor = predictor();
+        let prediction = predictor
+            .predict_for_entity("李四", Some("师祖"), 8)
+            .into_iter()
+            .find(|prediction| prediction.triple == Triple::new("李四", "师祖", "赵六"))
+            .expect("应预测出李四的师祖候选");
+
+        let mut refuted = FoilLedger::new();
+        refuted.refute("李四", "师祖", "赵六");
+        assert!(refuted.blocks_prediction(&predictor, &prediction));
+
+        let mut functional = FoilLedger::new();
+        functional.mark_functional("师祖");
+        assert!(functional.blocks_prediction(&predictor, &prediction));
+
+        assert!(!FoilLedger::new().blocks_prediction(&predictor, &prediction));
     }
 
     #[test]
