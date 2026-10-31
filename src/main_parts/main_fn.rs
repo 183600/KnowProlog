@@ -177,6 +177,39 @@ async fn main() {
         return;
     }
 
+    // Foil 采样与规则精化只操作会话账本，不打开知识存储。
+    if let Some(Commands::Foil {
+        fact,
+        positive,
+        refute,
+        functional,
+        rule,
+        adopt,
+        session,
+        min_support,
+        min_confidence,
+        max_foils,
+        limit,
+        json,
+    }) = &cli.command
+    {
+        run_foil(
+            fact,
+            positive,
+            refute,
+            functional,
+            rule,
+            *adopt,
+            session.as_deref(),
+            *min_support,
+            *min_confidence,
+            *max_foils,
+            *limit,
+            *json,
+        );
+        return;
+    }
+
     // 共指闭包只读证据 JSON：不打开知识存储，也不写任何账本。
     if let Some(Commands::Coref {
         file_path,

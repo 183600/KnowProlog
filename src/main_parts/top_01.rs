@@ -48,7 +48,9 @@ use know_prolog::{
     event_graph::{EventDialogue, EventGraph},
     external_knowledge::{get_direct_answer, AnswerOutcome, ExternalKnowledgeService},
     external_ledger::{ExternalLedger, LedgerLoad},
-    extract_query_entities_from_tagged, frontier, fulfillment,
+    extract_query_entities_from_tagged,
+    foil_refinement::{refine_rule, FoilLedger, FoilOptions, FoilSampler, RefineOptions},
+    frontier, fulfillment,
     fusion_arbitration::{arbitrate, ArbitrationInput},
     grammar_extractor::GrammarExtractor,
     history_trust::TrustAssessment,
@@ -397,6 +399,48 @@ enum Commands {
         #[arg(long, default_value_t = 20_000)]
         max_expansions: usize,
         /// Print the ledger and answers as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Sample near-miss alternatives (foils) for facts and compile explicit
+    /// refutations into reversible rule guards; never writes the knowledge store
+    Foil {
+        /// Fact to load as SUBJECT|PREDICATE|OBJECT (prefix ! for an explicit
+        /// refutation; repeatable)
+        #[arg(long = "fact", value_name = "S|P|O")]
+        fact: Vec<String>,
+        /// Positive hypothesis to inspect (repeatable; defaults to all loaded facts)
+        #[arg(long = "positive", value_name = "S|P|O")]
+        positive: Vec<String>,
+        /// Explicit refutation as SUBJECT|PREDICATE|OBJECT (repeatable)
+        #[arg(long = "refute", value_name = "S|P|O")]
+        refute: Vec<String>,
+        /// Mark a predicate as single-valued for this session (repeatable)
+        #[arg(long = "functional", value_name = "PREDICATE")]
+        functional: Vec<String>,
+        /// Refine only this rule index (repeatable; defaults to every mined rule)
+        #[arg(long = "rule", value_name = "INDEX")]
+        rule: Vec<usize>,
+        /// Adopt the compiled guards into the session ledger (requires --session)
+        #[arg(long, requires = "session")]
+        adopt: bool,
+        /// Session ledger JSON to load and save (state only; the knowledge
+        /// store is never opened or written)
+        #[arg(long)]
+        session: Option<String>,
+        /// Minimum rule support
+        #[arg(long, default_value_t = 2)]
+        min_support: usize,
+        /// Minimum rule confidence
+        #[arg(long, default_value_t = 0.6)]
+        min_confidence: f64,
+        /// Maximum foils sampled per positive
+        #[arg(long, default_value_t = 6)]
+        max_foils: usize,
+        /// Maximum positives inspected (stable order)
+        #[arg(long, default_value_t = 64)]
+        limit: usize,
+        /// Print the reports as JSON
         #[arg(long)]
         json: bool,
     },

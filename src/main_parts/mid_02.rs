@@ -449,6 +449,191 @@ fn run_rewrite_rules(book_path: &str, adopt: &[String], retire: &[String], json:
     }
 }
 
+/// `foil`：采样近邻替代并把显式反例编译成可撤销的规则守卫。
+#[allow(clippy::too_many_arguments)]
+fn run_foil(
+    facts: &[String],
+    positives: &[String],
+    refutations: &[String],
+    functional: &[String],
+    rule_indices: &[usize],
+    adopt: bool,
+    session_path: Option<&str>,
+    min_support: usize,
+    min_confidence: f64,
+    max_foils: usize,
+    limit: usize,
+    json: bool,
+) {
+    let mut ledger = match session_path {
+        Some(path) if std::path::Path::new(path).exists() => {
+            match FoilLedger::load_from_path(path) {
+                Some(ledger) => ledger,
+                None => {
+                    eprintln!("读取反例账本失败：{}", path);
+                    std::process::exit(1);
+                }
+            }
+        }
+        _ => FoilLedger::new(),
+    };
+
+    let mut predictor = LinkPredictor::new();
+    for raw in facts {
+        match open_closure::parse_fact(raw) {
+            Ok((subject, predicate, object, negated)) => {
+                if negated {
+                    ledger.refute(&subject, &predicate, &object);
+                } else {
+                    predictor.add_triple(&subject, &predicate, &object);
+                    ledger.assert_observation(&subject, &predicate, &object);
+                }
+            }
+            Err(error) => {
+                eprintln!("{}", error);
+                std::process::exit(2);
+            }
+        }
+    }
+    for raw in refutations {
+        match open_closure::parse_fact(raw) {
+            Ok((subject, predicate, object, _)) => {
+                ledger.refute(&subject, &predicate, &object);
+            }
+            Err(error) => {
+                eprintln!("{}", error);
+                std::process::exit(2);
+            }
+        }
+    }
+    for predicate in functional {
+        ledger.mark_functional(predicate);
+    }
+
+    let mut hypotheses = Vec::new();
+    for raw in positives {
+        match open_closure::parse_fact(raw) {
+            Ok((subject, predicate, object, _)) => {
+                hypotheses.push(LawTriple::new(&subject, &predicate, &object));
+            }
+            Err(error) => {
+                eprintln!("{}", error);
+                std::process::exit(2);
+            }
+        }
+    }
+    if hypotheses.is_empty() {
+        hypotheses = predictor.triples().to_vec();
+    }
+    hypotheses.sort();
+    hypotheses.dedup();
+    let hypotheses_total = hypotheses.len();
+    hypotheses.truncate(limit.max(1));
+
+    predictor.mine_rules(min_support.max(1), min_confidence.clamp(0.0, 1.0));
+    let options = FoilOptions {
+        max_foils_per_positive: max_foils.max(1),
+        ..FoilOptions::default()
+    };
+    let reports = FoilSampler::new(&predictor, &ledger)
+        .with_options(options)
+        .sample(&hypotheses);
+
+    let negatives: Vec<LawTriple> = ledger.refutations().cloned().collect();
+    let functional_set: BTreeSet<String> = ledger.functional_predicates().cloned().collect();
+    let indices: Vec<usize> = if rule_indices.is_empty() {
+        (0..predictor.rules().len()).collect()
+    } else {
+        rule_indices.to_vec()
+    };
+    let refinements: Vec<_> = indices
+        .into_iter()
+        .map(|index| {
+            refine_rule(
+                &predictor,
+                index,
+                &negatives,
+                &functional_set,
+                &RefineOptions::default(),
+            )
+        })
+        .collect();
+
+    let mut adopted = 0usize;
+    if adopt {
+        for refinement in &refinements {
+            if ledger.adopt_refinement(refinement) {
+                adopted += 1;
+            }
+        }
+    }
+
+    if let Some(path) = session_path {
+        if let Err(error) = ledger.save_to_path(path) {
+            eprintln!("写入反例账本失败（{}）：{}", path, error);
+            std::process::exit(1);
+        }
+    }
+
+    let predictions = predictor.predict_missing(32);
+    let kept_predictions = ledger.filter_predictions(&predictor, &predictions).len();
+    if json {
+        let payload = serde_json::json!({
+            "reports": &reports,
+            "refinements": &refinements,
+            "ledger": &ledger,
+            "adopted": adopted,
+            "hypotheses_total": hypotheses_total,
+            "hypotheses_inspected": reports.len(),
+            "predictions_sampled": predictions.len(),
+            "predictions_kept": kept_predictions,
+        });
+        match serde_json::to_string_pretty(&payload) {
+            Ok(text) => println!("{}", text),
+            Err(error) => {
+                eprintln!("反例报告序列化失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    for report in &reports {
+        print!("{}", report.render_text());
+    }
+    if hypotheses_total > reports.len() {
+        println!(
+            "（仅检查前 {} 条正例，共 {} 条；可用 --limit 调整。）",
+            reports.len(),
+            hypotheses_total
+        );
+    }
+    let touched: Vec<_> = refinements
+        .iter()
+        .filter(|refinement| {
+            !refinement.hard_negatives.is_empty() || !refinement.guards.is_empty()
+        })
+        .collect();
+    if touched.is_empty() {
+        println!(
+            "规则精化：扫描 {} 条规则，没有可由显式反例驱动的精化。",
+            refinements.len()
+        );
+    } else {
+        println!(
+            "规则精化：{} 条规则命中硬反例。",
+            touched.len()
+        );
+        for refinement in touched {
+            print!("{}", refinement.render_text());
+        }
+    }
+    println!("{}", ledger.render_report(&predictor));
+    if adopt {
+        println!("已采纳精化：{} 条规则。", adopted);
+    }
+}
+
 /// `open-closure`：只操作会话账本，不打开知识存储，也不写律典。
 #[allow(clippy::too_many_arguments)]
 fn run_open_closure(

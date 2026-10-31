@@ -1764,6 +1764,8 @@
         // 已在加载配置前处理（见 main 顶部早期分派）
         Some(Commands::OpenClosure { .. }) => {}
         // 已在加载配置前处理（见 main 顶部早期分派）
+        Some(Commands::Foil { .. }) => {}
+        // 已在加载配置前处理（见 main 顶部早期分派）
         Some(Commands::Coref { .. }) => {}
         // 已在加载配置前处理（见 main 顶部早期分派）
         Some(Commands::Privacy { .. }) => {}
