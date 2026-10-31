@@ -74,6 +74,7 @@ use crate::perf_ledger::PerfLedger;
 use crate::plugin::{PluginOutcome, PluginRuntime, RecipeDirection};
 use crate::predicate_registry::PredicateRegistry;
 use crate::prediction_draft::PredictionDrafts;
+use crate::foil_refinement::FoilLedger;
 use crate::predictive_elaboration::{PredictionGuard, PredictiveElaboration};
 use crate::probabilistic_query_intent::{
     Claim, EpistemicMode, EpistemicTarget, ProbabilisticQueryIntent,
@@ -638,6 +639,10 @@ pub struct DialogueSnapshot {
     pub completion: Option<CompletionLedger>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub predictive: Option<PredictiveElaboration>,
+    // 反例采样/规则守卫账本：跨会话保存显式否认、功能谓词与已采纳守卫；
+    // 空账本不落盘，旧快照字节保持不变
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foil: Option<FoilLedger>,
     // 当前假设世界的临时假设（未确认、未写入会话事实层）；
     // 空世界不落盘，旧快照字节保持不变
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -850,6 +855,7 @@ impl DialogueContext {
             ontology: None,
             completion: None,
             predictive: None,
+            foil: None,
             assumptions: Vec::new(),
             session_receipts: Vec::new(),
             pending_hypotheses: Vec::new(),
@@ -1311,6 +1317,8 @@ pub struct SymbolicReasoner {
     completion: CompletionLedger,
     // 生成侧推测账本：链接预测 → 闸门 → 呈现 → 裁决 → 会话记忆。
     predictive: PredictiveElaboration,
+    // 反例/守卫账本：来自 `foil` 子命令的显式决定；只过滤候选，不写图谱。
+    foil_ledger: FoilLedger,
     // 律典：声明律 + 挖掘律的统一台账；仅 Active 的传递/对称/互逆律参与查询扩展。
     laws: LawBook,
     // 律典的声明来源快照；知识变化时据此重建，避免把配置知识散落在查询路径。

@@ -96,6 +96,8 @@ impl SymbolicReasoner {
         self.completion = snapshot.completion.clone().unwrap_or_default();
         self.completion.clamp_limits();
         self.predictive = snapshot.predictive.clone().unwrap_or_default();
+        self.foil_ledger = snapshot.foil.clone().unwrap_or_default();
+        self.prediction_drafts.lock().clear();
         let regression = self.completion.enforce_regression();
         if !regression.passed() {
             self.completion.note(format!(

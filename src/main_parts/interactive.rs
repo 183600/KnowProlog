@@ -296,6 +296,20 @@ async fn run_interactive_mode(
     );
     // 读法观测：注入与交互/导入路径相同的 NLP 配置；失败轮才留轨迹。
     symbolic_reasoner.set_nlp_config(config.nlp.clone());
+    // 反例/守卫账本：`foil --session <store>/foil_ledger.json --adopt` 写入后，
+    // 交互对话按同一账本过滤链接预测候选；账本缺失时保持空。
+    let foil_path = format!("{}/foil_ledger.json", store_path);
+    if let Some(ledger) = FoilLedger::load_from_path(&foil_path) {
+        if ledger.has_decisions() {
+            println!(
+                "已恢复反例账本：{} 条否认，{} 个功能谓词，{} 条规则守卫。",
+                ledger.refutations().count(),
+                ledger.functional_predicates().count(),
+                ledger.guarded_rule_count()
+            );
+            symbolic_reasoner.set_foil_ledger(ledger);
+        }
+    }
     // 属性本体档案：启动即生效，单位化属性问答与属性 IRI 读兼容不依赖热重载。
     symbolic_reasoner.configure_attributes(&config.attributes);
     if config.semantic_grammar.enabled {

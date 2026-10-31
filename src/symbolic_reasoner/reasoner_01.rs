@@ -154,6 +154,7 @@ impl SymbolicReasoner {
             )),
             completion: CompletionLedger::new(),
             predictive: PredictiveElaboration::new(),
+            foil_ledger: FoilLedger::new(),
             laws: LawBook::new(),
             law_registry: None,
             persisted_laws: None,

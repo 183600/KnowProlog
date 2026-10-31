@@ -12,6 +12,7 @@ impl Clone for SymbolicReasoner {
             )),
             completion: self.completion.clone(),
             predictive: self.predictive.clone(),
+            foil_ledger: self.foil_ledger.clone(),
             laws: self.laws.clone(),
             law_registry: self.law_registry.clone(),
             persisted_laws: self.persisted_laws.clone(),

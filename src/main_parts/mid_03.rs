@@ -1665,6 +1665,11 @@ async fn build_store_reasoner(
         PerfLedger::shared(),
     );
     reasoner.set_nlp_config(config.nlp.clone());
+    if let Some(ledger) =
+        FoilLedger::load_from_path(&format!("{}/foil_ledger.json", store_path))
+    {
+        reasoner.set_foil_ledger(ledger);
+    }
     if config.semantic_grammar.enabled {
         reasoner
             .attach_semantic_grammar(know_prolog::semantic_grammar::RulePack::from_config(config));

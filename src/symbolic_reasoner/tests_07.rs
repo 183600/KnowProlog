@@ -79,6 +79,53 @@
         assert!(follow.contains("赵六"), "王五的师傅应为赵六：{}", follow);
     }
 
+
+    #[test]
+    fn foil_guards_filter_predictions_and_survive_snapshot() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let before = reasoner.predictions_for_entity("李四", Some("师祖"), 8);
+        let target = before.first().expect("应至少有一条链接预测").clone();
+        let rule = reasoner
+            .predictor
+            .rules()
+            .get(target.rule_index)
+            .expect("预测应引用有效规则");
+        let refinement = crate::foil_refinement::RuleRefinement {
+            rule_index: target.rule_index,
+            rule_text: rule.rule_text(),
+            hard_negatives: vec![target.triple.clone()],
+            unmatched_negatives: Vec::new(),
+            positives: Vec::new(),
+            evaluations: Vec::new(),
+            guards: vec![crate::foil_refinement::RuleGuard::ExceptInstance {
+                subject: target.triple.subject.clone(),
+                predicate: target.triple.predicate.clone(),
+                object: target.triple.object.clone(),
+            }],
+            blocked: 1,
+            status: crate::foil_refinement::RefinementStatus::Refined,
+            note: "测试守卫".to_string(),
+        };
+        let mut ledger = FoilLedger::new();
+        assert!(ledger.adopt_refinement(&refinement));
+        reasoner.set_foil_ledger(ledger);
+        let after = reasoner.predictions_for_entity("李四", Some("师祖"), 8);
+        assert!(!after.iter().any(|prediction| prediction.triple == target.triple));
+
+        let snapshot = reasoner.dialogue_snapshot();
+        assert!(snapshot.foil.is_some());
+        let mut restored = SymbolicReasoner::new(test_config(), HashMap::new());
+        restored.observe_facts(&master_facts());
+        restored
+            .restore_dialogue_snapshot(&snapshot)
+            .expect("反例账本应可恢复");
+        let after_restore = restored.predictions_for_entity("李四", Some("师祖"), 8);
+        assert!(!after_restore
+            .iter()
+            .any(|prediction| prediction.triple == target.triple));
+    }
+
     fn alignment_facts() -> Vec<PrologFact> {
         vec![
             PrologFact::Entity {

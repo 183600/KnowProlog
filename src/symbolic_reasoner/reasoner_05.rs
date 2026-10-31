@@ -817,7 +817,16 @@ impl SymbolicReasoner {
             self.prediction_drafts.lock().clear();
         }
         self.perf.bump("prediction_draft_misses");
-        let predictions = self.predictor.predict_for_entity(entity, predicate, limit);
+        let raw = self.predictor.predict_for_entity(entity, predicate, limit);
+        let predictions = if self.foil_ledger.guarded_rule_count() == 0 {
+            raw
+        } else {
+            self.foil_ledger
+                .filter_predictions(&self.predictor, &raw)
+                .into_iter()
+                .cloned()
+                .collect()
+        };
         let evicted = self.prediction_drafts.lock().put(
             self.revision,
             entity,
@@ -880,6 +889,29 @@ impl SymbolicReasoner {
         &self.predictive
     }
 
+    pub fn foil_ledger(&self) -> &FoilLedger {
+        &self.foil_ledger
+    }
+
+    /// 注入反例/守卫账本（通常来自 `<store>/foil_ledger.json`）。
+    /// 只影响后续候选过滤，不写图谱。
+    pub fn set_foil_ledger(&mut self, ledger: FoilLedger) {
+        self.foil_ledger = ledger;
+        self.prediction_drafts.lock().clear();
+    }
+
+    /// 采纳精化结果，立即过滤后续对话中的链接预测候选。
+    pub fn adopt_foil_refinement(
+        &mut self,
+        refinement: &crate::foil_refinement::RuleRefinement,
+    ) -> bool {
+        let changed = self.foil_ledger.adopt_refinement(refinement);
+        if changed {
+            self.prediction_drafts.lock().clear();
+        }
+        changed
+    }
+
     fn predictive_guard(&mut self) -> PredictionGuard {
         let mut guard = PredictionGuard::new();
         for triple in self.predictor.triples() {
@@ -899,6 +931,12 @@ impl SymbolicReasoner {
             }
         }
         for predicate in self.slots.policy().functional_predicates() {
+            guard.mark_functional(predicate);
+        }
+        for triple in self.foil_ledger.refutations() {
+            guard.insert_refuted(&triple.subject, &triple.predicate, &triple.object);
+        }
+        for predicate in self.foil_ledger.functional_predicates() {
             guard.mark_functional(predicate);
         }
         for (entity, etype) in self.generator.typed_entities() {

@@ -1503,6 +1503,7 @@ impl SymbolicReasoner {
         snapshot.ontology = self.discourse.ontology_capsule();
         snapshot.completion = (!self.completion.is_empty()).then(|| self.completion.clone());
         snapshot.predictive = (!self.predictive.is_empty()).then(|| self.predictive.clone());
+        snapshot.foil = self.foil_ledger.has_decisions().then(|| self.foil_ledger.clone());
         snapshot.assumptions = self
             .assumption_world
             .iter()

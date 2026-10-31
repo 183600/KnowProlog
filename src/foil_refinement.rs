@@ -1290,6 +1290,18 @@ impl FoilLedger {
         self.functional.contains(predicate.trim())
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.refuted.is_empty()
+            && self.functional.is_empty()
+            && self.asserted.is_empty()
+            && self.guards.is_empty()
+    }
+
+    /// 是否含有会影响预测的会话决定（否认/功能谓词/守卫）。
+    pub fn has_decisions(&self) -> bool {
+        !self.refuted.is_empty() || !self.functional.is_empty() || !self.guards.is_empty()
+    }
+
     pub fn refutations(&self) -> impl Iterator<Item = &Triple> {
         self.refuted.iter()
     }

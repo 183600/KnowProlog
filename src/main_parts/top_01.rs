@@ -440,7 +440,8 @@ enum Commands {
         #[arg(long, requires = "session")]
         adopt: bool,
         /// Session ledger JSON to load and save (state only; the knowledge
-        /// store is never opened or written)
+        /// store is never opened or written). Interactive dialogue also loads
+        /// `<store>/foil_ledger.json` when present.
         #[arg(long)]
         session: Option<String>,
         /// Minimum rule support
