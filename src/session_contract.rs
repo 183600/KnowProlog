@@ -254,18 +254,19 @@ pub fn run_file(path: impl AsRef<Path>) -> Result<SessionReport, String> {
 
 /// 运行契约：用契约自带的事实构建确定性知识源。
 pub fn run_contract(contract: &SessionContract) -> SessionReport {
-    let knowledge = ScenarioKnowledge::new(contract.entities.clone(), contract.relations.clone());
-    if !contract.aliases.is_empty() {
-        knowledge.inject(&[], &[], &contract.aliases);
-        knowledge.set_revision(1);
-    }
-    run_with(contract, &knowledge, |turn| {
-        if knowledge.inject(&turn.add_entities, &turn.add_relations, &turn.add_aliases) {
-            // 增量已推进版本；显式修订号在下面覆盖。
+    finish(contract, || {
+        let knowledge =
+            ScenarioKnowledge::new(contract.entities.clone(), contract.relations.clone());
+        if !contract.aliases.is_empty() {
+            knowledge.inject(&[], &[], &contract.aliases);
+            knowledge.set_revision(1);
         }
-        if let Some(revision) = turn.set_revision {
-            knowledge.set_revision(revision);
-        }
+        replay(contract, &knowledge, |turn| {
+            knowledge.inject(&turn.add_entities, &turn.add_relations, &turn.add_aliases);
+            if let Some(revision) = turn.set_revision {
+                knowledge.set_revision(revision);
+            }
+        })
     })
 }
 
@@ -274,20 +275,16 @@ pub fn run_contract_against(
     contract: &SessionContract,
     knowledge: &dyn DialogueKnowledge,
 ) -> SessionReport {
-    run_with(contract, knowledge, |_| {})
+    finish(contract, || replay(contract, knowledge, |_| {}))
 }
 
-fn run_with<F>(
-    contract: &SessionContract,
-    knowledge: &dyn DialogueKnowledge,
-    mut before_turn: F,
-) -> SessionReport
+fn finish<F>(contract: &SessionContract, mut play: F) -> SessionReport
 where
-    F: FnMut(&ContractTurn),
+    F: FnMut() -> (Vec<SessionStep>, String),
 {
-    let (steps, digest) = replay(contract, knowledge, &mut before_turn);
+    let (steps, digest) = play();
     let stable = if contract.require_stable {
-        let (_, again) = replay(contract, knowledge, &mut before_turn);
+        let (_, again) = play();
         again == digest
     } else {
         true
@@ -317,14 +314,11 @@ where
     }
 }
 
-fn replay<F>(
+fn replay(
     contract: &SessionContract,
     knowledge: &dyn DialogueKnowledge,
-    before_turn: &mut F,
-) -> (Vec<SessionStep>, String)
-where
-    F: FnMut(&ContractTurn),
-{
+    mut before_turn: impl FnMut(&ContractTurn),
+) -> (Vec<SessionStep>, String) {
     let mut manager = DialogueManager::new();
     let mut steps = Vec::with_capacity(contract.turns.len());
     for (index, turn) in contract.turns.iter().enumerate() {
@@ -800,6 +794,27 @@ expect = { answered = false, reply_kind = "unhandled", gaps_contains = ["unhandl
 "#;
         let report = run_contract(&contract(source));
         assert!(report.passed, "{}", report.render_text());
+    }
+
+    #[test]
+    fn mid_session_increments_replay_from_fresh_state() {
+        let source = r#"
+name = "增量稳定"
+[[entities]]
+name = "姚明"
+type = "Person"
+attributes = { "身高" = "226" }
+[[turns]]
+input = "列出所有人的身高"
+expect = { answered = true, plan_contains = ["board:scan"], answer_excludes = ["王治郅"] }
+[[turns]]
+add_entities = [{ name = "王治郅", type = "Person", attributes = { "身高" = "214" } }]
+input = "列出所有人的身高"
+expect = { answered = true, plan_contains = ["board:scan"], answer_contains = ["王治郅"] }
+"#;
+        let report = run_contract(&contract(source));
+        assert!(report.passed, "{}", report.render_text());
+        assert!(report.stable, "增量契约必须每轮回放都从初始事实开始");
     }
 
     #[test]
