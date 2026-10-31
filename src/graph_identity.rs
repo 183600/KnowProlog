@@ -114,6 +114,7 @@ impl AlignmentStatus {
 #[serde(rename_all = "snake_case")]
 pub enum AlignmentBlocker {
     TypeConflict,
+    NameCollision,
     MissingTypes,
     InsufficientRounds,
     HubTruncated,
@@ -127,6 +128,7 @@ impl AlignmentBlocker {
     pub fn label_zh(self) -> &'static str {
         match self {
             AlignmentBlocker::TypeConflict => "类型互斥",
+            AlignmentBlocker::NameCollision => "规范名在别名命名空间中已被占用",
             AlignmentBlocker::MissingTypes => "缺少类型",
             AlignmentBlocker::InsufficientRounds => "结构轮数不足",
             AlignmentBlocker::HubTruncated => "枢纽邻居被截断",
@@ -140,7 +142,9 @@ impl AlignmentBlocker {
     fn is_hard(self) -> bool {
         matches!(
             self,
-            AlignmentBlocker::TypeConflict | AlignmentBlocker::InsufficientRounds
+            AlignmentBlocker::TypeConflict
+                | AlignmentBlocker::NameCollision
+                | AlignmentBlocker::InsufficientRounds
         )
     }
 }
@@ -242,6 +246,8 @@ pub struct AlignmentPlan {
     pub oversized_buckets: usize,
     #[serde(default)]
     scope_order: Vec<String>,
+    #[serde(default)]
+    known_nodes: BTreeSet<(String, String)>,
 }
 
 impl AlignmentPlan {
@@ -315,14 +321,33 @@ impl AlignmentPlan {
                     .then_with(|| left.0.cmp(&right.0))
             });
             let canonical = component
-                .first()
-                .map(|(_, surface)| surface.clone())
-                .unwrap_or_default();
+                .iter()
+                .find(|candidate| self.component_can_use(candidate, &component))
+                .map(|(_, surface)| surface.clone());
+            let Some(canonical) = canonical else {
+                continue;
+            };
             for key in component {
                 mapping.insert(key, canonical.clone());
             }
         }
         mapping
+    }
+
+    /// 规范名在等价类成员的某个命名空间中若已被另一个节点占用，整个等价类
+    /// 不投影：宁可保留两个词面，也不把无关实体吸并到规范名上。
+    fn component_can_use(&self, canonical: &(String, String), component: &[(String, String)]) -> bool {
+        component.iter().all(|(scope, _)| {
+            *scope == canonical.0
+                || !self
+                    .known_nodes
+                    .contains(&(scope.clone(), canonical.1.clone()))
+                || component
+                    .iter()
+                    .any(|(member_scope, member_surface)| {
+                        member_scope == scope && member_surface == &canonical.1
+                    })
+        })
     }
 
     /// 把断言中的实体词面投影到规范词面；字面量宾语保持原样。
@@ -590,6 +615,10 @@ pub fn align_assertions(
         .enumerate()
         .map(|(index, scope)| (scope.clone(), index))
         .collect::<BTreeMap<_, _>>();
+    let known_nodes: BTreeSet<(String, String)> = nodes
+        .keys()
+        .map(|key| (key.scope.clone(), key.surface.clone()))
+        .collect();
 
     let mut buckets: BTreeMap<String, Vec<NodeKey>> = BTreeMap::new();
     for (key, fingerprint) in &fingerprints {
@@ -706,7 +735,16 @@ pub fn align_assertions(
         let source_fingerprint = &fingerprints[&source];
         let target_fingerprint = &fingerprints[&target];
 
+        let (canonical, alias) = canonical_pair(&source, &target, &scope_rank);
+        let alias_scope = if canonical == source.surface {
+            &target.scope
+        } else {
+            &source.scope
+        };
         let mut blockers = Vec::new();
+        if known_nodes.contains(&(alias_scope.clone(), canonical.clone())) {
+            blockers.push(AlignmentBlocker::NameCollision);
+        }
         let types_equal = !source_build.types.is_empty()
             && source_build.types == target_build.types;
         if !types_equal {
@@ -749,7 +787,6 @@ pub fn align_assertions(
             AlignmentStatus::Proposed
         };
 
-        let (canonical, alias) = canonical_pair(&source, &target, &scope_rank);
         certificates.push(AlignmentCertificate {
             from_scope: source.scope.clone(),
             from: source.surface.clone(),
@@ -806,6 +843,7 @@ pub fn align_assertions(
         rejected,
         oversized_buckets,
         scope_order,
+        known_nodes,
     }
 }
 
@@ -1125,6 +1163,31 @@ mod tests {
         assert!(certificate
             .blockers
             .contains(&AlignmentBlocker::AmbiguousMargin));
+    }
+
+    #[test]
+    fn canonical_name_collision_blocks_projection() {
+        let namespaces = store();
+        let assertions = vec![
+            assertion("alice", "X", "type", "Company", ObjectKind::Entity),
+            assertion("alice", "X", "创始人", "P", ObjectKind::Entity),
+            assertion("alice", "P", "type", "Person", ObjectKind::Entity),
+            assertion("bob", "Y", "type", "Company", ObjectKind::Entity),
+            assertion("bob", "Y", "创始人", "Q", ObjectKind::Entity),
+            assertion("bob", "Q", "type", "Person", ObjectKind::Entity),
+            assertion("bob", "X", "type", "Company", ObjectKind::Entity),
+        ];
+        let plan = align_assertions(&namespaces, &assertions, &AlignmentOptions::default());
+        let certificate = plan
+            .certificates
+            .iter()
+            .find(|certificate| certificate.from == "X" && certificate.to == "Y")
+            .expect("公司对应出现证书");
+        assert_eq!(certificate.status, AlignmentStatus::Rejected);
+        assert!(certificate
+            .blockers
+            .contains(&AlignmentBlocker::NameCollision));
+        assert!(!plan.aliases().contains(&("Y".to_string(), "X".to_string())));
     }
 
     #[test]
