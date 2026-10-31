@@ -992,6 +992,39 @@ fn persist_pattern_evolution(ledger: &EvolutionLedger, path: &str) {
 /// 返回 `Ok(receipt)` 时由调用方决定是否保留候选；返回 `Err` 表示台账本身
 /// 无法记录。无论结果如何，调用方在 `!receipt.verdict.may_commit()` 时应恢复
 /// 重载前的模式库，避免悬空 `query_type` 静默进入路由。
+/// 把一次模式库变更作为提案过闸门：先钉住变更前基线，再回放候选。
+///
+/// 通过时同步模式图；拒绝时只留回执，调用方负责把 `before` 恢复回
+/// `pattern_library`。演化图无论结果都会落图，便于事后复核。
+async fn commit_pattern_change(
+    manager: &OxigraphManager,
+    ledger: &mut EvolutionLedger,
+    before: &PatternLibrary,
+    after: &PatternLibrary,
+    episodes: &[know_prolog::pattern_ir::PatternEpisode],
+    config: &SystemConfig,
+    clock: EvolutionClock,
+    evolution_path: &str,
+    note: &str,
+) -> Result<know_prolog::pattern_evolution::EvolutionReceipt, String> {
+    ledger.ensure_baseline(before, clock, format!("{}前基线", note));
+    let result = ledger
+        .snapshot_library(after, episodes, config, clock, note)
+        .map_err(|error| error.to_string());
+    persist_pattern_evolution(ledger, evolution_path);
+    if let Err(error) = manager.sync_pattern_evolution(ledger).await {
+        eprintln!("演化台账落图失败：{}", error);
+    }
+    if let Ok(receipt) = &result {
+        if receipt.verdict.may_commit() {
+            if let Err(error) = manager.sync_pattern_ledger(after.entries()).await {
+                eprintln!("模式落图失败：{}", error);
+            }
+        }
+    }
+    result
+}
+
 fn gate_config_change(
     ledger: &mut EvolutionLedger,
     before: &PatternLibrary,
@@ -1002,7 +1035,7 @@ fn gate_config_change(
     path: &str,
     label: &str,
 ) -> Result<know_prolog::pattern_evolution::EvolutionReceipt, String> {
-    ledger.record_baseline(before, clock, format!("{}前基线", label));
+    ledger.ensure_baseline(before, clock, format!("{}前基线", label));
     let result = ledger
         .snapshot_library(after, episodes, config, clock, label)
         .map_err(|error| error.to_string());

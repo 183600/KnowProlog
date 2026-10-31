@@ -394,32 +394,66 @@
                     &pattern_episodes,
                     &context,
                 ) {
-                    Some(suggestion) => match pattern_library.accept_case(&suggestion) {
-                        Ok(entry) => {
-                            println!(
-                                "已确认案例：{}（来源 {}，路由 {}，优先级 {}）。",
-                                entry.name,
-                                entry.source,
-                                entry.query_type,
-                                entry.priority
-                            );
-                            println!("候选模式：{}", entry.render());
-                            match oxigraph_manager
-                                .sync_pattern_ledger(pattern_library.entries())
+                    Some(suggestion) => {
+                        let before = pattern_library.clone();
+                        match pattern_library.accept_case(&suggestion) {
+                            Ok(entry) => {
+                                let note = format!("案例确认：{}", entry.name);
+                                let clock = EvolutionClock::new(
+                                    0,
+                                    kb_revision,
+                                    pattern_evolution
+                                        .current()
+                                        .map(|generation| generation.generation)
+                                        .unwrap_or(0),
+                                    pattern_episodes.revision(),
+                                );
+                                match commit_pattern_change(
+                                    &oxigraph_manager,
+                                    &mut pattern_evolution,
+                                    &before,
+                                    &pattern_library,
+                                    pattern_episodes.entries(),
+                                    &language_config,
+                                    clock,
+                                    &evolution_path,
+                                    &note,
+                                )
                                 .await
-                            {
-                                Ok(count) => {
-                                    println!(
-                                        "模式落图：{} 条已同步到 {}。",
-                                        count,
-                                        pattern_ir::PATTERNS_GRAPH
-                                    )
+                                {
+                                    Ok(receipt) if receipt.verdict.may_commit() => {
+                                        println!(
+                                            "已确认案例：{}（来源 {}，路由 {}，优先级 {}）。",
+                                            entry.name,
+                                            entry.source,
+                                            entry.query_type,
+                                            entry.priority
+                                        );
+                                        println!("候选模式：{}", entry.render());
+                                        println!(
+                                            "演化闸门：{}（回放 {} 例，回归 {}）。",
+                                            receipt.verdict.label(),
+                                            receipt.replay.cases,
+                                            receipt.replay.regressions
+                                        );
+                                    }
+                                    Ok(receipt) => {
+                                        pattern_library = before;
+                                        println!(
+                                            "确认联想被演化闸门拦截（{}），已恢复原模式库：",
+                                            receipt.verdict.label()
+                                        );
+                                        println!("{}", receipt.render());
+                                    }
+                                    Err(error) => {
+                                        pattern_library = before;
+                                        println!("确认联想未提交：{}", error);
+                                    }
                                 }
-                                Err(error) => println!("确认后落图失败：{}", error),
                             }
+                            Err(error) => println!("确认联想失败：{}", error),
                         }
-                        Err(error) => println!("确认联想失败：{}", error),
-                    },
+                    }
                     None => println!(
                         "确认联想：没有足够相似的成功经验；请先用「模式联想：<句子>」确认候选，或使用「教模式」显式教学。"
                     ),
@@ -972,26 +1006,64 @@
                     },
                     None => None,
                 };
+                let before = pattern_library.clone();
                 match pattern_library.teach_with_guard(name, pattern, route, priority, guard) {
                     Ok(entry) => {
-                        println!(
-                            "已教模式「{}」→ {}（优先级 {}，IR {}{}）",
-                            entry.name,
-                            entry.query_type,
-                            entry.priority,
-                            entry.render(),
-                            entry
-                                .guard
-                                .as_ref()
-                                .map(|guard| format!("，守卫：{}", guard.render()))
-                                .unwrap_or_default()
+                        let note = format!("教学：{}", entry.name);
+                        let clock = EvolutionClock::new(
+                            0,
+                            kb_revision,
+                            pattern_evolution
+                                .current()
+                                .map(|generation| generation.generation)
+                                .unwrap_or(0),
+                            pattern_episodes.revision(),
                         );
-                        match oxigraph_manager
-                            .sync_pattern_ledger(pattern_library.entries())
-                            .await
+                        match commit_pattern_change(
+                            &oxigraph_manager,
+                            &mut pattern_evolution,
+                            &before,
+                            &pattern_library,
+                            pattern_episodes.entries(),
+                            &language_config,
+                            clock,
+                            &evolution_path,
+                            &note,
+                        )
+                        .await
                         {
-                            Ok(count) => println!("模式落图：{} 条已同步。", count),
-                            Err(error) => eprintln!("模式落图失败：{}", error),
+                            Ok(receipt) if receipt.verdict.may_commit() => {
+                                println!(
+                                    "已教模式「{}」→ {}（优先级 {}，IR {}{}）",
+                                    entry.name,
+                                    entry.query_type,
+                                    entry.priority,
+                                    entry.render(),
+                                    entry
+                                        .guard
+                                        .as_ref()
+                                        .map(|guard| format!("，守卫：{}", guard.render()))
+                                        .unwrap_or_default()
+                                );
+                                println!(
+                                    "演化闸门：{}（回放 {} 例，回归 {}）。",
+                                    receipt.verdict.label(),
+                                    receipt.replay.cases,
+                                    receipt.replay.regressions
+                                );
+                            }
+                            Ok(receipt) => {
+                                pattern_library = before;
+                                println!(
+                                    "教学模式被演化闸门拦截（{}），已恢复原模式库：",
+                                    receipt.verdict.label()
+                                );
+                                println!("{}", receipt.render());
+                            }
+                            Err(error) => {
+                                pattern_library = before;
+                                println!("教学模式未提交：{}", error);
+                            }
                         }
                     }
                     Err(error) => println!("教学模式失败：{}", error),
@@ -1010,19 +1082,57 @@
             if name.is_empty() {
                 println!("用法：忘模式：<名 或 id 前缀>");
             } else {
+                let before = pattern_library.clone();
                 match pattern_library.forget(name) {
                     Some(entry) => {
-                        println!(
-                            "已遗忘教学模式「{}」（IR {}）。",
-                            entry.name,
-                            entry.render()
+                        let note = format!("遗忘：{}", entry.name);
+                        let clock = EvolutionClock::new(
+                            0,
+                            kb_revision,
+                            pattern_evolution
+                                .current()
+                                .map(|generation| generation.generation)
+                                .unwrap_or(0),
+                            pattern_episodes.revision(),
                         );
-                        match oxigraph_manager
-                            .sync_pattern_ledger(pattern_library.entries())
-                            .await
+                        match commit_pattern_change(
+                            &oxigraph_manager,
+                            &mut pattern_evolution,
+                            &before,
+                            &pattern_library,
+                            pattern_episodes.entries(),
+                            &language_config,
+                            clock,
+                            &evolution_path,
+                            &note,
+                        )
+                        .await
                         {
-                            Ok(count) => println!("模式落图：{} 条已同步。", count),
-                            Err(error) => eprintln!("模式落图失败：{}", error),
+                            Ok(receipt) if receipt.verdict.may_commit() => {
+                                println!(
+                                    "已遗忘教学模式「{}」（IR {}）。",
+                                    entry.name,
+                                    entry.render()
+                                );
+                                println!(
+                                    "演化闸门：{}（回放 {} 例，回归 {}）。",
+                                    receipt.verdict.label(),
+                                    receipt.replay.cases,
+                                    receipt.replay.regressions
+                                );
+                            }
+                            Ok(receipt) => {
+                                pattern_library = before;
+                                println!(
+                                    "遗忘模式被演化闸门拦截（{}），已恢复原模式库：",
+                                    receipt.verdict.label()
+                                );
+                                println!("{}", receipt.render());
+                            }
+                            Err(error) => {
+                                pattern_library = before;
+                                println!("遗忘模式未提交：{}", error);
+                            }
                         }
                     }
                     None => println!("没有找到可遗忘的教学模式「{}」（只删教学来源）。", name),

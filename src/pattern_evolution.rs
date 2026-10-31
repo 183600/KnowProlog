@@ -1477,6 +1477,25 @@ impl EvolutionLedger {
         Ok(receipt)
     }
 
+    /// 若模式库相对当前代已漂移，先钉住一代基线；否则复用当前代。
+    ///
+    /// 外部事务（教学、配置重载）在改变模式库前调用，保证随后的
+    /// [`Self::snapshot_library`] 只比较本次变更，而不是历史漂移。
+    pub fn ensure_baseline(
+        &mut self,
+        library: &PatternLibrary,
+        clock: EvolutionClock,
+        note: impl Into<String>,
+    ) -> PatternGeneration {
+        let fingerprint = pattern_ir::library_fingerprint(library.entries());
+        if let Some(current) = self.current() {
+            if current.fingerprint == fingerprint {
+                return current.clone();
+            }
+        }
+        self.record_baseline(library, clock, note)
+    }
+
     /// 无条件记录一代「已观察状态」，用于外部事务开始前的基线。
     ///
     /// 这不是提案：它不声称改进，也不做回放；调用方应在随后用
@@ -2019,6 +2038,25 @@ mod tests {
         assert_eq!(rolled.entries, base.entries);
         assert_eq!(ledger.receipts.len(), 1);
         assert_eq!(ledger.receipts[0].kind, ProposalKind::Rollback);
+    }
+
+    #[test]
+    fn ensure_baseline_reuses_current_and_pins_drift() {
+        let base = base_generation();
+        let mut ledger = EvolutionLedger::default();
+        ledger.ensure_initial(&base.library(), base.clock, "初始");
+        let reused =
+            ledger.ensure_baseline(&base.library(), EvolutionClock::new(2, 2, 0, 3), "同库");
+        assert_eq!(reused.generation, 0);
+        let mut drifted = base.library();
+        drifted.add(entry("漂移", "taught#drift", "age_query", 5, &["几岁"]));
+        let pinned = ledger.ensure_baseline(&drifted, EvolutionClock::new(2, 2, 0, 3), "漂移");
+        assert_eq!(pinned.generation, 1);
+        assert_eq!(
+            pinned.fingerprint,
+            pattern_ir::library_fingerprint(drifted.entries())
+        );
+        assert_eq!(ledger.current().unwrap().generation, 1);
     }
 
     #[test]
