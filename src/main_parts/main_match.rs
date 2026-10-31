@@ -2078,6 +2078,9 @@
         Some(Commands::Session { .. }) => {
             // 已在打开存储前处理；此处仅保持 match 穷尽。
         }
+        Some(Commands::Claims { .. }) => {
+            // 已在打开存储前处理；此处仅保持 match 穷尽。
+        }
         Some(Commands::Interactive) | None => {
             // 运行交互模式
             run_interactive_mode(

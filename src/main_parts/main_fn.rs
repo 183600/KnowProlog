@@ -144,6 +144,39 @@ async fn main() {
         return;
     }
 
+    // claim 生命周期同样离线：只读写显式账本，不打开知识存储。
+    if let Some(Commands::Claims {
+        ledger,
+        plan,
+        reply,
+        turn,
+        revision,
+        retire_fact,
+        retire_kind,
+        reason,
+        impact_fact,
+        expected_emissions,
+        strict,
+        json,
+    }) = &cli.command
+    {
+        run_claim_ledger(
+            ledger,
+            plan.as_deref(),
+            *reply,
+            *turn,
+            *revision,
+            retire_fact,
+            retire_kind,
+            reason,
+            impact_fact,
+            *expected_emissions,
+            *strict,
+            *json,
+        );
+        return;
+    }
+
     // 开放闭包只操作会话账本，不打开知识存储，也不写律典。
     if let Some(Commands::OpenClosure {
         text,
@@ -655,5 +688,4 @@ async fn main() {
     // 处理命令行参数
 
     include!("main_match.rs");
-
 }

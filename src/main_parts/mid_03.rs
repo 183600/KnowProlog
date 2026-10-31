@@ -992,6 +992,203 @@ fn run_session_contracts(
     }
 }
 
+fn parse_claim_fact(raw: &str) -> Option<know_prolog::claim_lifecycle::FactKey> {
+    let parts: Vec<&str> = raw
+        .split(['|', '｜'])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let session = parts
+        .get(3)
+        .map(|flag| {
+            matches!(
+                flag.to_ascii_lowercase().as_str(),
+                "session" | "true" | "会话"
+            )
+        })
+        .unwrap_or(false);
+    Some(know_prolog::claim_lifecycle::FactKey::new(
+        parts[0], parts[1], parts[2], session,
+    ))
+}
+
+/// `claims`：离线管理 claim 生命周期账本。
+///
+/// 支持从 AnswerPlan JSON 登记并过闸提交、退役事实并查看影响面、以及输出
+/// 确定性审计。账本路径显式指定；不打开知识存储，也不依赖配置。
+fn run_claim_ledger(
+    ledger_path: &str,
+    plan_path: Option<&str>,
+    reply: u64,
+    turn: u64,
+    revision: u64,
+    retire_facts: &[String],
+    retire_kind: &str,
+    reason: &str,
+    impact_facts: &[String],
+    expected_emissions: Option<usize>,
+    strict: bool,
+    json: bool,
+) {
+    use know_prolog::claim_lifecycle::{
+        AuditOptions, AuditVerdict, ClaimLedger, GateContext, RetirementKind,
+    };
+
+    let retirement = match retire_kind.trim().to_ascii_lowercase().as_str() {
+        "retracted" | "撤回" => RetirementKind::Retracted,
+        "expired" | "过期" => RetirementKind::Expired,
+        "redacted" | "forgotten" | "遗忘" => RetirementKind::Redacted,
+        "superseded" | "取代" => {
+            eprintln!("事实退役不支持 superseded；请用 claim 级取代");
+            std::process::exit(2);
+        }
+        other => {
+            eprintln!("未知的退役种类：{}", other);
+            std::process::exit(2);
+        }
+    };
+
+    let path = std::path::Path::new(ledger_path);
+    let mut ledger = if path.exists() {
+        match ClaimLedger::load(path) {
+            Ok(ledger) => ledger,
+            Err(error) => {
+                eprintln!("读取 claim 账本失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        ClaimLedger::new()
+    };
+    let mut dirty = false;
+    let mut emission = None;
+
+    if let Some(plan_path) = plan_path {
+        let text = if plan_path == "-" {
+            use std::io::Read as _;
+            let mut text = String::new();
+            if let Err(error) = std::io::stdin().read_to_string(&mut text) {
+                eprintln!("读取计划失败：{}", error);
+                std::process::exit(1);
+            }
+            text
+        } else {
+            match std::fs::read_to_string(plan_path) {
+                Ok(text) => text,
+                Err(error) => {
+                    eprintln!("读取计划失败：{}", error);
+                    std::process::exit(1);
+                }
+            }
+        };
+        let plan: know_prolog::answer_plan::AnswerPlan = match serde_json::from_str(&text) {
+            Ok(plan) => plan,
+            Err(error) => {
+                eprintln!("解析 AnswerPlan 失败：{}", error);
+                std::process::exit(1);
+            }
+        };
+        emission = Some(ledger.emit_plan(&plan, reply, turn, revision, &GateContext::default()));
+        dirty = true;
+    }
+
+    let mut impacts = Vec::new();
+    for raw in retire_facts {
+        let Some(fact) = parse_claim_fact(raw) else {
+            eprintln!("事实格式应为 SUBJECT|PREDICATE|OBJECT[|SESSION]：{}", raw);
+            std::process::exit(2);
+        };
+        match ledger.retire_fact(&fact, retirement, reason, turn, revision) {
+            Ok(impact) => impacts.push(impact),
+            Err(error) => {
+                eprintln!("退役事实失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+        dirty = true;
+    }
+
+    let mut inspected = Vec::new();
+    for raw in impact_facts {
+        let Some(fact) = parse_claim_fact(raw) else {
+            eprintln!("事实格式应为 SUBJECT|PREDICATE|OBJECT[|SESSION]：{}", raw);
+            std::process::exit(2);
+        };
+        inspected.push(ledger.impact_of_fact(&fact));
+    }
+
+    if dirty {
+        if let Err(error) = ledger.save(path) {
+            eprintln!("写入 claim 账本失败：{}", error);
+            std::process::exit(1);
+        }
+    }
+    let audit = ledger.audit(expected_emissions, &AuditOptions::default());
+
+    if json {
+        let mut object = serde_json::Map::new();
+        object.insert(
+            "ledger".to_string(),
+            serde_json::json!({
+                "path": ledger_path,
+                "claims": ledger.len(),
+                "events": ledger.events.len(),
+            }),
+        );
+        if let Some(emission) = &emission {
+            object.insert(
+                "emission".to_string(),
+                serde_json::to_value(emission).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        if !impacts.is_empty() {
+            object.insert(
+                "impacts".to_string(),
+                serde_json::to_value(&impacts).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        if !inspected.is_empty() {
+            object.insert(
+                "inspected".to_string(),
+                serde_json::to_value(&inspected).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        object.insert(
+            "audit".to_string(),
+            serde_json::to_value(&audit).unwrap_or(serde_json::Value::Null),
+        );
+        match serde_json::to_string_pretty(&serde_json::Value::Object(object)) {
+            Ok(text) => println!("{}", text),
+            Err(error) => {
+                eprintln!("claim 结果序列化失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        if let Some(emission) = &emission {
+            println!("{}", emission.render_zh());
+        }
+        for impact in &impacts {
+            println!("{}", impact.render_zh());
+        }
+        for impact in &inspected {
+            println!("{}", impact.render_zh());
+        }
+        println!("{}", audit.render_zh());
+    }
+
+    let emission_incomplete = emission
+        .as_ref()
+        .map(|emission| !emission.complete())
+        .unwrap_or(false);
+    if strict && (audit.verdict != AuditVerdict::Clean || emission_incomplete) {
+        std::process::exit(1);
+    }
+}
+
 /// `scenario`：离线回放查询板剧本；任一步失败以非零码退出（可直接进 CI）。
 fn run_query_scenario(file: &str, json: bool) {
     let report = match know_prolog::query_scenario::run_file(file) {
@@ -1038,7 +1235,10 @@ fn run_taxonomy(json: bool) {
             println!("覆盖：全部受支持 query_type 都有唯一回答图式。");
         } else {
             for issue in &issues {
-                println!("{} [{}] {}：{}", "ERROR", issue.code, issue.query_type, issue.detail);
+                println!(
+                    "{} [{}] {}：{}",
+                    "ERROR", issue.code, issue.query_type, issue.detail
+                );
             }
         }
     }
@@ -1665,9 +1865,7 @@ async fn build_store_reasoner(
         PerfLedger::shared(),
     );
     reasoner.set_nlp_config(config.nlp.clone());
-    if let Some(ledger) =
-        FoilLedger::load_from_path(&format!("{}/foil_ledger.json", store_path))
-    {
+    if let Some(ledger) = FoilLedger::load_from_path(&format!("{}/foil_ledger.json", store_path)) {
         reasoner.set_foil_ledger(ledger);
     }
     if config.semantic_grammar.enabled {

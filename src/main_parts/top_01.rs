@@ -36,9 +36,7 @@ use know_prolog::{
     },
     dialogue_manager::{DialogueManager, MoveKind},
     dialogue_uri::{DialogueArtifactIndex, DialogueSession},
-    disclosure_fusion::{
-        self as disclosure_fusion, AnswerDisclosureConfig, ClaimAtom, FusedClaim,
-    },
+    disclosure_fusion::{self as disclosure_fusion, AnswerDisclosureConfig, ClaimAtom, FusedClaim},
     embedding_eval::{
         compare_baseline, entity_types_from_prolog_facts, evaluate, triples_from_prolog_facts,
         EvalBaseline, EvalConfig,
@@ -137,11 +135,11 @@ use know_prolog::{
     symbolic_generator::SymbolicGenerator,
     symbolic_reasoner::{FormalClarificationOutcome, LanguagePolicySync, SymbolicReasoner},
     synonym_graph::{SynonymContext, SynonymGraph, SynonymKind, SynonymResolution, SynonymSense},
-    variant_closure::{VariantClosure, VariantContext},
     teachable_assertion::{TarResponse, TeachableAssertionReader},
     temporal::{self, TemporalConstraint, TemporalIndex, UnknownTimePolicy, Validity},
     trace_graph::{ReferentTrail, TraceMode},
     type_system::TypeSystem,
+    variant_closure::{VariantClosure, VariantContext},
     view_render::{
         render_coverage_report, render_proof_ascii, render_proof_mermaid, render_timeline_flow,
         render_timeline_markdown, CoverageInput, KnowledgeSubgraph, TimelineTurn,
@@ -1714,6 +1712,47 @@ enum Commands {
         /// With --baseline, write the current reports after all contracts pass
         #[arg(long, requires = "baseline")]
         update_baseline: bool,
+    },
+    /// Manage the claim lifecycle ledger: emit an answer plan through the
+    /// pre-emission gate, retire facts, inspect impact, and audit. Offline;
+    /// does not open the knowledge store
+    Claims {
+        /// Claim ledger JSON path (created when missing)
+        #[arg(long, default_value = "claim_ledger.json")]
+        ledger: String,
+        /// AnswerPlan JSON file to register and emit; "-" reads from stdin
+        #[arg(long)]
+        plan: Option<String>,
+        /// Reply sequence attached to plan emissions
+        #[arg(long, default_value_t = 1)]
+        reply: u64,
+        /// Logical turn for lifecycle events
+        #[arg(long, default_value_t = 1)]
+        turn: u64,
+        /// Knowledge revision for lifecycle events
+        #[arg(long, default_value_t = 0)]
+        revision: u64,
+        /// Retire a fact as SUBJECT|PREDICATE|OBJECT|SESSION (repeatable)
+        #[arg(long = "retire-fact", value_name = "S|P|O")]
+        retire_fact: Vec<String>,
+        /// Retirement kind: retracted / expired / redacted
+        #[arg(long, default_value = "retracted")]
+        retire_kind: String,
+        /// Reason recorded in retirement events
+        #[arg(long, default_value = "手动退役")]
+        reason: String,
+        /// Show the impact of a fact as SUBJECT|PREDICATE|OBJECT (repeatable)
+        #[arg(long = "impact-fact", value_name = "S|P|O")]
+        impact_fact: Vec<String>,
+        /// Expected emitted claims for the audit; omit when auditing only
+        #[arg(long)]
+        expected_emissions: Option<usize>,
+        /// Exit non-zero unless the audit is clean and every plan claim passed
+        #[arg(long)]
+        strict: bool,
+        /// Print the result as JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Mine, review, export or import OWL axioms proposed from the graph
     #[command(disable_help_flag = true)]
