@@ -23,6 +23,14 @@ expect = { answered = true, intent = "ask_attribute", focus_before = "姚明", f
 input = "叶莉的国籍呢"
 expect = { answered = true, intent = "ask_attribute", focus_before = "姚明", focus = "叶莉", inherited = false, answer_contains = ["中国"] }
 
+[[aliases]]
+surface = "明哥"
+canonical = "姚明"
+
+[[turns]]
+input = "明哥的国籍呢"
+expect = { answered = true, intent = "ask_attribute", focus_before = "叶莉", focus = "姚明", inherited = false, answer_contains = ["中国"], grounded = true, quoted_contains = ["姚明", "国籍"] }
+
 [[turns]]
 input = "我们聊过什么？"
 expect = { answered = true, intent = "meta_recap", plan_contains = ["recap"], answer_contains = ["姚明"] }
