@@ -307,94 +307,15 @@ impl AlignmentPlan {
 
     /// 已接受证书的传递投影：`(命名空间, 词面) → 规范词面`。
     ///
-    /// 同一等价类选命名空间优先级最高（信任 → 优先级 → id）的词面作为规范名；
-    /// 完全同优先级时再按词面字典序破平，保证结果可复现。
+    /// 同一等价类优先沿用已确认的规范名；否则选命名空间优先级最高（信任 →
+    /// 优先级 → id）的词面。完全同优先级时按词面字典序破平，保证可复现。
     pub fn projection_map(&self) -> BTreeMap<(String, String), String> {
-        let mut adjacency: BTreeMap<(String, String), BTreeSet<(String, String)>> = BTreeMap::new();
-        for certificate in self.accepted() {
-            let left = (certificate.from_scope.clone(), certificate.from.clone());
-            let right = (certificate.to_scope.clone(), certificate.to.clone());
-            adjacency
-                .entry(left.clone())
-                .or_default()
-                .insert(right.clone());
-            adjacency.entry(right).or_default().insert(left);
-        }
-        let scope_rank: BTreeMap<&str, usize> = self
-            .scope_order
-            .iter()
-            .enumerate()
-            .map(|(index, scope)| (scope.as_str(), index))
-            .collect();
-        let mut mapping = BTreeMap::new();
-        let mut visited: BTreeSet<(String, String)> = BTreeSet::new();
-        for start in adjacency.keys() {
-            if visited.contains(start) {
-                continue;
-            }
-            let mut component = Vec::new();
-            let mut queue = vec![start.clone()];
-            visited.insert(start.clone());
-            while let Some(current) = queue.pop() {
-                component.push(current.clone());
-                if let Some(neighbors) = adjacency.get(&current) {
-                    for neighbor in neighbors {
-                        if visited.insert(neighbor.clone()) {
-                            queue.push(neighbor.clone());
-                        }
-                    }
-                }
-            }
-            component.sort_by(|left, right| {
-                scope_rank
-                    .get(left.0.as_str())
-                    .copied()
-                    .unwrap_or(usize::MAX)
-                    .cmp(
-                        &scope_rank
-                            .get(right.0.as_str())
-                            .copied()
-                            .unwrap_or(usize::MAX),
-                    )
-                    .then_with(|| left.1.cmp(&right.1))
-                    .then_with(|| left.0.cmp(&right.0))
-            });
-            let canonical = component
-                .iter()
-                .filter(|(_, surface)| self.preferred_canonicals.contains(surface))
-                .find(|candidate| self.component_can_use(candidate, &component))
-                .or_else(|| {
-                    component
-                        .iter()
-                        .find(|candidate| self.component_can_use(candidate, &component))
-                })
-                .map(|(_, surface)| surface.clone());
-            let Some(canonical) = canonical else {
-                continue;
-            };
-            for key in component {
-                mapping.insert(key, canonical.clone());
-            }
-        }
-        mapping
-    }
-
-    /// 规范名在等价类成员的某个命名空间中若已被另一个节点占用，整个等价类
-    /// 不投影：宁可保留两个词面，也不把无关实体吸并到规范名上。
-    fn component_can_use(
-        &self,
-        canonical: &(String, String),
-        component: &[(String, String)],
-    ) -> bool {
-        component.iter().all(|(scope, _)| {
-            *scope == canonical.0
-                || !self
-                    .known_nodes
-                    .contains(&(scope.clone(), canonical.1.clone()))
-                || component.iter().any(|(member_scope, member_surface)| {
-                    member_scope == scope && member_surface == &canonical.1
-                })
-        })
+        projection_map_for(
+            self.accepted(),
+            &self.scope_order,
+            &self.known_nodes,
+            &self.preferred_canonicals,
+        )
     }
 
     /// 把断言中的实体词面投影到规范词面；字面量宾语保持原样。
@@ -857,6 +778,32 @@ pub fn align_assertions(
             .then_with(|| left.to_scope.cmp(&right.to_scope))
             .then_with(|| left.to.cmp(&right.to))
     });
+    let projection = projection_map_for(
+        certificates
+            .iter()
+            .filter(|certificate| certificate.status == AlignmentStatus::Accepted),
+        &scope_order,
+        &known_nodes,
+        &preferred_canonicals,
+    );
+    for certificate in &mut certificates {
+        if certificate.status != AlignmentStatus::Accepted {
+            continue;
+        }
+        let Some(canonical) = projection
+            .get(&(certificate.from_scope.clone(), certificate.from.clone()))
+            .or_else(|| projection.get(&(certificate.to_scope.clone(), certificate.to.clone())))
+            .cloned()
+        else {
+            continue;
+        };
+        certificate.alias = if canonical == certificate.from {
+            certificate.to.clone()
+        } else {
+            certificate.from.clone()
+        };
+        certificate.canonical = canonical;
+    }
     let accepted = certificates
         .iter()
         .filter(|certificate| certificate.status == AlignmentStatus::Accepted)
@@ -1039,6 +986,100 @@ fn compare_candidates(
         .confidence_bps
         .cmp(&left.confidence_bps)
         .then_with(|| compare_nodes(&left.to, &right.to, scope_rank))
+}
+
+fn projection_map_for<'a, I>(
+    certificates: I,
+    scope_order: &[String],
+    known_nodes: &BTreeSet<(String, String)>,
+    preferred_canonicals: &BTreeSet<String>,
+) -> BTreeMap<(String, String), String>
+where
+    I: IntoIterator<Item = &'a AlignmentCertificate>,
+{
+    let mut adjacency: BTreeMap<(String, String), BTreeSet<(String, String)>> = BTreeMap::new();
+    for certificate in certificates {
+        if !certificate.is_accepted() {
+            continue;
+        }
+        let left = (certificate.from_scope.clone(), certificate.from.clone());
+        let right = (certificate.to_scope.clone(), certificate.to.clone());
+        adjacency
+            .entry(left.clone())
+            .or_default()
+            .insert(right.clone());
+        adjacency.entry(right).or_default().insert(left);
+    }
+    let scope_rank: BTreeMap<&str, usize> = scope_order
+        .iter()
+        .enumerate()
+        .map(|(index, scope)| (scope.as_str(), index))
+        .collect();
+    let mut mapping = BTreeMap::new();
+    let mut visited: BTreeSet<(String, String)> = BTreeSet::new();
+    for start in adjacency.keys() {
+        if visited.contains(start) {
+            continue;
+        }
+        let mut component = Vec::new();
+        let mut queue = vec![start.clone()];
+        visited.insert(start.clone());
+        while let Some(current) = queue.pop() {
+            component.push(current.clone());
+            if let Some(neighbors) = adjacency.get(&current) {
+                for neighbor in neighbors {
+                    if visited.insert(neighbor.clone()) {
+                        queue.push(neighbor.clone());
+                    }
+                }
+            }
+        }
+        component.sort_by(|left, right| {
+            scope_rank
+                .get(left.0.as_str())
+                .copied()
+                .unwrap_or(usize::MAX)
+                .cmp(
+                    &scope_rank
+                        .get(right.0.as_str())
+                        .copied()
+                        .unwrap_or(usize::MAX),
+                )
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        let canonical = component
+            .iter()
+            .filter(|(_, surface)| preferred_canonicals.contains(surface))
+            .find(|candidate| component_can_use(candidate, &component, known_nodes))
+            .or_else(|| {
+                component
+                    .iter()
+                    .find(|candidate| component_can_use(candidate, &component, known_nodes))
+            })
+            .map(|(_, surface)| surface.clone());
+        let Some(canonical) = canonical else {
+            continue;
+        };
+        for key in component {
+            mapping.insert(key, canonical.clone());
+        }
+    }
+    mapping
+}
+
+fn component_can_use(
+    canonical: &(String, String),
+    component: &[(String, String)],
+    known_nodes: &BTreeSet<(String, String)>,
+) -> bool {
+    component.iter().all(|(scope, _)| {
+        *scope == canonical.0
+            || !known_nodes.contains(&(scope.clone(), canonical.1.clone()))
+            || component.iter().any(|(member_scope, member_surface)| {
+                member_scope == scope && member_surface == &canonical.1
+            })
+    })
 }
 
 fn canonical_predicate(aliases: &BTreeMap<String, String>, predicate: &str) -> String {
@@ -1310,6 +1351,20 @@ mod tests {
                 .map(String::as_str),
             Some("Apple Inc.")
         );
+        let certificate = plan
+            .certificates
+            .iter()
+            .find(|certificate| {
+                certificate.status == AlignmentStatus::Accepted
+                    && (certificate.from.contains("苹果") || certificate.to.contains("苹果"))
+            })
+            .expect("公司证书已接受");
+        assert_eq!(certificate.canonical, "Apple Inc.");
+        assert_eq!(certificate.alias, "苹果公司");
+        assert!(plan
+            .identity_edges()
+            .iter()
+            .any(|edge| edge.from == "苹果公司" && edge.to == "Apple Inc."));
     }
 
     #[test]
