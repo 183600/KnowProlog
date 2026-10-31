@@ -7,6 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use crate::abduction::{clarification_batch_scope, classify_answer, AnswerKind};
+use crate::answer_plan::StyleDirective;
 use crate::binding_frames::FrameProgram;
 use crate::cache::RevisionLru;
 use crate::canonical::{self, DecodeError, DecodeReceipt};
@@ -299,6 +300,29 @@ impl SessionPolicy {
         }
     }
 }
+/// 解析生成式介绍命令；只接管显式前缀，避免把普通问句误当生成请求。
+fn parse_generation_request(input: &str) -> Option<&str> {
+    let input = input.trim();
+    for prefix in [
+        "生成介绍：",
+        "生成介绍:",
+        "介绍：",
+        "介绍:",
+        "介绍一下",
+        "生成介绍",
+    ] {
+        if let Some(rest) = input.strip_prefix(prefix) {
+            let entity = rest
+                .trim()
+                .trim_end_matches(['。', '？', '?', '！', '!', '；', ';']);
+            if !entity.is_empty() {
+                return Some(entity);
+            }
+        }
+    }
+    None
+}
+
 /// 截断到前 `limit` 个字符（按字符边界，尾部加省略号）。
 fn truncate_chars(text: &str, limit: usize) -> String {
     let mut out: String = text.chars().take(limit).collect();
@@ -796,6 +820,10 @@ impl Session {
         }
         self.history.push(raw_input.clone());
         self.manager.clear_last_recovery();
+        // 生成式介绍与回答计划风格指令使用原始措辞，先于澄清/悬问通道解析，
+        // 保证 HTTP 会话与 CLI 对同一句「预算：120字」给出同一份计划表达。
+        let style_command = StyleDirective::parse(&raw_input);
+        let generation_entity = parse_generation_request(&raw_input).map(str::to_string);
         // 上一轮确认/更正过的事实必须进入本轮推理前提（幂等，不写图谱）。
         let adopted = self.sync_recovery_confirmed_facts();
         // 补全回合与假设世界命令使用原始措辞，避免被插件改写；
@@ -821,6 +849,8 @@ impl Session {
         // 系统命令/补全命令不参与裸回答，避免劫持正常控制流；澄清短答
         // 已由上面的通道结算，不能再被悬问窗口二次消费。
         let pending_answer = if clarification_answer.is_none()
+            && style_command.is_none()
+            && generation_entity.is_none()
             && completion_command.is_none()
             && constructive_command.is_none()
             && assumption_command.is_none()
@@ -854,7 +884,9 @@ impl Session {
         let plugin_answer = self.plugin_recipe_answer(&raw_input, plugin_outcome.as_ref());
 
         control.enter(TurnPhase::Recall)?;
-        let dialogue = if completion_command.is_some()
+        let dialogue = if style_command.is_some()
+            || generation_entity.is_some()
+            || completion_command.is_some()
             || constructive_command.is_some()
             || assumption_command.is_some()
             || predictive_command.is_some()
@@ -868,7 +900,41 @@ impl Session {
 
         control.enter(TurnPhase::Reason)?;
         let (status, source, kind, plan, mut reply, derivation) =
-            if let Some(text) = completion_command {
+            if let Some(directive) = style_command {
+                self.reasoner.clear_pending_awaiting();
+                let text = self
+                    .reasoner
+                    .restyle_generation(directive)
+                    .unwrap_or_else(|| "生成功能未启用，无法按回答计划重述。".to_string());
+                (
+                    "answered".to_string(),
+                    "generation_plan".to_string(),
+                    Some("style_directive".to_string()),
+                    vec![format!("style:{}", directive.tag())],
+                    text,
+                    None,
+                )
+            } else if let Some(entity) = generation_entity.as_deref() {
+                self.reasoner.clear_pending_awaiting();
+                match self.reasoner.generate_about(entity) {
+                    Some(text) => (
+                        "answered".to_string(),
+                        "generation".to_string(),
+                        Some("generate_about".to_string()),
+                        vec!["generation_plan".to_string()],
+                        text,
+                        None,
+                    ),
+                    None => (
+                        "deferred".to_string(),
+                        "generation".to_string(),
+                        Some("generate_about".to_string()),
+                        vec!["generation_miss".to_string()],
+                        format!("知识图谱中没有关于「{}」的可生成事实。", entity),
+                        None,
+                    ),
+                }
+            } else if let Some(text) = completion_command {
                 (
                     "answered".to_string(),
                     "completion".to_string(),

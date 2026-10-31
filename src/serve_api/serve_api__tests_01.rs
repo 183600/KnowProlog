@@ -420,6 +420,46 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
     }
 
     #[tokio::test]
+    async fn generation_and_budget_directives_work_over_http_sessions() {
+        let state = test_state(1);
+        let session_id = state.create_session().await.expect("会话应创建成功");
+
+        let generated = state
+            .take_turn(&session_id, "介绍：姚明")
+            .await
+            .expect("生成轮应成功");
+        assert_eq!(generated.status, "answered", "{}", generated.reply);
+        assert_eq!(generated.source, "generation", "{}", generated.reply);
+        assert!(generated.reply.contains("姚明"), "{}", generated.reply);
+
+        let brief = state
+            .take_turn(&session_id, "简短点")
+            .await
+            .expect("风格轮应成功");
+        assert_eq!(brief.source, "generation_plan", "{}", brief.reply);
+        assert!(brief.reply.contains("简短版"), "{}", brief.reply);
+
+        let budgeted = state
+            .take_turn(&session_id, "预算：80字")
+            .await
+            .expect("预算轮应成功");
+        assert_eq!(budgeted.source, "generation_plan", "{}", budgeted.reply);
+        assert!(budgeted.reply.contains("预算版"), "{}", budgeted.reply);
+        assert!(
+            budgeted.reply.chars().count() <= 80,
+            "预算必须约束最终 HTTP 回复：{}",
+            budgeted.reply
+        );
+
+        let before = state
+            .take_turn(&session_id, "姚明的身高是多少")
+            .await
+            .expect("普通问答应成功");
+        assert_ne!(before.source, "generation_plan");
+        assert!(before.reply.contains("226"), "{}", before.reply);
+    }
+
+    #[tokio::test]
     async fn knowledge_assertions_reach_existing_sessions() {
         let state = test_state(4);
         let first = state.create_session().await.expect("会话应创建成功");
