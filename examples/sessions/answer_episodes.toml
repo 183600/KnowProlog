@@ -13,28 +13,28 @@ attributes = { "身高" = "190", "国籍" = "中国" }
 
 [[turns]]
 input = "姚明的身高是多少"
-expect = { answered = true, intent = "ask_attribute", answer_schema = "attribute", episode_closed = true, answer_contains = ["226"] }
+expect = { answered = true, intent = "ask_attribute", answer_schema = "attribute", episode_turns = 1, episode_closed = true, answer_contains = ["226"] }
 
 [[turns]]
 input = "还有呢"
-expect = { answered = true, intent = "continue", answer_schema = "attribute", missing_obligations_contains = ["evidence"], episode_closed = false }
+expect = { answered = true, intent = "continue", answer_schema = "attribute", episode_turns = 2, missing_obligations_contains = ["evidence"], episode_closed = false }
 
 [[turns]]
 input = "你怎么知道的？"
-expect = { answered = true, intent = "meta_why", answer_schema = "attribute", missing_obligations_contains = ["evidence"], episode_closed = false }
+expect = { answered = true, intent = "meta_why", answer_schema = "attribute", episode_turns = 3, missing_obligations_contains = ["evidence"], episode_closed = false }
 
 [[turns]]
 input = "叶莉的身高是多少"
-expect = { answered = true, intent = "ask_attribute", answer_schema = "attribute", episode_closed = true, answer_contains = ["190"] }
+expect = { answered = true, intent = "ask_attribute", answer_schema = "attribute", episode_turns = 1, episode_closed = true, answer_contains = ["190"] }
 
 [[turns]]
 input = "我们聊过什么？"
-expect = { answered = true, intent = "meta_recap", answer_schema = "recap", episode_closed = true, answer_contains = ["姚明"] }
+expect = { answered = true, intent = "meta_recap", answer_schema = "recap", episode_turns = 1, episode_closed = true, answer_contains = ["姚明"] }
 
 [[turns]]
 input = "张三的身高是多少"
-expect = { answered = false, reply_kind = "unhandled", answer_schema = "", gaps_contains = ["unhandled"] }
+expect = { answered = false, reply_kind = "unhandled", answer_schema = "", episode_turns = 0, gaps_contains = ["unhandled"] }
 
 [[turns]]
 input = "姚明的体重是多少"
-expect = { answered = true, intent = "ask_attribute", answer_schema = "attribute", missing_obligations_contains = ["answer", "evidence"], episode_closed = false, gaps_contains = ["knowledge_gap"] }
+expect = { answered = true, intent = "ask_attribute", answer_schema = "attribute", episode_turns = 1, missing_obligations_contains = ["answer", "evidence"], episode_closed = false, gaps_contains = ["knowledge_gap"] }

@@ -2030,6 +2030,9 @@
         Some(Commands::Plugins { .. }) => {
             // 已在打开存储前处理；此处仅保持 match 穷尽。
         }
+        Some(Commands::Taxonomy { .. }) | Some(Commands::TaxonomyFuzz { .. }) => {
+            // 已在打开存储前处理；此处仅保持 match 穷尽。
+        }
         Some(Commands::FuzzDialogue { .. }) => {
             // 已在打开存储前处理；此处仅保持 match 穷尽。
         }

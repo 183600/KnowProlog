@@ -111,6 +111,16 @@ async fn main() {
         return;
     }
 
+    // 回答分类学与其课程矩阵完全离线：不依赖配置、存储或网络。
+    if let Some(Commands::Taxonomy { json }) = &cli.command {
+        run_taxonomy(*json);
+        return;
+    }
+    if let Some(Commands::TaxonomyFuzz { seed, json }) = &cli.command {
+        run_taxonomy_fuzz(*seed, *json);
+        return;
+    }
+
     // 查询剧本完全离线（自带事实）：先于配置加载与存储打开处理。
     if let Some(Commands::Scenario { file, json }) = &cli.command {
         run_query_scenario(file, *json);

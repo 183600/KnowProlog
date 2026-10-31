@@ -1018,6 +1018,51 @@ fn run_query_scenario(file: &str, json: bool) {
 }
 
 /// `fuzz-dialogue`：确定性质量差分模糊测试（无配置、无存储、无网络）。
+/// `taxonomy`：打印回答分类学与 query_type 覆盖；有覆盖洞时非零退出。
+fn run_taxonomy(json: bool) {
+    let issues = know_prolog::answer_taxonomy::lint_query_types(
+        know_prolog::config_contract::supported_query_types(),
+    );
+    if json {
+        let value = serde_json::json!({
+            "table": know_prolog::answer_taxonomy::render_table(),
+            "issues": issues,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).unwrap_or_default()
+        );
+    } else {
+        println!("{}", know_prolog::answer_taxonomy::render_table());
+        if issues.is_empty() {
+            println!("覆盖：全部受支持 query_type 都有唯一回答图式。");
+        } else {
+            for issue in &issues {
+                println!("{} [{}] {}：{}", "ERROR", issue.code, issue.query_type, issue.detail);
+            }
+        }
+    }
+    if !issues.is_empty() {
+        std::process::exit(1);
+    }
+}
+
+/// `taxonomy-fuzz`：回放回答分类学课程；任一不变量失败即非零退出。
+fn run_taxonomy_fuzz(seed: u64, json: bool) {
+    let report = know_prolog::taxonomy_fuzz::run(seed);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_default()
+        );
+    } else {
+        println!("{}", report.render_text());
+    }
+    if report.failed > 0 {
+        std::process::exit(1);
+    }
+}
+
 fn run_fuzz_dialogue(
     cases: usize,
     seed: u64,

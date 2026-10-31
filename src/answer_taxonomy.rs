@@ -216,6 +216,20 @@ impl Obligation {
         }
     }
 
+    pub fn from_label(label: &str) -> Option<Self> {
+        [
+            Obligation::Subject,
+            Obligation::Predicate,
+            Obligation::Answer,
+            Obligation::Evidence,
+            Obligation::Contrast,
+            Obligation::Boundary,
+            Obligation::Clarification,
+        ]
+        .into_iter()
+        .find(|obligation| obligation.label() == label.trim())
+    }
+
     /// 每轮都要重新履行、不随追问继承的槽位。
     pub fn is_transient(self) -> bool {
         matches!(

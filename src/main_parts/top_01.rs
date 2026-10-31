@@ -1515,6 +1515,23 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Print the answer taxonomy: schemas, query-type coverage, required
+    /// obligations and legal follow-ups; exits non-zero on coverage holes
+    Taxonomy {
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Replay the deterministic answer-taxonomy course (world × follow-up
+    /// matrix) offline; exits non-zero on any invariant failure
+    TaxonomyFuzz {
+        /// Deterministic course seed (same seed → byte-identical report)
+        #[arg(long, default_value_t = 20261031)]
+        seed: u64,
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect dialogue artifact URIs (session / turn / reply / claim /
     /// mention / evidence): list the index, or resolve a URI or selector
     DialogueArtifacts {

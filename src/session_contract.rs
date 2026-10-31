@@ -130,6 +130,9 @@ pub struct ReceiptExpectation {
     /// 本轮回答回合的图式（`AnswerSchema::label`）。
     #[serde(default)]
     pub answer_schema: Option<String>,
+    /// 回答回合已连续覆盖的轮次（新开回合为 1）。
+    #[serde(default)]
+    pub episode_turns: Option<u32>,
     /// 回答回合仍欠的槽位（`Obligation::label`）。
     #[serde(default)]
     pub missing_obligations_contains: Vec<String>,
@@ -164,6 +167,9 @@ pub struct TurnReceipt {
     /// 本轮回答回合的图式；无法分类时为空。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub answer_schema: String,
+    /// 回答回合已连续覆盖的轮次（未回答为 0）。
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub episode_turns: u32,
     /// 回答回合仍欠的必需槽位（去重、有界、稳定排序）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub missing_obligations: Vec<String>,
@@ -501,6 +507,10 @@ fn capture_turn(
         .as_ref()
         .map(|episode| episode.schema.label().to_string())
         .unwrap_or_default();
+    let episode_turns = episode
+        .as_ref()
+        .map(|episode| episode.turns)
+        .unwrap_or_default();
     let missing_obligations = episode
         .as_ref()
         .map(|episode| {
@@ -532,6 +542,7 @@ fn capture_turn(
         quoted_terms: bounded_tokens(quoted),
         ungrounded_terms: bounded_tokens(ungrounded),
         answer_schema,
+        episode_turns,
         missing_obligations,
         answer_excerpt: excerpt(&answer, 80),
         answer_digest,
@@ -682,6 +693,14 @@ fn check_expectations(
             failures.push(format!(
                 "期望回答图式「{}」，实际「{}」",
                 expected, receipt.answer_schema
+            ));
+        }
+    }
+    if let Some(expected) = expect.episode_turns {
+        if expected != receipt.episode_turns {
+            failures.push(format!(
+                "期望回答回合第 {} 轮，实际第 {} 轮",
+                expected, receipt.episode_turns
             ));
         }
     }
@@ -904,6 +923,12 @@ fn compare_receipts(baseline: &TurnReceipt, current: &TurnReceipt) -> Vec<String
             schema_label(&current.answer_schema)
         ));
     }
+    if baseline.episode_turns != current.episode_turns {
+        changes.push(format!(
+            "回答回合轮次 {} → {}",
+            baseline.episode_turns, current.episode_turns
+        ));
+    }
     changes.extend(compare_tokens(
         "回合欠账",
         &baseline.missing_obligations,
@@ -948,6 +973,10 @@ fn compare_tokens(label: &str, baseline: &[String], current: &[String]) -> Vec<S
 
 fn focus_label(focus: Option<&str>) -> &str {
     focus.unwrap_or("（空）")
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 fn schema_label(schema: &str) -> &str {
@@ -1018,6 +1047,7 @@ fn receipt_digest(receipt: &TurnReceipt) -> String {
         quoted_terms: &'a [String],
         ungrounded_terms: &'a [String],
         answer_schema: &'a str,
+        episode_turns: u32,
         missing_obligations: &'a [String],
         answer_excerpt: &'a str,
         answer_digest: &'a str,
@@ -1038,6 +1068,7 @@ fn receipt_digest(receipt: &TurnReceipt) -> String {
         quoted_terms: &receipt.quoted_terms,
         ungrounded_terms: &receipt.ungrounded_terms,
         answer_schema: &receipt.answer_schema,
+        episode_turns: receipt.episode_turns,
         missing_obligations: &receipt.missing_obligations,
         answer_excerpt: &receipt.answer_excerpt,
         answer_digest: &receipt.answer_digest,
@@ -1384,6 +1415,7 @@ input = "姚明的身高是多少"
             quoted_terms: Vec::new(),
             ungrounded_terms: Vec::new(),
             answer_schema: String::new(),
+            episode_turns: 0,
             missing_obligations: Vec::new(),
             answer_excerpt: excerpt(&long, 80),
             answer_digest: canonical_digest(&long).unwrap(),
