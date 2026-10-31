@@ -39,6 +39,8 @@ pub enum NominationOrigin {
     Dialogue,
     /// 文本导入模式（又称/简称/全称/即）
     Import,
+    /// 图谱结构对齐（跨来源指纹证书）
+    Structural,
     /// 外部接口来源
     Api,
 }
@@ -50,6 +52,7 @@ impl NominationOrigin {
             NominationOrigin::Config => "配置声明",
             NominationOrigin::Dialogue => "用户确认",
             NominationOrigin::Import => "文本导入",
+            NominationOrigin::Structural => "结构对齐",
             NominationOrigin::Api => "外部接口",
         }
     }
@@ -966,6 +969,17 @@ impl EntityRegistry {
         canonical: &str,
         origin: NominationOrigin,
     ) -> bool {
+        self.confirm_alias_with_evidence(surface, canonical, origin, "人工确认")
+    }
+
+    /// 确认别名并记录可审计的证据文本；来源决定 `origins` 归类。
+    pub fn confirm_alias_with_evidence(
+        &mut self,
+        surface: &str,
+        canonical: &str,
+        origin: NominationOrigin,
+        evidence: &str,
+    ) -> bool {
         let folded = fold_surface(surface);
         let canonical = canonical.trim();
         if folded.is_empty() || canonical.is_empty() {
@@ -974,12 +988,12 @@ impl EntityRegistry {
         let target = match self.find_target(canonical) {
             Some(target) => target,
             None => {
-                self.ensure_record(canonical, origin, "人工确认");
+                self.ensure_record(canonical, origin, evidence);
                 canonical.to_string()
             }
         };
         if folded == fold_surface(&target) {
-            let record = self.ensure_record(&target, origin, "人工确认");
+            let record = self.ensure_record(&target, origin, evidence);
             let changed = record.status != EntityStatus::Confirmed;
             record.status = EntityStatus::Confirmed;
             return changed;
@@ -1001,7 +1015,9 @@ impl EntityRegistry {
         let record_changed = record.status != EntityStatus::Confirmed;
         record.status = EntityStatus::Confirmed;
         record.origins.insert(origin);
-        record.sources.insert("人工确认".to_string());
+        if !evidence.trim().is_empty() {
+            record.sources.insert(evidence.trim().to_string());
+        }
         let alias = record.aliases.entry(folded).or_insert_with(|| AliasRecord {
             surface: surface.trim().to_string(),
             status: EntityStatus::Pending,
@@ -1013,7 +1029,7 @@ impl EntityRegistry {
         let alias_changed = alias.status != EntityStatus::Confirmed;
         alias.status = EntityStatus::Confirmed;
         alias.origins.insert(origin);
-        push_evidence(&mut alias.evidence, "人工确认");
+        push_evidence(&mut alias.evidence, evidence);
         if alias.surface != surface.trim() {
             alias.variants.insert(surface.trim().to_string());
         }
@@ -1565,6 +1581,30 @@ mod tests {
             let once = fold_surface(name);
             assert_eq!(fold_surface(&once), once, "折叠必须幂等：{}", name);
         }
+    }
+
+    #[test]
+    fn structural_confirmation_records_origin_and_evidence() {
+        let mut registry = EntityRegistry::new();
+        assert!(registry.confirm_alias_with_evidence(
+            "Apple_Inc.",
+            "苹果公司",
+            NominationOrigin::Structural,
+            "结构指纹对齐",
+        ));
+        assert_eq!(
+            registry.resolve("Apple_Inc."),
+            EntityResolution::Canonical("苹果公司".to_string())
+        );
+        let record = registry.records.get("苹果公司").expect("规范记录已建立");
+        assert!(record.origins.contains(&NominationOrigin::Structural));
+        assert!(record.sources.contains("结构指纹对齐"));
+        let alias = record
+            .aliases
+            .get(&fold_surface("Apple_Inc."))
+            .expect("别名已登记");
+        assert!(alias.origins.contains(&NominationOrigin::Structural));
+        assert!(alias.evidence.iter().any(|item| item == "结构指纹对齐"));
     }
 
     #[test]

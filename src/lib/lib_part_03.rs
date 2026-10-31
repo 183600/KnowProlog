@@ -333,6 +333,20 @@ impl OxigraphManager {
         changed
     }
 
+    /// 确认一个结构对齐别名（来源＝结构对齐，证据＝结构指纹证书）。
+    pub fn confirm_structural_entity_alias(&self, surface: &str, canonical: &str) -> bool {
+        let changed = self.entity_registry.write().confirm_alias_with_evidence(
+            surface,
+            canonical,
+            entity_registry::NominationOrigin::Structural,
+            "结构指纹对齐",
+        );
+        if changed {
+            self.perf.bump("identity_alias_confirm");
+        }
+        changed
+    }
+
     /// 拒绝一个别名提名（墓碑：不予自动提名，也不参与解析）。
     pub fn reject_entity_alias(&self, surface: &str, canonical: &str) -> bool {
         let changed = self

@@ -1031,7 +1031,7 @@ async fn run_align(
     if apply {
         for (alias, canonical) in plan.aliases() {
             applied += 1;
-            if manager.confirm_entity_alias(&alias, &canonical) {
+            if manager.confirm_structural_entity_alias(&alias, &canonical) {
                 changed += 1;
             }
         }
