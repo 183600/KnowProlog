@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use crate::confidence::ClaimEnvelope;
 use crate::context_image::fnv1a_hex;
 use crate::media_evidence::{Locator, MediaCitation};
+use crate::resource_ledger::{ResourceKind, ResourceLedger, ResourceVector};
 
 /// 回答计划的结构版本；不兼容变更时递增。
 pub const ANSWER_PLAN_VERSION: u32 = 1;
@@ -495,14 +496,123 @@ impl AnswerPlan {
                 subject: self.subject.clone(),
             });
         }
+        if let StyleDirective::Budget(limit) = directive {
+            return self.budgeted_surface(limit).map(|budgeted| budgeted.units);
+        }
         let mut builder = SurfaceBuilder::new(self, directive);
         match directive {
             StyleDirective::Brief => self.build_window(&mut builder, BRIEF_CLAIM_LIMIT, false),
             StyleDirective::Detailed => self.build_window(&mut builder, usize::MAX, true),
             StyleDirective::Restate => self.build_restate(&mut builder),
             StyleDirective::Focus(index) => self.build_focus(&mut builder, index)?,
+            StyleDirective::Budget(_) => unreachable!("预算指令已在上方分流"),
         }
         Ok(builder.finish())
+    }
+
+    /// 在字符预算内选择完整命题并表达同一份计划。
+    ///
+    /// 选择只按计划原顺序取前缀：不切断句子、不改写命题，也不引入计划外
+    /// 内容。抬头、截断提示与计划容量提示都计入预算；预算连第一条完整命题
+    /// 都放不下时显式返回 [`PlanRenderError::BudgetTooSmall`]，并给出最小
+    /// 可用字符数，而不是输出空白或半句话。
+    pub fn budgeted_surface(
+        &self,
+        budget_chars: usize,
+    ) -> Result<BudgetedSurface, PlanRenderError> {
+        if self.claims.is_empty() {
+            return Err(PlanRenderError::Empty {
+                subject: self.subject.clone(),
+            });
+        }
+        let total = self.claims.len();
+        let mut best: Option<(usize, SurfaceUnits)> = None;
+        for kept in 1..=total {
+            let units = self.build_budget_surface(budget_chars, kept);
+            if units.concat().chars().count() <= budget_chars {
+                best = Some((kept, units));
+            }
+        }
+        let Some((kept_claims, units)) = best else {
+            let minimum = self
+                .build_budget_surface(budget_chars, 1)
+                .concat()
+                .chars()
+                .count();
+            return Err(PlanRenderError::BudgetTooSmall {
+                subject: self.subject.clone(),
+                budget: budget_chars,
+                minimum,
+            });
+        };
+        let mut ledger = ResourceLedger::new(ResourceVector::output_only(budget_chars));
+        for unit in &units.units {
+            ledger
+                .try_charge(ResourceKind::OutputChars, unit.text.chars().count())
+                .map_err(|denial| PlanRenderError::BudgetTooSmall {
+                    subject: self.subject.clone(),
+                    budget: budget_chars,
+                    minimum: denial.used.saturating_add(denial.requested),
+                })?;
+        }
+        Ok(BudgetedSurface {
+            units,
+            ledger,
+            kept_claims,
+            omitted_claims: total.saturating_sub(kept_claims),
+        })
+    }
+
+    fn build_budget_surface(&self, budget_chars: usize, kept: usize) -> SurfaceUnits {
+        let total = self.claims.len();
+        let kept = kept.clamp(1, total.max(1));
+        let mut builder = SurfaceBuilder::new(self, StyleDirective::Budget(budget_chars));
+        builder.push(
+            SurfaceUnitKind::Header,
+            format!(
+                "预算版（保留 {}/{} 点，预算 {} 字，未新增事实）：\n",
+                kept, total, budget_chars
+            ),
+            None,
+            None,
+        );
+        for (index, claim) in self.claims.iter().take(kept).enumerate() {
+            builder.push(
+                SurfaceUnitKind::Claim,
+                format!(
+                    "  {}. {}{}\n",
+                    index + 1,
+                    claim.text.trim(),
+                    claim.media_note(false)
+                ),
+                Some(&claim.slot),
+                Some(index + 1),
+            );
+        }
+        if kept < total {
+            builder.push(
+                SurfaceUnitKind::Omission,
+                format!("  ……其余 {} 点因预算未展开。\n", total - kept),
+                None,
+                None,
+            );
+        }
+        let mut caveats = Vec::new();
+        if self.suppressed > 0 {
+            caveats.push(format!("{} 句未通过自检", self.suppressed));
+        }
+        if self.omitted > 0 {
+            caveats.push(format!("{} 点超出计划容量", self.omitted));
+        }
+        if !caveats.is_empty() {
+            builder.push(
+                SurfaceUnitKind::Capacity,
+                format!("  （计划另有{}。）\n", caveats.join("、")),
+                None,
+                None,
+            );
+        }
+        builder.finish()
     }
 
     fn build_window(&self, builder: &mut SurfaceBuilder, limit: usize, detailed: bool) {
@@ -878,6 +988,43 @@ impl SurfaceUnits {
     }
 }
 
+/// 预算约束下的一次表达：表层单位、资源账本与保留/省略计数。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BudgetedSurface {
+    pub units: SurfaceUnits,
+    pub ledger: ResourceLedger,
+    pub kept_claims: usize,
+    pub omitted_claims: usize,
+}
+
+impl BudgetedSurface {
+    pub fn concat(&self) -> String {
+        self.units.concat()
+    }
+
+    pub fn used_chars(&self) -> usize {
+        self.ledger.used_of(ResourceKind::OutputChars)
+    }
+
+    pub fn budget_chars(&self) -> usize {
+        self.ledger.limits().output_chars
+    }
+
+    pub fn render_receipt(&self) -> String {
+        format!(
+            "预算表达：保留 {}/{} 点，{}；{}",
+            self.kept_claims,
+            self.kept_claims + self.omitted_claims,
+            self.ledger.render_receipt(),
+            if self.omitted_claims > 0 {
+                "未展开命题只被省略，未被改写"
+            } else {
+                "全部命题均在预算内完整表达"
+            }
+        )
+    }
+}
+
 struct SurfaceBuilder {
     plan_id: String,
     revision: u64,
@@ -1146,6 +1293,8 @@ pub enum StyleDirective {
     Restate,
     /// 只取第 N 点（从 1 开始）。
     Focus(usize),
+    /// 在 N 个字符内选择完整命题；省略项显式披露。
+    Budget(usize),
 }
 
 impl StyleDirective {
@@ -1160,6 +1309,11 @@ impl StyleDirective {
             .trim();
         if stripped.is_empty() {
             return None;
+        }
+        for prefix in BUDGET_PREFIXES {
+            if let Some(rest) = stripped.strip_prefix(prefix) {
+                return parse_budget(rest, true).map(StyleDirective::Budget);
+            }
         }
         for prefix in ["风格：", "风格:", "回答计划：", "回答计划:"] {
             if let Some(rest) = stripped.strip_prefix(prefix) {
@@ -1191,6 +1345,9 @@ impl StyleDirective {
         if RESTATE_PHRASES.contains(&stripped) {
             return Some(StyleDirective::Restate);
         }
+        if let Some(budget) = parse_budget(stripped, false) {
+            return Some(StyleDirective::Budget(budget));
+        }
         parse_focus(stripped, false).map(StyleDirective::Focus)
     }
 
@@ -1200,6 +1357,7 @@ impl StyleDirective {
             StyleDirective::Detailed => "完整版",
             StyleDirective::Restate => "换种表达",
             StyleDirective::Focus(_) => "定位单点",
+            StyleDirective::Budget(_) => "预算版",
         }
     }
 
@@ -1210,8 +1368,53 @@ impl StyleDirective {
             StyleDirective::Detailed => "detailed".to_string(),
             StyleDirective::Restate => "restate".to_string(),
             StyleDirective::Focus(index) => format!("focus:{}", index),
+            StyleDirective::Budget(limit) => format!("budget:{}", limit),
         }
     }
+}
+
+const BUDGET_PREFIXES: &[&str] = &[
+    "预算：",
+    "预算:",
+    "回答预算：",
+    "回答预算:",
+    "字数：",
+    "字数:",
+];
+
+/// 解析「预算：120字」「控制在 80 字以内」这类长度指令。
+///
+/// 裸数字（如「120」）不接管：它可能是澄清短答或普通数值。只有显式前缀
+/// 或「字 / 字以内 / 不超过 / 最多」等量词与限制词出现时才视为预算。
+fn parse_budget(text: &str, explicit: bool) -> Option<usize> {
+    let mut body = text.trim();
+    let mut explicit = explicit;
+    for prefix in ["控制在", "不超过", "最多", "限制在", "限制为", "限制", "限"] {
+        if let Some(rest) = body.strip_prefix(prefix) {
+            body = rest.trim();
+            explicit = true;
+            break;
+        }
+    }
+    for suffix in [
+        "字以内",
+        "字符以内",
+        "个字以内",
+        "字内",
+        "字符",
+        "个字",
+        "字",
+    ] {
+        if let Some(rest) = body.strip_suffix(suffix) {
+            body = rest.trim();
+            explicit = true;
+            break;
+        }
+    }
+    if !explicit || body.is_empty() || !body.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    body.parse::<usize>().ok().filter(|value| *value > 0)
 }
 
 const BRIEF_PHRASES: &[&str] = &[
@@ -1375,6 +1578,11 @@ pub enum PlanRenderError {
         requested: usize,
         total: usize,
     },
+    BudgetTooSmall {
+        subject: String,
+        budget: usize,
+        minimum: usize,
+    },
 }
 
 impl std::fmt::Display for PlanRenderError {
@@ -1395,6 +1603,15 @@ impl std::fmt::Display for PlanRenderError {
                 formatter,
                 "关于「{}」的回答计划只有 {} 点，无法定位第 {} 点。",
                 subject, total, requested
+            ),
+            PlanRenderError::BudgetTooSmall {
+                subject,
+                budget,
+                minimum,
+            } => write!(
+                formatter,
+                "预算 {} 字不足以完整表达「{}」的第一条命题；至少需要 {} 字才能保留抬头、完整命题与省略说明。",
+                budget, subject, minimum
             ),
         }
     }
@@ -1445,6 +1662,86 @@ mod tests {
             assert!(!text.contains(claim.text.trim()), "越界 claim：{}", text);
         }
         assert!(text.contains("完整讲讲"), "{}", text);
+    }
+
+    #[test]
+    fn budget_keeps_whole_claims_within_a_hard_character_limit() {
+        let plan = sample_plan();
+        let budgeted = plan.budgeted_surface(90).unwrap();
+        let text = budgeted.concat();
+        assert!(text.chars().count() <= 90, "{}", text);
+        assert!(text.contains("预算版"), "{}", text);
+        assert!(budgeted.kept_claims >= 1);
+        assert!(budgeted.kept_claims < plan.claim_count(), "{}", text);
+        assert!(text.contains("因预算未展开"), "{}", text);
+        for claim in plan.claims.iter().take(budgeted.kept_claims) {
+            assert!(
+                text.contains(claim.text.trim()),
+                "保留命题必须完整：{}",
+                text
+            );
+        }
+        for claim in plan.claims.iter().skip(budgeted.kept_claims) {
+            assert!(
+                !text.contains(claim.text.trim()),
+                "省略命题不得出现：{}",
+                text
+            );
+        }
+        assert_eq!(budgeted.used_chars(), text.chars().count());
+        assert_eq!(budgeted.budget_chars(), 90);
+        assert!(budgeted.ledger.fits_within_limits());
+        assert!(budgeted.render_receipt().contains("预算表达"));
+        assert_eq!(budgeted, plan.budgeted_surface(90).unwrap());
+        assert_eq!(
+            plan.surface_units(StyleDirective::Budget(90)).unwrap(),
+            budgeted.units
+        );
+        assert_eq!(budgeted.units.directive, "budget:90");
+    }
+
+    #[test]
+    fn tiny_budget_is_an_explicit_error_with_a_minimum() {
+        let plan = sample_plan();
+        let error = plan.budgeted_surface(8).unwrap_err();
+        match &error {
+            PlanRenderError::BudgetTooSmall {
+                subject,
+                budget,
+                minimum,
+            } => {
+                assert_eq!(subject, "张三");
+                assert_eq!(*budget, 8);
+                assert!(*minimum > 8, "minimum={}", minimum);
+            }
+            other => panic!("应返回预算不足错误，实际：{:?}", other),
+        }
+        let text = error.to_string();
+        assert!(text.contains("预算 8 字"), "{}", text);
+        assert!(text.contains("至少需要"), "{}", text);
+        assert!(text.contains("完整命题"), "{}", text);
+    }
+
+    #[test]
+    fn generous_budget_keeps_every_claim_without_an_omission_note() {
+        let plan = sample_plan();
+        let budgeted = plan.budgeted_surface(10_000).unwrap();
+        assert_eq!(budgeted.kept_claims, plan.claim_count());
+        assert_eq!(budgeted.omitted_claims, 0);
+        assert!(!budgeted.concat().contains("因预算未展开"));
+        for claim in &plan.claims {
+            assert!(budgeted.concat().contains(claim.text.trim()));
+        }
+    }
+
+    #[test]
+    fn budget_surface_counts_plan_caveats_inside_the_limit() {
+        let plan = AnswerPlan::new("介绍：张三", "张三", 7, sample_claims(), 2, 1);
+        let budgeted = plan.budgeted_surface(180).unwrap();
+        let text = budgeted.concat();
+        assert!(text.chars().count() <= 180, "{}", text);
+        assert!(text.contains("1 句未通过自检"), "{}", text);
+        assert!(text.contains("2 点超出计划容量"), "{}", text);
     }
 
     #[test]
@@ -1547,6 +1844,12 @@ mod tests {
             ("回答计划：简短", StyleDirective::Brief),
             ("风格：完整", StyleDirective::Detailed),
             ("风格：换种表达", StyleDirective::Restate),
+            ("预算：120字", StyleDirective::Budget(120)),
+            ("预算:80", StyleDirective::Budget(80)),
+            ("回答预算：60字以内", StyleDirective::Budget(60)),
+            ("控制在 45 字", StyleDirective::Budget(45)),
+            ("最多30字", StyleDirective::Budget(30)),
+            ("120字以内", StyleDirective::Budget(120)),
         ] {
             assert_eq!(
                 StyleDirective::parse(input),
@@ -1568,6 +1871,9 @@ mod tests {
             "1",
             "2",
             "二十",
+            "120",
+            "预算：0字",
+            "预算：很多字",
             "介绍一下北京",
         ] {
             assert_eq!(StyleDirective::parse(input), None, "不应接管「{}」", input);
@@ -1807,6 +2113,7 @@ mod tests {
             StyleDirective::Detailed,
             StyleDirective::Restate,
             StyleDirective::Focus(2),
+            StyleDirective::Budget(90),
         ] {
             let stream = plan.surface_units(directive).unwrap();
             assert_eq!(

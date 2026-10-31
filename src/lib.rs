@@ -171,6 +171,7 @@ pub mod relation_acquisition;
 pub mod relation_frame;
 pub mod release;
 pub mod resolution_engine;
+pub mod resource_ledger;
 pub mod revision_guard;
 pub mod rewrite_book;
 pub mod rewrite_retrieval;

@@ -274,6 +274,8 @@ mod session_tests {
             "换种表达",
             "第二点是什么",
             "风格：第2点",
+            "预算：120字",
+            "控制在80字以内",
         ] {
             assert!(
                 StyleDirective::parse(input).is_some(),

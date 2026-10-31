@@ -398,7 +398,7 @@ impl SymbolicReasoner {
             ));
         }
         output.push_str(
-            "  可输入「简短点」「完整讲讲」「换种表达」或「第N点是什么」重述同一份计划。",
+            "  可输入「简短点」「完整讲讲」「换种表达」「第N点是什么」或「预算：120字」重述同一份计划。",
         );
         if self.config.confidence.enabled {
             let pending = self.epistemic_turns.render_pending_zh(3);
