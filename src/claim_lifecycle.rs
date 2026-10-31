@@ -1874,6 +1874,46 @@ impl ClaimLedger {
         None
     }
 
+    fn support_tombstone(
+        &self,
+        record: &ClaimRecord,
+        extra: &BTreeSet<FactKey>,
+    ) -> Option<FactKey> {
+        let mut visiting = BTreeSet::new();
+        self.support_tombstone_inner(record, extra, &mut visiting)
+    }
+
+    fn support_tombstone_inner(
+        &self,
+        record: &ClaimRecord,
+        extra: &BTreeSet<FactKey>,
+        visiting: &mut BTreeSet<String>,
+    ) -> Option<FactKey> {
+        for item in &record.support {
+            match item {
+                ClaimSupport::Fact { .. } => {
+                    if let Some(fact) = item.as_fact() {
+                        if extra.contains(&fact) {
+                            return Some(fact);
+                        }
+                    }
+                }
+                ClaimSupport::Claim { id } => {
+                    if !visiting.insert(id.clone()) {
+                        continue;
+                    }
+                    if let Some(parent) = self.claims.get(id) {
+                        if let Some(found) = self.support_tombstone_inner(parent, extra, visiting) {
+                            return Some(found);
+                        }
+                    }
+                    visiting.remove(id);
+                }
+            }
+        }
+        None
+    }
+
     /// 提交前闸门；不改状态，只给出 allow / refresh / deny 与可复核发现。
     pub fn gate(&self, id: &str, context: &GateContext) -> GateDecision {
         let mut findings = Vec::new();
@@ -1926,15 +1966,11 @@ impl ClaimLedger {
         if let Some((code, detail)) = self.support_problem(record) {
             findings.push(GateFinding::new(code, detail));
         }
-        for item in &record.support {
-            if let Some(fact) = item.as_fact() {
-                if context.extra_retired.contains(&fact) {
-                    findings.push(GateFinding::new(
-                        GateFindingCode::ExternalTombstone,
-                        fact.render(),
-                    ));
-                }
-            }
+        if let Some(fact) = self.support_tombstone(record, &context.extra_retired) {
+            findings.push(GateFinding::new(
+                GateFindingCode::ExternalTombstone,
+                fact.render(),
+            ));
         }
         findings.sort();
         findings.dedup();
@@ -2581,16 +2617,12 @@ impl ClaimLedger {
                     });
                 }
             }
-            for item in &record.support {
-                if let Some(fact) = item.as_fact() {
-                    if options.extra_retired.contains(&fact) {
-                        findings.insert(AuditFinding {
-                            code: GateFindingCode::ExternalTombstone,
-                            claim_id: id.clone(),
-                            detail: format!("支撑命中外部墓碑：{}", fact.render()),
-                        });
-                    }
-                }
+            if let Some(fact) = self.support_tombstone(record, &options.extra_retired) {
+                findings.insert(AuditFinding {
+                    code: GateFindingCode::ExternalTombstone,
+                    claim_id: id.clone(),
+                    detail: format!("支撑命中外部墓碑：{}", fact.render()),
+                });
             }
             let last_emitted_seq = self
                 .events
@@ -3306,10 +3338,29 @@ mod tests {
                 1,
             )
             .unwrap();
+        let child = ledger
+            .register(
+                draft(
+                    "吴十",
+                    "通勤",
+                    "s2",
+                    "吴十通勤方便。",
+                    vec![ClaimSupport::claim(&claim.id)],
+                ),
+                2,
+                1,
+            )
+            .unwrap();
         let context = GateContext::default().with_retired_facts([fact_key.clone()]);
         let decision = ledger.gate(&claim.id, &context);
         assert_eq!(decision.verdict, GateVerdict::Deny);
         assert!(decision
+            .findings
+            .iter()
+            .any(|finding| finding.code == GateFindingCode::ExternalTombstone));
+        let child_decision = ledger.gate(&child.id, &context);
+        assert_eq!(child_decision.verdict, GateVerdict::Deny);
+        assert!(child_decision
             .findings
             .iter()
             .any(|finding| finding.code == GateFindingCode::ExternalTombstone));
@@ -3322,6 +3373,10 @@ mod tests {
             &AuditOptions::default().with_retired_facts([fact_key]),
         );
         assert_eq!(audit.verdict, AuditVerdict::Findings);
+        assert!(audit
+            .findings
+            .iter()
+            .any(|finding| finding.claim_id == child.id));
     }
 
     #[test]
