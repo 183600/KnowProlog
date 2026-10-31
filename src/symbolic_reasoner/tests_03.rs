@@ -1864,3 +1864,28 @@ rules = [
                 .contains(&plan.id)
         );
     }
+
+    #[test]
+    fn future_claim_ledger_version_is_rejected_before_any_state_change() {
+        let facts = master_facts();
+        let mut source = SymbolicReasoner::new(test_config(), HashMap::new());
+        source.observe_facts(&facts);
+        source.generate_about("张三").expect("应能生成介绍");
+        let mut snapshot = source.dialogue_snapshot();
+        snapshot
+            .claims
+            .as_mut()
+            .expect("账本应写入快照")
+            .version = crate::claim_lifecycle::CLAIM_LEDGER_VERSION + 1;
+
+        let mut target = SymbolicReasoner::new(test_config(), HashMap::new());
+        target.observe_facts(&facts);
+        let error = target
+            .restore_dialogue_snapshot(&snapshot)
+            .expect_err("未来版本应被拒绝");
+        assert!(error.contains("claim 账本版本"), "{}", error);
+        assert!(
+            target.context().generation_state().is_none(),
+            "版本门失败时不得半应用生成状态"
+        );
+    }
