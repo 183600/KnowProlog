@@ -499,6 +499,10 @@ impl NodeBuild {
         self.out_entity.len() + self.in_entity.len() + self.out_literal.len()
     }
 
+    fn has_entity_edge(&self) -> bool {
+        !self.out_entity.is_empty() || !self.in_entity.is_empty()
+    }
+
     fn predicates(&self) -> BTreeSet<String> {
         let mut predicates = BTreeSet::new();
         for (predicate, _) in &self.out_entity {
@@ -764,7 +768,10 @@ pub fn align_assertions(
         if source_fingerprint.truncated || target_fingerprint.truncated {
             blockers.push(AlignmentBlocker::HubTruncated);
         }
-        if source_build.degree() < options.min_degree || target_build.degree() < options.min_degree
+        if source_build.degree() < options.min_degree
+            || target_build.degree() < options.min_degree
+            || !source_build.has_entity_edge()
+            || !target_build.has_entity_edge()
         {
             blockers.push(AlignmentBlocker::Sparse);
         }
@@ -1169,6 +1176,26 @@ mod tests {
         assert!(certificate
             .blockers
             .contains(&AlignmentBlocker::AmbiguousMargin));
+    }
+
+    #[test]
+    fn literal_only_nodes_are_proposed_not_merged() {
+        let namespaces = store();
+        let assertions = vec![
+            assertion("alice", "甲", "type", "Person", ObjectKind::Entity),
+            assertion("alice", "甲", "年龄", "18", ObjectKind::Literal),
+            assertion("bob", "乙", "type", "Person", ObjectKind::Entity),
+            assertion("bob", "乙", "年龄", "20", ObjectKind::Literal),
+        ];
+        let plan = align_assertions(&namespaces, &assertions, &AlignmentOptions::default());
+        let certificate = plan
+            .certificates
+            .iter()
+            .find(|certificate| certificate.from == "甲" && certificate.to == "乙")
+            .expect("只有字面量的同构实体应留下提案");
+        assert_eq!(certificate.status, AlignmentStatus::Proposed);
+        assert!(certificate.blockers.contains(&AlignmentBlocker::Sparse));
+        assert!(plan.aliases().is_empty());
     }
 
     #[test]
