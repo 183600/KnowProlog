@@ -775,6 +775,8 @@
             if key.is_empty() {
                 println!("用法：确认锻造 <id>（先用「锻造台账」查看候选 id）。");
             } else {
+                let before_library = pattern_library.clone();
+                let before_forge = pattern_forge.clone();
                 match pattern_forge.activate(key) {
                     Ok(activation) => {
                         let backend_known = pattern_library.entries().iter().any(|entry| {
@@ -786,29 +788,68 @@
                         for entry in &activation.entries {
                             pattern_library.add(entry.clone());
                         }
-                        println!(
-                            "已激活锻造规则 {}「{}」：{} 条展开参与路由（仅本会话来源，可用「退役锻造」撤销）。",
-                            activation.pattern.id,
-                            activation.pattern.name,
-                            activation.entries.len()
+                        let note = format!("确认锻造：{}", activation.pattern.id);
+                        let clock = EvolutionClock::new(
+                            0,
+                            kb_revision,
+                            pattern_evolution
+                                .current()
+                                .map(|generation| generation.generation)
+                                .unwrap_or(0),
+                            pattern_episodes.revision(),
                         );
-                        if !backend_known {
-                            println!(
-                                "  提示：路由「{}」目前没有其它可执行模式。锻造只让这类问法被认出，后端查询仍需在 config.toml 或 PL 规则中提供。",
-                                activation.pattern.query_type
-                            );
-                        }
-                        for entry in &activation.entries {
-                            println!("  - {}（{}）", entry.name, entry.render());
-                        }
-                        match oxigraph_manager
-                            .sync_pattern_ledger(pattern_library.entries())
-                            .await
+                        match commit_pattern_change(
+                            &oxigraph_manager,
+                            &mut pattern_evolution,
+                            &before_library,
+                            &pattern_library,
+                            pattern_episodes.entries(),
+                            &language_config,
+                            clock,
+                            &evolution_path,
+                            &note,
+                        )
+                        .await
                         {
-                            Ok(count) => println!("模式落图：{} 条已同步。", count),
-                            Err(error) => eprintln!("模式落图失败：{}", error),
+                            Ok(receipt) if receipt.verdict.may_commit() => {
+                                println!(
+                                    "已激活锻造规则 {}「{}」：{} 条展开参与路由（仅本会话来源，可用「退役锻造」撤销）。",
+                                    activation.pattern.id,
+                                    activation.pattern.name,
+                                    activation.entries.len()
+                                );
+                                println!(
+                                    "演化闸门：{}（回放 {} 例，回归 {}）。",
+                                    receipt.verdict.label(),
+                                    receipt.replay.cases,
+                                    receipt.replay.regressions
+                                );
+                                if !backend_known {
+                                    println!(
+                                        "  提示：路由「{}」目前没有其它可执行模式。锻造只让这类问法被认出，后端查询仍需在 config.toml 或 PL 规则中提供。",
+                                        activation.pattern.query_type
+                                    );
+                                }
+                                for entry in &activation.entries {
+                                    println!("  - {}（{}）", entry.name, entry.render());
+                                }
+                                persist_pattern_forge(&pattern_forge, &forge_path);
+                            }
+                            Ok(receipt) => {
+                                pattern_library = before_library;
+                                pattern_forge = before_forge;
+                                println!(
+                                    "确认锻造被演化闸门拦截（{}），已恢复原模式库与锻造台账：",
+                                    receipt.verdict.label()
+                                );
+                                println!("{}", receipt.render());
+                            }
+                            Err(error) => {
+                                pattern_library = before_library;
+                                pattern_forge = before_forge;
+                                println!("确认锻造未提交：{}", error);
+                            }
                         }
-                        persist_pattern_forge(&pattern_forge, &forge_path);
                     }
                     Err(error) => println!("确认锻造失败：{}", error),
                 }
