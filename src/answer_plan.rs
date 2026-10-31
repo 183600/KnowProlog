@@ -105,6 +105,66 @@ impl From<&MediaCitation> for PlanMediaCitation {
     }
 }
 
+/// 一条命题的推导依据：规则来源 + 前提事实 + 有界深度与整数置信度。
+///
+/// 与 [`ClaimEvidence`] 的分工：证据回答「依据哪些登记事实」，推导回答
+/// 「这些事实如何由哪条规则推出结论」。直接事实的命题没有推导；推出命题
+/// 同时携带前提证据与推导，表达层才能在详细模式里说清断言与推断的边界。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimJustification {
+    /// 规则来源（教学规则、链接预测规则、本体公理等）。
+    pub rule_source: String,
+    /// 规则体实际使用的前提三元组（已去重、排序）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub premises: Vec<ClaimEvidence>,
+    /// 前向饱和中的推导轮次（直接事实为 0）。
+    pub depth: usize,
+    /// 推导置信度的万分之一整数表示（0..=10000）。
+    pub confidence_bps: u16,
+}
+
+impl ClaimJustification {
+    pub fn new(
+        rule_source: impl Into<String>,
+        mut premises: Vec<ClaimEvidence>,
+        depth: usize,
+        confidence_bps: u16,
+    ) -> Self {
+        premises.sort();
+        premises.dedup();
+        Self {
+            rule_source: rule_source.into(),
+            premises,
+            depth,
+            confidence_bps: confidence_bps.min(10_000),
+        }
+    }
+
+    /// 简短的中文依据说明；前提过多时只展开前三条并给出总数。
+    pub fn render_zh(&self) -> String {
+        const SHOWN: usize = 3;
+        let mut premises = self
+            .premises
+            .iter()
+            .take(SHOWN)
+            .map(ClaimEvidence::render)
+            .collect::<Vec<_>>()
+            .join("；");
+        if self.premises.is_empty() {
+            premises = "无登记前提".to_string();
+        } else if self.premises.len() > SHOWN {
+            let _ = write!(premises, "；等 {} 条", self.premises.len());
+        }
+        format!(
+            "由「{}」推出（第 {} 轮，置信度 {:.2}；前提：{}）",
+            self.rule_source,
+            self.depth,
+            self.confidence_bps as f64 / 10_000.0,
+            premises
+        )
+    }
+}
+
 /// 一条可被表达层选择的命题。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanClaim {
@@ -124,6 +184,9 @@ pub struct PlanClaim {
     /// 该命题依据的事实三元组；空证据跳过序列化，旧计划字节不变。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<ClaimEvidence>,
+    /// 推出命题的规则依据；直接事实缺省，旧计划字节不变。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub justification: Option<ClaimJustification>,
     /// 该命题可引用的媒体锚点；空引用跳过序列化，旧计划字节不变。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<PlanMediaCitation>,
@@ -147,6 +210,7 @@ impl PlanClaim {
             session,
             envelope: None,
             evidence: Vec::new(),
+            justification: None,
             media: Vec::new(),
         }
     }
@@ -163,6 +227,12 @@ impl PlanClaim {
         self
     }
 
+    /// 附加/覆盖命题的推导依据；直接事实不调用，序列化字节保持不变。
+    pub fn with_justification(mut self, justification: ClaimJustification) -> Self {
+        self.justification = Some(justification);
+        self
+    }
+
     /// 附加/覆盖命题可引用的媒体锚点；空引用不会写入序列化。
     pub fn with_media_citations(mut self, media: Vec<PlanMediaCitation>) -> Self {
         self.media = media;
@@ -174,6 +244,14 @@ impl PlanClaim {
             return String::new();
         }
         format!("；依据：{}", self.evidence_digest())
+    }
+
+    /// 详细模式才展开推导；简短模式只保留命题与媒体摘要。
+    fn justification_note(&self, detailed: bool) -> String {
+        match (&self.justification, detailed) {
+            (Some(justification), true) => format!("；推导：{}", justification.render_zh()),
+            _ => String::new(),
+        }
     }
 
     fn media_note(&self, detailed: bool) -> String {
@@ -378,6 +456,22 @@ impl AnswerPlan {
                     item.subject, item.predicate, item.object, item.session
                 );
             }
+            if let Some(justification) = &claim.justification {
+                let _ = write!(
+                    material,
+                    "|j:{}|{}|{}",
+                    justification.rule_source, justification.depth, justification.confidence_bps
+                );
+                let mut premises: Vec<&ClaimEvidence> = justification.premises.iter().collect();
+                premises.sort();
+                for item in premises {
+                    let _ = write!(
+                        material,
+                        "|jp:{}|{}|{}|{}",
+                        item.subject, item.predicate, item.object, item.session
+                    );
+                }
+            }
         }
         fnv1a_hex(material.as_bytes())
     }
@@ -392,7 +486,10 @@ impl AnswerPlan {
     /// 不变量：`surface_units(d).concat()` 与 `realize(d)` 逐字节相等。流式
     /// 输出因此不是第二套生成器，而只是同一份计划的增量呈现；单位索引、
     /// 计划 id 与表达标签共同构成可恢复的事件 id。
-    pub fn surface_units(&self, directive: StyleDirective) -> Result<SurfaceUnits, PlanRenderError> {
+    pub fn surface_units(
+        &self,
+        directive: StyleDirective,
+    ) -> Result<SurfaceUnits, PlanRenderError> {
         if self.claims.is_empty() {
             return Err(PlanRenderError::Empty {
                 subject: self.subject.clone(),
@@ -437,9 +534,10 @@ impl AnswerPlan {
                             claim.predicate,
                             claim.source_label(),
                             format!(
-                                "{}{}{}",
+                                "{}{}{}{}",
                                 claim.envelope_note(),
                                 claim.evidence_note(),
+                                claim.justification_note(true),
                                 claim.media_note(true)
                             )
                         )
@@ -495,9 +593,10 @@ impl AnswerPlan {
                 claim.predicate,
                 claim.source_label(),
                 format!(
-                    "{}{}{}",
+                    "{}{}{}{}",
                     claim.envelope_note(),
                     claim.evidence_note(),
+                    claim.justification_note(true),
                     claim.media_note(true)
                 )
             ),
@@ -1031,9 +1130,7 @@ impl PlanDiff {
                 }
             }
         }
-        output.push_str(
-            "  说明：复核只比较新旧计划，不重新解释问题，也不改写已经说出口的回答。\n",
-        );
+        output.push_str("  说明：复核只比较新旧计划，不重新解释问题，也不改写已经说出口的回答。\n");
         output.trim_end().to_string()
     }
 }
@@ -1583,21 +1680,28 @@ mod tests {
             0,
         );
         let json = serde_json::to_string(&plain).unwrap();
-        assert!(!json.contains("evidence"), "空证据不得增加序列化字节：{}", json);
+        assert!(
+            !json.contains("evidence"),
+            "空证据不得增加序列化字节：{}",
+            json
+        );
 
         let annotated = AnswerPlan::new(
             "q",
             "张三",
             1,
-            vec![PlanClaim::new("s", "p", "命题。", false).with_evidence(vec![
-                ClaimEvidence::new("张三", "师傅", "李四", false),
-            ])],
+            vec![PlanClaim::new("s", "p", "命题。", false)
+                .with_evidence(vec![ClaimEvidence::new("张三", "师傅", "李四", false)])],
             0,
             0,
         );
         assert_ne!(plain.id, annotated.id, "证据属于计划内容，必须进入指纹");
         let detailed = annotated.realize(StyleDirective::Detailed).unwrap();
-        assert!(detailed.contains("依据：图谱 张三 师傅 李四"), "{}", detailed);
+        assert!(
+            detailed.contains("依据：图谱 张三 师傅 李四"),
+            "{}",
+            detailed
+        );
         let brief = annotated.realize(StyleDirective::Brief).unwrap();
         assert!(!brief.contains("依据："), "简短版不展开证据：{}", brief);
 
@@ -1618,9 +1722,8 @@ mod tests {
             "q",
             "张三",
             1,
-            vec![PlanClaim::new("s", "p", "命题。", false).with_evidence(vec![
-                ClaimEvidence::new("张三", "师傅", "李四", false),
-            ])],
+            vec![PlanClaim::new("s", "p", "命题。", false)
+                .with_evidence(vec![ClaimEvidence::new("张三", "师傅", "李四", false)])],
             0,
             0,
         );
@@ -1628,9 +1731,8 @@ mod tests {
             "q",
             "张三",
             2,
-            vec![PlanClaim::new("s", "p", "命题。", false).with_evidence(vec![
-                ClaimEvidence::new("张三", "师傅", "王五", false),
-            ])],
+            vec![PlanClaim::new("s", "p", "命题。", false)
+                .with_evidence(vec![ClaimEvidence::new("张三", "师傅", "王五", false)])],
             0,
             0,
         );
@@ -1664,7 +1766,11 @@ mod tests {
         let text = annotated.realize(StyleDirective::Detailed).unwrap();
         assert!(text.contains("置信区间：63–90%"), "{}", text);
         let brief = annotated.realize(StyleDirective::Brief).unwrap();
-        assert!(!brief.contains("置信区间"), "简短版不展开置信元数据：{}", brief);
+        assert!(
+            !brief.contains("置信区间"),
+            "简短版不展开置信元数据：{}",
+            brief
+        );
 
         let json = serde_json::to_string(&annotated).unwrap();
         let restored: AnswerPlan = serde_json::from_str(&json).unwrap();
@@ -1730,9 +1836,16 @@ mod tests {
             .collect();
         assert_eq!(claims.len(), BRIEF_CLAIM_LIMIT);
         for (position, unit) in claims.iter().enumerate() {
-            assert_eq!(unit.slot.as_deref(), Some(plan.claims[position].slot.as_str()));
+            assert_eq!(
+                unit.slot.as_deref(),
+                Some(plan.claims[position].slot.as_str())
+            );
             assert_eq!(unit.claim_index, Some(position + 1));
-            assert!(!unit.text.contains("谓词："), "简短版不展开元数据：{}", unit.text);
+            assert!(
+                !unit.text.contains("谓词："),
+                "简短版不展开元数据：{}",
+                unit.text
+            );
         }
         assert_eq!(
             brief.iter().next().map(|unit| unit.kind),
@@ -1786,9 +1899,7 @@ mod tests {
     }
 
     fn media_plan_citation(label: &str, confidence: f64) -> PlanMediaCitation {
-        use crate::media_evidence::{
-            AnchorDraft, Locator, MediaLimits, MediaStore, Modality,
-        };
+        use crate::media_evidence::{AnchorDraft, Locator, MediaLimits, MediaStore, Modality};
         let mut store = MediaStore::new(MediaLimits::default());
         let bytes = format!("{}|{}", label, confidence);
         let asset = store
@@ -1819,7 +1930,11 @@ mod tests {
             0,
         );
         let json = serde_json::to_string(&plain).unwrap();
-        assert!(!json.contains("media"), "空媒体引用不得增加序列化字节：{}", json);
+        assert!(
+            !json.contains("media"),
+            "空媒体引用不得增加序列化字节：{}",
+            json
+        );
 
         let citation = media_plan_citation("表 1", 0.92);
         let annotated = AnswerPlan::new(
@@ -1851,7 +1966,11 @@ mod tests {
         assert!(brief.contains("表 2"), "{}", brief);
         assert!(!brief.contains("表 1"), "{}", brief);
         let detailed = plan.realize(StyleDirective::Detailed).unwrap();
-        assert!(detailed.contains("表 1") && detailed.contains("表 2"), "{}", detailed);
+        assert!(
+            detailed.contains("表 1") && detailed.contains("表 2"),
+            "{}",
+            detailed
+        );
 
         let before = AnswerPlan::new(
             "q",
@@ -1876,5 +1995,59 @@ mod tests {
         let rendered = diff.render_zh(false);
         assert!(rendered.contains("媒体：表 1"), "{}", rendered);
         assert!(rendered.contains("表 2"), "{}", rendered);
+    }
+
+    #[test]
+    fn justification_is_optional_serialized_and_visible_only_in_detailed_mode() {
+        let plain = AnswerPlan::new(
+            "q",
+            "张三",
+            1,
+            vec![PlanClaim::new("s", "师傅", "张三的师傅是李四。", false)],
+            0,
+            0,
+        );
+        let plain_json = serde_json::to_string(&plain).unwrap();
+        assert!(
+            !plain_json.contains("justification"),
+            "直接事实不得增加推导字段：{}",
+            plain_json
+        );
+
+        let justification = ClaimJustification::new(
+            "传递规则",
+            vec![
+                ClaimEvidence::new("张三", "师傅", "李四", false),
+                ClaimEvidence::new("李四", "师傅", "王五", false),
+            ],
+            2,
+            8_100,
+        );
+        let derived = AnswerPlan::new(
+            "q",
+            "张三",
+            1,
+            vec![PlanClaim::new("s", "师祖", "张三的师祖是王五。", false)
+                .with_evidence(vec![
+                    ClaimEvidence::new("张三", "师傅", "李四", false),
+                    ClaimEvidence::new("李四", "师傅", "王五", false),
+                ])
+                .with_justification(justification)],
+            0,
+            0,
+        );
+        assert_ne!(plain.id, derived.id, "推导依据必须进入计划指纹");
+        let json = serde_json::to_string(&derived).unwrap();
+        assert!(json.contains("justification"), "{}", json);
+        let detailed = derived.realize(StyleDirective::Detailed).unwrap();
+        assert!(
+            detailed.contains("推导：由「传递规则」推出"),
+            "{}",
+            detailed
+        );
+        assert!(detailed.contains("置信度 0.81"), "{}", detailed);
+        assert!(detailed.contains("第 2 轮"), "{}", detailed);
+        let brief = derived.realize(StyleDirective::Brief).unwrap();
+        assert!(!brief.contains("推导："), "简短模式不应展开推导：{}", brief);
     }
 }
