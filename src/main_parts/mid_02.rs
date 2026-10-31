@@ -583,7 +583,8 @@ fn run_foil(
         .with_options(options)
         .sample(&hypotheses);
 
-    let mut negatives: Vec<LawTriple> = ledger.refutations().cloned().collect();
+    let refuted: BTreeSet<LawTriple> = ledger.refutations().cloned().collect();
+    let mut negatives: Vec<LawTriple> = refuted.iter().cloned().collect();
     negatives.extend(functional_conflict_negatives(&predictor, &ledger));
     let negatives = normalize_negatives(&negatives);
     let functional_set: BTreeSet<String> = ledger.functional_predicates().cloned().collect();
@@ -595,11 +596,12 @@ fn run_foil(
     let refinements: Vec<_> = indices
         .into_iter()
         .map(|index| {
-            refine_rule(
+            refine_rule_with_refutations(
                 &predictor,
                 index,
                 &negatives,
                 &functional_set,
+                &refuted,
                 &RefineOptions::default(),
             )
         })

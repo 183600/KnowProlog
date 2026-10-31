@@ -685,6 +685,17 @@ impl RuleGuard {
         predictor: &LinkPredictor,
         extra_values: &BTreeMap<(String, String), BTreeSet<String>>,
     ) -> bool {
+        self.blocks_with_refutations(triple, predictor, extra_values, &BTreeSet::new())
+    }
+
+    /// 同 [`RuleGuard::blocks`]，但忽略已被显式否认的旧取值。
+    pub fn blocks_with_refutations(
+        &self,
+        triple: &Triple,
+        predictor: &LinkPredictor,
+        extra_values: &BTreeMap<(String, String), BTreeSet<String>>,
+        refuted: &BTreeSet<Triple>,
+    ) -> bool {
         match self {
             RuleGuard::ExclusiveValue { predicate } => {
                 if triple.predicate != *predicate {
@@ -694,6 +705,9 @@ impl RuleGuard {
                 let mut values: BTreeSet<String> = predictor
                     .objects_of(&triple.subject, &triple.predicate)
                     .into_iter()
+                    .filter(|object| {
+                        !refuted.contains(&Triple::new(&triple.subject, &triple.predicate, object))
+                    })
                     .collect();
                 if let Some(extra) = extra_values.get(&key) {
                     values.extend(extra.iter().cloned());
@@ -1002,6 +1016,26 @@ pub fn refine_rule(
     functional: &BTreeSet<String>,
     options: &RefineOptions,
 ) -> RuleRefinement {
+    refine_rule_with_refutations(
+        predictor,
+        rule_index,
+        hard_negatives,
+        functional,
+        &BTreeSet::new(),
+        options,
+    )
+}
+
+/// 同 [`refine_rule`]，但把显式否认的取值从功能互斥证据中剔除：
+/// 被用户否认的旧取值不应再支撑 `ExclusiveValue` 守卫。
+pub fn refine_rule_with_refutations(
+    predictor: &LinkPredictor,
+    rule_index: usize,
+    hard_negatives: &[Triple],
+    functional: &BTreeSet<String>,
+    refuted: &BTreeSet<Triple>,
+    options: &RefineOptions,
+) -> RuleRefinement {
     let Some(rule) = predictor.rules().get(rule_index) else {
         return RuleRefinement {
             rule_index,
@@ -1081,7 +1115,8 @@ pub fn refine_rule(
             &application.triple.subject,
             &application.triple.predicate,
             &application.triple.object,
-        ) {
+        ) && !refuted.contains(&application.triple)
+        {
             extras
                 .entry((
                     application.triple.subject.clone(),
@@ -1118,11 +1153,11 @@ pub fn refine_rule(
         .map(|guard| {
             let blocked_negatives = matched
                 .iter()
-                .filter(|triple| guard.blocks(triple, predictor, &extras))
+                .filter(|triple| guard.blocks_with_refutations(triple, predictor, &extras, refuted))
                 .count();
             let dropped_positives = positives
                 .iter()
-                .filter(|triple| guard.blocks(triple, predictor, &extras))
+                .filter(|triple| guard.blocks_with_refutations(triple, predictor, &extras, refuted))
                 .count();
             GuardEvaluation {
                 guard,
@@ -1151,14 +1186,21 @@ pub fn refine_rule(
         let new_blocks = matched
             .iter()
             .filter(|triple| !blocked.contains(*triple))
-            .filter(|triple| evaluation.guard.blocks(triple, predictor, &extras))
+            .filter(|triple| {
+                evaluation
+                    .guard
+                    .blocks_with_refutations(triple, predictor, &extras, refuted)
+            })
             .count();
         if new_blocks == 0 {
             continue;
         }
         selected.push(evaluation.guard.clone());
         for triple in &matched {
-            if evaluation.guard.blocks(triple, predictor, &extras) {
+            if evaluation
+                .guard
+                .blocks_with_refutations(triple, predictor, &extras, refuted)
+            {
                 blocked.insert(triple.clone());
             }
         }
@@ -1399,9 +1441,9 @@ impl FoilLedger {
             return false;
         };
         let extras = self.value_index();
-        guards
-            .iter()
-            .any(|guard| guard.blocks(&prediction.triple, predictor, &extras))
+        guards.iter().any(|guard| {
+            guard.blocks_with_refutations(&prediction.triple, predictor, &extras, &self.refuted)
+        })
     }
 
     /// 过滤预测：只保留未被显式否认、功能冲突或规则守卫阻断的候选。
@@ -1721,6 +1763,30 @@ mod tests {
             matches!(evaluation.guard, RuleGuard::ExceptSubject { .. })
                 && evaluation.dropped_positives > 0
         }));
+    }
+
+    #[test]
+    fn refuted_old_value_does_not_justify_exclusive_guard() {
+        let predictor = predictor();
+        let negatives = [Triple::new("李四", "师祖", "赵六")];
+        let functional = BTreeSet::from(["师祖".to_string()]);
+        let refuted = BTreeSet::from([Triple::new("李四", "师祖", "王五")]);
+        let refinement = refine_rule_with_refutations(
+            &predictor,
+            5,
+            &negatives,
+            &functional,
+            &refuted,
+            &RefineOptions::default(),
+        );
+        assert!(
+            !refinement
+                .guards
+                .iter()
+                .any(|guard| matches!(guard, RuleGuard::ExclusiveValue { .. })),
+            "被否认的旧取值不应产生功能互斥守卫：{:?}",
+            refinement.guards
+        );
     }
 
     #[test]
