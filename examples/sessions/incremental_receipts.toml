@@ -1,0 +1,25 @@
+name = "增量回执与旧帧标记"
+description = "扫描 → 回合间注入新实体并推进版本 → 旧证据标旧 → 新扫描可见；验证回执在知识变更后的确定性"
+
+[[entities]]
+name = "姚明"
+type = "Person"
+attributes = { "身高" = "226", "国籍" = "中国" }
+
+[[entities]]
+name = "王治郅"
+type = "Person"
+attributes = { "身高" = "214", "国籍" = "中国" }
+
+[[turns]]
+input = "列出所有人的身高"
+expect = { answered = true, plan_contains = ["board:scan"], answer_contains = ["姚明"], answer_excludes = ["易建联"], evidence_contains = ["身高"] }
+
+[[turns]]
+add_entities = [{ name = "易建联", type = "Person", attributes = { "身高" = "213", "国籍" = "中国" } }]
+input = "依据"
+expect = { answered = true, plan_contains = ["board:explain"], answer_contains = ["v1 → v2"], evidence_contains = ["身高"] }
+
+[[turns]]
+input = "列出所有人的身高"
+expect = { answered = true, plan_contains = ["board:scan"], answer_contains = ["易建联"] }
