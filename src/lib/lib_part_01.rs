@@ -399,6 +399,9 @@ pub struct SystemConfig {
     /// 分层追踪图：多轮决策的显式工作记忆（问据栈/指代轨迹/更正失效）
     #[serde(default)]
     pub trace_graph: trace_graph::TraceGraphConfig,
+    /// RDF 生成记忆：把每轮回答投影成可按轮查询/忘记的命名图（默认关闭）。
+    #[serde(default)]
+    pub generation_memory: generation_memory::GenerationMemoryConfig,
     /// 配置编译的绑定帧：模式 -> 槽位 -> 目标 -> 措辞（默认关闭）。
     #[serde(default)]
     pub dialogue_frames: binding_frames::DialogueFramesConfig,

@@ -77,6 +77,28 @@ const P_JSON: &str = "http://example.org/kg/ledger/dialogue/json";
 
 type MemoryResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// RDF 生成记忆配置（默认关闭；开启后每个轮次边界做一次有界投影）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GenerationMemoryConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_memory_turns")]
+    pub max_turns: usize,
+}
+
+fn default_memory_turns() -> usize {
+    DEFAULT_MEMORY_TURNS
+}
+
+impl Default for GenerationMemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_turns: DEFAULT_MEMORY_TURNS,
+        }
+    }
+}
+
 /// 一个轮次及其回答（回答按 seq 升序）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryTurn {
@@ -290,20 +312,16 @@ impl GenerationMemory {
         let mut quads: Vec<Quad> = Vec::new();
         self.add_session_quads(&mut quads)?;
         for stored in self.turns.values() {
-            let graph = GraphName::NamedNode(named_node(&turn_graph_iri(
-                &self.session,
-                stored.turn.seq,
-            ))?);
+            let graph =
+                GraphName::NamedNode(named_node(&turn_graph_iri(&self.session, stored.turn.seq))?);
             add_turn_quads(&mut quads, &graph, &self.session, &stored.turn)?;
             for reply in &stored.replies {
                 add_reply_quads(&mut quads, &graph, &self.session, reply)?;
             }
         }
         for reply in self.unattached_replies.values() {
-            let graph = GraphName::NamedNode(named_node(&reply_graph_iri(
-                &self.session,
-                reply.seq,
-            ))?);
+            let graph =
+                GraphName::NamedNode(named_node(&reply_graph_iri(&self.session, reply.seq))?);
             add_reply_quads(&mut quads, &graph, &self.session, reply)?;
         }
         Ok(normalize_quads(quads))
@@ -395,9 +413,9 @@ impl GenerationMemory {
         let mut turns: BTreeMap<u64, MemoryTurn> = BTreeMap::new();
         let mut replies: BTreeMap<u64, ReplyArtifact> = BTreeMap::new();
         for subject in &turn_subjects {
-            let body = json_by_subject.get(subject).ok_or_else(|| {
-                format!("轮次工件 {} 缺少规范 JSON，拒绝猜测其内容", subject)
-            })?;
+            let body = json_by_subject
+                .get(subject)
+                .ok_or_else(|| format!("轮次工件 {} 缺少规范 JSON，拒绝猜测其内容", subject))?;
             let turn: TurnArtifact = serde_json::from_str(body)
                 .map_err(|error| format!("轮次工件 {} 解码失败：{}", subject, error))?;
             if turn.uri != *subject {
@@ -415,9 +433,9 @@ impl GenerationMemory {
             );
         }
         for subject in &reply_subjects {
-            let body = json_by_subject.get(subject).ok_or_else(|| {
-                format!("回答工件 {} 缺少规范 JSON，拒绝猜测其内容", subject)
-            })?;
+            let body = json_by_subject
+                .get(subject)
+                .ok_or_else(|| format!("回答工件 {} 缺少规范 JSON，拒绝猜测其内容", subject))?;
             let reply: ReplyArtifact = serde_json::from_str(body)
                 .map_err(|error| format!("回答工件 {} 解码失败：{}", subject, error))?;
             if reply.uri != *subject {
@@ -758,13 +776,7 @@ fn add_claim_quads(
     push_node(quads, reply, P_HAS_CLAIM, &subject, graph)?;
     push_node(quads, &subject, P_REPLY, reply, graph)?;
     push_literal(quads, &subject, P_SESSION, session, graph)?;
-    push_literal(
-        quads,
-        &subject,
-        P_INDEX,
-        claim.index.to_string(),
-        graph,
-    )?;
+    push_literal(quads, &subject, P_INDEX, claim.index.to_string(), graph)?;
     push_literal(quads, &subject, P_DIGEST, &claim.digest, graph)?;
     push_literal(quads, &subject, P_TEXT, &claim.text, graph)?;
     push_node(
@@ -851,7 +863,11 @@ mod tests {
             .append_turn_with_refs("他的身高呢", "query", Some("姚明"), 1, &[])
             .unwrap();
         chronicle
-            .append_reply("姚明的身高是 226 厘米。", &["direct_answer".to_string()], &["身高".to_string()])
+            .append_reply(
+                "姚明的身高是 226 厘米。",
+                &["direct_answer".to_string()],
+                &["身高".to_string()],
+            )
             .unwrap();
         let index = DialogueArtifactIndex::from_chronicle(&session, &chronicle);
         (index, session, chronicle)
@@ -912,6 +928,17 @@ mod tests {
         assert_eq!(memory.turns.keys().copied().collect::<Vec<_>>(), vec![3]);
         assert_eq!(memory.reply_count(), 1);
         assert_eq!(memory.recent_turns(0).len(), 1);
+    }
+
+    #[test]
+    fn config_defaults_off_and_parses_explicit_values() {
+        let defaults: GenerationMemoryConfig = toml::from_str("").unwrap();
+        assert!(!defaults.enabled);
+        assert_eq!(defaults.max_turns, DEFAULT_MEMORY_TURNS);
+        let explicit: GenerationMemoryConfig =
+            toml::from_str("enabled = true\nmax_turns = 3").unwrap();
+        assert!(explicit.enabled);
+        assert_eq!(explicit.max_turns, 3);
     }
 
     #[test]

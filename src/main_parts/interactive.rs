@@ -769,6 +769,7 @@ async fn run_interactive_mode(
     let stdin_reader = std::io::stdin();
     let mut event_dialogue: Option<EventDialogue> = None;
     let mut lexical_memory_dirty = false;
+    let mut synced_chronicle_len = 0usize;
     loop {
         if lexical_memory_dirty {
             let memory = symbolic_reasoner.lexical_memory().clone();
@@ -776,6 +777,25 @@ async fn run_interactive_mode(
                 Ok(_) => lexical_memory_dirty = false,
                 Err(error) => {
                     eprintln!("词法记忆检查点落图失败（下次重试）：{}", error);
+                }
+            }
+        }
+        if config.generation_memory.enabled {
+            if let (Some(chronicle), Some(session)) =
+                (chronicle.as_ref(), dialogue_session.as_ref())
+            {
+                if chronicle.len() != synced_chronicle_len {
+                    let memory = generation_memory::GenerationMemory::from_chronicle(
+                        session,
+                        chronicle,
+                        config.generation_memory.max_turns,
+                    );
+                    match oxigraph_manager.sync_generation_memory(&memory).await {
+                        Ok(_) => synced_chronicle_len = chronicle.len(),
+                        Err(error) => {
+                            eprintln!("生成记忆落图失败（下次重试）：{}", error);
+                        }
+                    }
                 }
             }
         }
