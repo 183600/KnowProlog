@@ -2060,6 +2060,9 @@
         Some(Commands::DialogueArtifacts { .. }) => {
             // 已在打开存储前处理；此处仅保持 match 穷尽。
         }
+        Some(Commands::DialogueMemory { .. }) => {
+            // 已在打开存储前处理；此处仅保持 match 穷尽。
+        }
         Some(Commands::Transduce { .. }) => {
             // 已在加载配置后处理；此处仅保持 match 穷尽。
         }

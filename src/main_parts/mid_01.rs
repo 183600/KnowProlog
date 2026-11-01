@@ -413,14 +413,13 @@ fn isolate_dialogue_state_path(path: &mut Option<String>, store_path: &str) {
     );
 }
 
-/// `dialogue-artifacts`：读取编年史并输出稳定工件 URI；不打开知识存储。
-fn run_dialogue_artifacts(
+/// 解析编年史与会话标识路径（交互模式、工件与生成记忆共用同一规则）。
+fn resolve_dialogue_paths(
     config: &know_prolog::SystemConfig,
     store_path: &str,
-    selector: Option<&str>,
     chronicle_override: Option<&str>,
     session_override: Option<&str>,
-) {
+) -> (String, String) {
     let chronicle_path = chronicle_override
         .map(str::to_string)
         .or_else(|| {
@@ -438,6 +437,23 @@ fn run_dialogue_artifacts(
             know_prolog::dialogue_uri::SESSION_FILE_SUFFIX
         )
     });
+    (chronicle_path, session_path)
+}
+
+/// `dialogue-artifacts`：读取编年史并输出稳定工件 URI；不打开知识存储。
+fn run_dialogue_artifacts(
+    config: &know_prolog::SystemConfig,
+    store_path: &str,
+    selector: Option<&str>,
+    chronicle_override: Option<&str>,
+    session_override: Option<&str>,
+) {
+    let (chronicle_path, session_path) = resolve_dialogue_paths(
+        config,
+        store_path,
+        chronicle_override,
+        session_override,
+    );
     let session = match DialogueSession::open_or_create(&session_path) {
         Ok(session) => session,
         Err(error) => {
@@ -459,6 +475,119 @@ fn run_dialogue_artifacts(
     match selector {
         Some(selector) => println!("{}", index.render_selector(selector)),
         None => println!("{}", index.render_report()),
+    }
+}
+
+/// `dialogue-memory`：把编年史投影为按轮隔离的 RDF 生成记忆，或按会话忘记。
+async fn run_dialogue_memory(
+    config: &know_prolog::SystemConfig,
+    store_path: &str,
+    sync: bool,
+    forget: bool,
+    max_turns: usize,
+    json: bool,
+    chronicle_override: Option<&str>,
+    session_override: Option<&str>,
+) {
+    use know_prolog::generation_memory::GenerationMemory;
+    if sync && forget {
+        eprintln!("--sync 与 --forget 不能同时使用。");
+        std::process::exit(1);
+    }
+    let (chronicle_path, session_path) = resolve_dialogue_paths(
+        config,
+        store_path,
+        chronicle_override,
+        session_override,
+    );
+    let manager = match OxigraphManager::new(store_path) {
+        Ok(manager) => manager,
+        Err(error) => {
+            eprintln!("打开知识存储失败（{}）：{}", store_path, error);
+            std::process::exit(1);
+        }
+    };
+    if forget {
+        let session = match DialogueSession::load(&session_path) {
+            Ok(Some(session)) => session,
+            Ok(None) => {
+                println!("会话标识不存在（{}），没有可忘记的生成记忆。", session_path);
+                return;
+            }
+            Err(error) => {
+                eprintln!("会话标识读取失败（{}）：{}", session_path, error);
+                std::process::exit(1);
+            }
+        };
+        match manager.forget_generation_memory(session.id()).await {
+            Ok(removed) if json => println!(
+                "{}",
+                serde_json::json!({
+                    "session": session.uri(),
+                    "removed_graphs": removed,
+                })
+            ),
+            Ok(removed) => println!(
+                "已忘记生成记忆：{} 个命名图（会话 {}）。",
+                removed,
+                session.uri()
+            ),
+            Err(error) => {
+                eprintln!("忘记生成记忆失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    let session = match DialogueSession::open_or_create(&session_path) {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!("对话工件会话标识打开失败（{}）：{}", session_path, error);
+            std::process::exit(1);
+        }
+    };
+    let memory = if sync {
+        let (chronicle, audit) = match Chronicle::open(&chronicle_path, FsyncPolicy::None) {
+            Ok((chronicle, audit)) => (chronicle, audit),
+            Err(error) => {
+                eprintln!("对话编年史打开失败（{}）：{}", chronicle_path, error);
+                std::process::exit(1);
+            }
+        };
+        if !audit.is_clean() {
+            eprintln!("对话编年史{}", audit.verdict());
+        }
+        let memory = GenerationMemory::from_chronicle(&session, &chronicle, max_turns);
+        if let Err(error) = manager.sync_generation_memory(&memory).await {
+            eprintln!("写入生成记忆失败：{}", error);
+            std::process::exit(1);
+        }
+        memory
+    } else {
+        match manager.load_generation_memory(session.id()).await {
+            Ok(memory) => memory,
+            Err(error) => {
+                eprintln!("读取生成记忆失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+    };
+    if json {
+        match serde_json::to_string_pretty(&memory) {
+            Ok(text) => println!("{}", text),
+            Err(error) => {
+                eprintln!("生成记忆序列化失败：{}", error);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        println!("{}", memory.render_report());
+        if !sync && memory.is_empty() {
+            println!(
+                "（RDF 生成记忆为空；使用 --sync 从编年史投影最近 {} 轮。）",
+                max_turns
+            );
+        }
     }
 }
 

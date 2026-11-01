@@ -424,6 +424,28 @@ async fn main() {
         );
         return;
     }
+    if let Some(Commands::DialogueMemory {
+        sync,
+        forget,
+        max_turns,
+        json,
+        chronicle,
+        session,
+    }) = &cli.command
+    {
+        run_dialogue_memory(
+            &config,
+            &store_path,
+            *sync,
+            *forget,
+            *max_turns,
+            *json,
+            chronicle.as_deref(),
+            session.as_deref(),
+        )
+        .await;
+        return;
+    }
     if let Some(Commands::Transduce {
         text,
         echo,

@@ -51,7 +51,7 @@ use know_prolog::{
         functional_conflict_negatives, normalize_negatives, refine_rule_with_refutations,
         FoilLedger, FoilOptions, FoilSampler, RefineOptions,
     },
-    frontier, fulfillment,
+    frontier, fulfillment, generation_memory,
     fusion_arbitration::{arbitrate, ArbitrationInput},
     grammar_extractor::GrammarExtractor,
     graph_identity::{align_ledger, AlignmentOptions},
@@ -1619,6 +1619,30 @@ enum Commands {
     DialogueArtifacts {
         /// URI or selector (上一轮 / 第2点 / 依据 / 实体：姚明); omit to list
         selector: Option<String>,
+        /// Override the chronicle path (defaults to the configured dialogue
+        /// state path or store directory)
+        #[arg(long)]
+        chronicle: Option<String>,
+        /// Override the session identity sidecar (defaults to the chronicle
+        /// path + .session.json)
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Project the dialogue chronicle into per-turn RDF generation-memory
+    /// graphs, recall what the session has already said, or forget it
+    DialogueMemory {
+        /// Rebuild the session memory from the chronicle before printing it
+        #[arg(long)]
+        sync: bool,
+        /// Delete every generation-memory graph for the session
+        #[arg(long)]
+        forget: bool,
+        /// Maximum recent turns to project (0 = all)
+        #[arg(long, default_value_t = generation_memory::DEFAULT_MEMORY_TURNS)]
+        max_turns: usize,
+        /// Print the recalled memory as JSON
+        #[arg(long)]
+        json: bool,
         /// Override the chronicle path (defaults to the configured dialogue
         /// state path or store directory)
         #[arg(long)]
