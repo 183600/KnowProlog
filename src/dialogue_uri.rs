@@ -641,6 +641,16 @@ impl DialogueArtifactIndex {
         self.replies.len()
     }
 
+    /// 全部轮次（按 seq 升序）。
+    pub fn turns(&self) -> impl DoubleEndedIterator<Item = &TurnArtifact> {
+        self.turns.values()
+    }
+
+    /// 全部回答（按 seq 升序）。
+    pub fn replies(&self) -> impl DoubleEndedIterator<Item = &ReplyArtifact> {
+        self.replies.values()
+    }
+
     pub fn claim_count(&self) -> usize {
         self.replies.values().map(|reply| reply.claims.len()).sum()
     }

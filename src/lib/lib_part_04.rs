@@ -332,6 +332,84 @@ impl OxigraphManager {
         ))
     }
 
+    /// 列出某会话的生成记忆命名图（按 IRI 升序，确定性）。
+    fn generation_memory_graphs(
+        store: &Store,
+        prefix: &str,
+    ) -> Result<Vec<NamedNode>, Box<dyn std::error::Error + Send + Sync>> {
+        let mut graphs: Vec<NamedNode> = Vec::new();
+        for graph in store.named_graphs() {
+            if let NamedOrBlankNode::NamedNode(node) = graph? {
+                if node.as_str().starts_with(prefix) {
+                    graphs.push(node);
+                }
+            }
+        }
+        graphs.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        Ok(graphs)
+    }
+
+    /// 同步生成记忆：先清空该会话的全部命名图，再全量写入（幂等；不推进知识版本）。
+    ///
+    /// 生成史是账本而不是知识事实：默认图、Prolog 事实快照与全图扫描都不应看到它。
+    /// 返回写入的四元组数；同一份记忆重复同步得到同一组图与同一批四元组。
+    pub async fn sync_generation_memory(
+        &self,
+        memory: &generation_memory::GenerationMemory,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let quads = memory.to_quads()?;
+        let prefix = generation_memory::session_graph_prefix(&memory.session);
+        let store = self.store.lock().await;
+        for graph in Self::generation_memory_graphs(&store, &prefix)? {
+            store.remove_named_graph(graph.as_ref())?;
+        }
+        for quad in &quads {
+            store.insert(quad)?;
+        }
+        self.perf.bump("generation_memory_sync");
+        Ok(quads.len())
+    }
+
+    /// 读取某会话的生成记忆；图谱不存在时返回空记忆（会话标识保留）。
+    pub async fn load_generation_memory(
+        &self,
+        session: &str,
+    ) -> Result<generation_memory::GenerationMemory, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let prefix = generation_memory::session_graph_prefix(session);
+        let store = self.store.lock().await;
+        let mut quads: Vec<Quad> = Vec::new();
+        for graph in Self::generation_memory_graphs(&store, &prefix)? {
+            let graph_name = GraphName::NamedNode(graph);
+            quads.extend(
+                store
+                    .quads_for_pattern(None, None, None, Some(graph_name.as_ref()))
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        self.perf.bump("generation_memory_load");
+        if quads.is_empty() {
+            return Ok(generation_memory::GenerationMemory::empty(session));
+        }
+        generation_memory::GenerationMemory::from_quads_in_session(session, quads)
+            .map_err(|error| error.into())
+    }
+
+    /// 忘记某会话的全部生成记忆命名图。返回删除的图数量（不触碰知识图）。
+    pub async fn forget_generation_memory(
+        &self,
+        session: &str,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let prefix = generation_memory::session_graph_prefix(session);
+        let store = self.store.lock().await;
+        let graphs = Self::generation_memory_graphs(&store, &prefix)?;
+        for graph in &graphs {
+            store.remove_named_graph(graph.as_ref())?;
+        }
+        self.perf.bump("generation_memory_forget");
+        Ok(graphs.len())
+    }
+
     /// 物化派生账本：清空 `kg:graphs/derived` 后全量重写（幂等；不推进知识版本）。
     ///
     /// 每条派生事实带规则来源、前提、推导轮次、置信度与物化戳
