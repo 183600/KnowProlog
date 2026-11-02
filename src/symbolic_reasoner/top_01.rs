@@ -1330,6 +1330,10 @@ pub struct SymbolicReasoner {
     // 显式持久化的采纳/退役决定；每次重建律典后重新盖到声明/挖掘结果上。
     persisted_laws: Option<LawBook>,
     context: DialogueContext,
+    // 可选的“已说过命题”过滤：由对话循环按已投影的生成记忆设置，默认 None，
+    // 既有生成行为不变。闭包返回 true 表示该命题文本已说过，生成时应跳过，
+    // 实现“生成受约束、不重复陈述”。
+    already_said_check: Option<Box<dyn Fn(&str) -> bool + Send + Sync>>,
     // 生成断言的提交前闸门与生命周期；随对话快照持久化，不写知识图谱。
     claims: crate::claim_lifecycle::ClaimLedger,
     epistemic_turns: EpistemicTurnBook,

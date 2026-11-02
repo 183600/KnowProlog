@@ -159,6 +159,7 @@ impl SymbolicReasoner {
             law_registry: None,
             persisted_laws: None,
             context: DialogueContext::new(5),
+            already_said_check: None,
             claims: crate::claim_lifecycle::ClaimLedger::new(),
             epistemic_turns: EpistemicTurnBook::new(),
             beliefs: BeliefLedger::default(),
@@ -222,6 +223,16 @@ impl SymbolicReasoner {
         };
         reasoner.rebuild_knowledge_caches();
         reasoner
+    }
+
+    /// 设置“已说过命题”过滤闭包。由对话循环按已投影的生成记忆设置；
+    /// `None`（默认）表示不过滤，既有生成行为不变。闭包返回 true 时，
+    /// 生成器在 `generate_about` 中跳过该命题文本，避免重复陈述。
+    pub fn set_already_said_check(
+        &mut self,
+        f: Option<Box<dyn Fn(&str) -> bool + Send + Sync>>,
+    ) {
+        self.already_said_check = f;
     }
 
     /// 从预热基座分叉一个新会话：知识派生状态按值深拷贝，会话态清零。

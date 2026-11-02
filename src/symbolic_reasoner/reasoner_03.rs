@@ -76,11 +76,21 @@ impl SymbolicReasoner {
             canonical
         };
         let overlay = self.generation_overlay();
-        let clauses = self.generator.profile_clauses_with_overlay(
+        let mut clauses = self.generator.profile_clauses_with_overlay(
             &entity,
             GenerationOrder::Relevance,
             &overlay,
         )?;
+        // 按“已说过命题”过滤：只保留本会话生成记忆里尚未陈述过的命题，
+        // 实现生成受约束、不重复陈述；全部已说则不再生成。
+        clauses.retain(|clause| {
+            self.already_said_check
+                .as_ref()
+                .map_or(true, |check| !check(&clause.sentence))
+        });
+        if clauses.is_empty() {
+            return None;
+        }
         let plan = self.build_answer_plan(&format!("介绍：{}", entity), &entity, &clauses);
         let mut cursor = GenerationCursor::new(&entity, GenerationOrder::Relevance);
         let page = self.generator.cursor_page(

@@ -507,6 +507,21 @@
                 Ok(facts) => symbolic_reasoner.observe_facts(&facts),
                 Err(e) => println!("加载知识图谱失败: {}", e),
             }
+            // 接入生成记忆：按已投影的命题集过滤，避免重复陈述已说过的事实。
+            if generation_memory_enabled {
+                if let (Some(chronicle), Some(session)) =
+                    (chronicle.as_ref(), dialogue_session.as_ref())
+                {
+                    let memory = generation_memory::GenerationMemory::from_chronicle(
+                        session,
+                        chronicle,
+                        config.generation_memory.max_turns,
+                    );
+                    symbolic_reasoner.set_already_said_check(Some(Box::new(move |text| {
+                        memory.already_said(text)
+                    })));
+                }
+            }
             match symbolic_reasoner.generate_about(entity) {
                 Some(text) => println!("{}", text),
                 None => println!("知识图谱中没有关于「{}」的可生成事实。", entity),

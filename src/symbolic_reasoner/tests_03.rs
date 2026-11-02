@@ -498,6 +498,39 @@ rules = [
     }
 
     #[test]
+    fn test_generate_about_filters_already_said_claims() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        let first = reasoner.generate_about("张三").expect("首次应能生成介绍段落");
+        assert!(
+            first.contains("张三的师傅是李四。"),
+            "首次生成应包含图谱事实：{}",
+            first
+        );
+        // 标记该命题已说过：再次生成同一实体应跳过它，不重复陈述。
+        reasoner.set_already_said_check(Some(Box::new(|text| text == "张三的师傅是李四。")));
+        let second = reasoner.generate_about("张三");
+        let second = second.expect("仍有未说过的命题，应继续生成");
+        assert!(
+            !second.contains("张三的师傅是李四"),
+            "已说过的命题应被过滤：{}",
+            second
+        );
+    }
+
+    #[test]
+    fn test_generate_about_all_already_said_returns_none() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+        // 把所有张三相关命题都标记为已说过，再生成应返回 None（无新事实可陈述）。
+        reasoner.set_already_said_check(Some(Box::new(|_| true)));
+        assert!(
+            reasoner.generate_about("张三").is_none(),
+            "全部命题已说过时应返回 None"
+        );
+    }
+
+    #[test]
     fn test_generation_audit_drops_unsupported_and_unparsed_sentences() {
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
         reasoner.observe_facts(&master_facts());
