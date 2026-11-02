@@ -2092,6 +2092,7 @@
                 perf_ledger,
                 recovery_mode,
                 trace_mode,
+                generation_memory_enabled,
                 &store_path,
                 &cli.config,
             )

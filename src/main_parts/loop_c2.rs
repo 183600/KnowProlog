@@ -986,7 +986,7 @@
 
         // RDF 生成记忆召回（默认关闭）：启用后，元话语问题先由命名图回答——
         // 跨重启、有界、只读；未开启、非元话语或读图失败时本块整体不生效。
-        if config.generation_memory.enabled {
+        if generation_memory_enabled {
             if let Some(session) = dialogue_session.as_ref() {
                 if let Some(reply) =
                     answer_generation_recall(&config, &oxigraph_manager, session, input).await

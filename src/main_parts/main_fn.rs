@@ -500,6 +500,16 @@ async fn main() {
         Some(value) => parse_trace_mode(value),
         None => config.trace_graph.parse_mode(),
     };
+    // RDF 生成记忆开关：命令行 `--generation-memory` 优先，缺省回落 config.toml 的 [generation_memory]。
+    let generation_memory_enabled = match cli.generation_memory.as_deref() {
+        Some("on" | "true" | "1") => true,
+        Some("off" | "false" | "0") => false,
+        Some(other) => {
+            eprintln!("忽略无效的 --generation-memory 值「{}」，回落 config.toml。", other);
+            config.generation_memory.enabled
+        }
+        None => config.generation_memory.enabled,
+    };
 
     // 模式锻造只读配置与例子：不打开知识存储，适合脚本化预览与回归。
     if let Some(Commands::Forge {

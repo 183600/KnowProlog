@@ -169,6 +169,9 @@ struct Cli {
     /// When omitted, the `[trace_graph] mode` from config.toml is used.
     #[arg(long, global = true)]
     trace: Option<String>,
+    /// RDF 生成记忆开关：on / off。命令行优先，缺省回落 config.toml 的 [generation_memory]。
+    #[arg(long, global = true)]
+    generation_memory: Option<String>,
     #[command(subcommand)]
     command: Option<Commands>,
 }

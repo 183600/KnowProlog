@@ -4,6 +4,7 @@ async fn run_interactive_mode(
     perf_ledger: Arc<PerfLedger>,
     recovery_mode: RecoveryMode,
     trace_mode: TraceMode,
+    generation_memory_enabled: bool,
     store_path: &str,
     config_path: &str,
 ) {
@@ -780,7 +781,7 @@ async fn run_interactive_mode(
                 }
             }
         }
-        if config.generation_memory.enabled {
+        if generation_memory_enabled {
             if let (Some(chronicle), Some(session)) =
                 (chronicle.as_ref(), dialogue_session.as_ref())
             {
