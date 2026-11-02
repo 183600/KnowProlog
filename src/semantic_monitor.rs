@@ -205,11 +205,7 @@ impl SearchFold {
         self.certified_searches += u64::from(receipt.certified_top_k);
         self.budget_exhausted_searches += u64::from(receipt.budget_exhausted);
         self.truncated_searches += u64::from(
-            receipt.budget_exhausted
-                || receipt
-                    .notes
-                    .iter()
-                    .any(|note| note.contains("截断")),
+            receipt.budget_exhausted || receipt.notes.iter().any(|note| note.contains("截断")),
         );
         self.docs = self.docs.max(receipt.docs);
         self.max_returned = self.max_returned.max(returned);
@@ -229,9 +225,8 @@ impl SearchFold {
         self.index_empty_searches += u64::from(receipt.docs == 0);
         self.certified_searches += u64::from(receipt.certified_top_k);
         self.budget_exhausted_searches += u64::from(receipt.budget_exhausted);
-        self.truncated_searches += u64::from(
-            receipt.omitted_by_truncation > 0 || receipt.budget_exhausted,
-        );
+        self.truncated_searches +=
+            u64::from(receipt.omitted_by_truncation > 0 || receipt.budget_exhausted);
         self.docs = self.docs.max(receipt.docs);
         self.query_terms = self.query_terms.max(receipt.query_terms);
         self.max_returned = self.max_returned.max(returned);
@@ -669,7 +664,10 @@ impl SemanticFleetMetrics {
             fleet.sessions += 1;
             fleet.window.merge(&window);
             for alert in &window.alerts {
-                *fleet.alerting_sessions.entry(alert.code.clone()).or_insert(0) += 1;
+                *fleet
+                    .alerting_sessions
+                    .entry(alert.code.clone())
+                    .or_insert(0) += 1;
             }
         }
         fleet
@@ -800,12 +798,7 @@ impl SemanticMonitor {
 
     pub fn advice(&self) -> SearchAdvice {
         let state = self.state.lock();
-        SearchAdvice::from_budget(
-            &BudgetState {
-                level: state.level,
-            },
-            state.mode,
-        )
+        SearchAdvice::from_budget(&BudgetState { level: state.level }, state.mode)
     }
 
     pub fn clear(&self) {
@@ -922,12 +915,7 @@ impl SemanticMonitor {
             score: state.score,
             capacity: self.config.capacity,
         };
-        let advice = SearchAdvice::from_budget(
-            &BudgetState {
-                level: state.level,
-            },
-            mode,
-        );
+        let advice = SearchAdvice::from_budget(&BudgetState { level: state.level }, mode);
         let observation = SemanticObservation {
             sequence: active.sequence,
             question_digest: active.question_digest,
@@ -975,9 +963,7 @@ impl SemanticMonitor {
         if active.search.searches > 0 && active.search.returned == 0 {
             delta -= config.zero_recall_cost;
         }
-        if active.search.searches > 0
-            && active.search.certified_searches < active.search.searches
-        {
+        if active.search.searches > 0 && active.search.certified_searches < active.search.searches {
             delta -= config.uncertified_cost;
         }
         if active.search.budget_exhausted_searches > 0 {
@@ -1081,12 +1067,7 @@ impl SemanticMonitor {
             score: state.score,
             capacity: self.config.capacity,
         };
-        let advice = SearchAdvice::from_budget(
-            &BudgetState {
-                level: state.level,
-            },
-            mode,
-        );
+        let advice = SearchAdvice::from_budget(&BudgetState { level: state.level }, mode);
         let mut metrics = WindowMetrics {
             capacity: self.window,
             observations: total,
@@ -1138,10 +1119,7 @@ fn build_alerts(metrics: &WindowMetrics) -> Vec<Alert> {
                     numerator: metrics.retrieval_recall.numerator,
                     denominator: metrics.retrieval_recall.denominator,
                     bps: Some(bps),
-                    message: format!(
-                        "走检索的轮次里只有 {}‰ 至少命中一条证据。",
-                        bps
-                    ),
+                    message: format!("走检索的轮次里只有 {}‰ 至少命中一条证据。", bps),
                     repair: RepairAction::AcquireFact,
                 });
             }
@@ -1154,10 +1132,7 @@ fn build_alerts(metrics: &WindowMetrics) -> Vec<Alert> {
                     numerator: metrics.zero_recall_searches.numerator,
                     denominator: metrics.zero_recall_searches.denominator,
                     bps: Some(bps),
-                    message: format!(
-                        "最近 {} 次检索里零召回占 {}‰。",
-                        metrics.searches, bps
-                    ),
+                    message: format!("最近 {} 次检索里零召回占 {}‰。", metrics.searches, bps),
                     repair: RepairAction::AcquireFact,
                 });
             }
@@ -1238,7 +1213,10 @@ fn build_alerts(metrics: &WindowMetrics) -> Vec<Alert> {
                     numerator: ratio.numerator,
                     denominator: ratio.denominator,
                     bps: Some(bps),
-                    message: format!("{}：{}/{}（{}‰）。", label, ratio.numerator, ratio.denominator, bps),
+                    message: format!(
+                        "{}：{}/{}（{}‰）。",
+                        label, ratio.numerator, ratio.denominator, bps
+                    ),
                     repair,
                 });
             }
@@ -1278,7 +1256,10 @@ fn build_alerts(metrics: &WindowMetrics) -> Vec<Alert> {
                     numerator: ratio.numerator,
                     denominator: ratio.denominator,
                     bps: Some(bps),
-                    message: format!("{}：{}/{}（{}‰）。", label, ratio.numerator, ratio.denominator, bps),
+                    message: format!(
+                        "{}：{}/{}（{}‰）。",
+                        label, ratio.numerator, ratio.denominator, bps
+                    ),
                     repair,
                 });
             }
@@ -1295,9 +1276,7 @@ fn build_alerts(metrics: &WindowMetrics) -> Vec<Alert> {
                     bps: Some(bps),
                     message: format!(
                         "证据装配为空：{}/{}（{}‰）。",
-                        metrics.assembly_empty.numerator,
-                        metrics.assembly_empty.denominator,
-                        bps
+                        metrics.assembly_empty.numerator, metrics.assembly_empty.denominator, bps
                     ),
                     repair: RepairAction::WidenEvidence,
                 });
@@ -1318,9 +1297,7 @@ mod tests {
     use super::*;
     use crate::dense_retrieval::{RetrievalHit, SearchReceipt};
     use crate::query_planner::QueryPlan;
-    use crate::rewrite_retrieval::{
-        HypothesisAssessment, HypothesisCandidate, HypothesisSource,
-    };
+    use crate::rewrite_retrieval::{HypothesisAssessment, HypothesisCandidate, HypothesisSource};
 
     fn hit(subject: &str) -> RetrievalHit {
         RetrievalHit {
@@ -1480,7 +1457,11 @@ mod tests {
         monitor.finish(TurnOutcome::Deferred);
         let metrics = monitor.snapshot();
         assert_eq!(metrics.observations, 1);
-        assert!(metrics.alerts.is_empty(), "冷启动不应告警：{:?}", metrics.alerts);
+        assert!(
+            metrics.alerts.is_empty(),
+            "冷启动不应告警：{:?}",
+            metrics.alerts
+        );
     }
 
     #[test]

@@ -53,34 +53,70 @@ impl AnswerExpectation {
         if q.is_empty() {
             return Self::Unknown;
         }
-        if ["什么时候", "何时", "哪一年", "哪年", "几月", "几日", "什么时间"]
-            .iter()
-            .any(|cue| q.contains(cue))
+        if [
+            "什么时候",
+            "何时",
+            "哪一年",
+            "哪年",
+            "几月",
+            "几日",
+            "什么时间",
+        ]
+        .iter()
+        .any(|cue| q.contains(cue))
         {
             return Self::Time;
         }
         if [
-            "多少", "多大", "多高", "多重", "多长", "多久", "多远", "几年", "几岁", "几个", "几次",
-            "百分比", "数量",
+            "多少",
+            "多大",
+            "多高",
+            "多重",
+            "多长",
+            "多久",
+            "多远",
+            "几年",
+            "几岁",
+            "几个",
+            "几次",
+            "百分比",
+            "数量",
         ]
         .iter()
         .any(|cue| q.contains(cue))
         {
             return Self::Number;
         }
-        if ["哪里", "哪儿", "何处", "何地", "什么地方", "哪个城市", "哪个国家"]
-            .iter()
-            .any(|cue| q.contains(cue))
+        if [
+            "哪里",
+            "哪儿",
+            "何处",
+            "何地",
+            "什么地方",
+            "哪个城市",
+            "哪个国家",
+        ]
+        .iter()
+        .any(|cue| q.contains(cue))
         {
             return Self::Place;
         }
-        if ["谁", "哪位", "哪个人", "什么人", "人物"].iter().any(|cue| q.contains(cue)) {
+        if ["谁", "哪位", "哪个人", "什么人", "人物"]
+            .iter()
+            .any(|cue| q.contains(cue))
+        {
             return Self::Person;
         }
-        if ["什么关系", "什么联系", "怎样的关系"].iter().any(|cue| q.contains(cue)) {
+        if ["什么关系", "什么联系", "怎样的关系"]
+            .iter()
+            .any(|cue| q.contains(cue))
+        {
             return Self::Predicate;
         }
-        if ["什么", "哪个", "哪项", "哪一个"].iter().any(|cue| q.contains(cue)) {
+        if ["什么", "哪个", "哪项", "哪一个"]
+            .iter()
+            .any(|cue| q.contains(cue))
+        {
             return Self::Entity;
         }
         Self::Unknown
@@ -148,7 +184,11 @@ pub struct EvidenceKey {
 }
 
 impl EvidenceKey {
-    pub fn new(subject: impl Into<String>, predicate: impl Into<String>, object: impl Into<String>) -> Self {
+    pub fn new(
+        subject: impl Into<String>,
+        predicate: impl Into<String>,
+        object: impl Into<String>,
+    ) -> Self {
         Self {
             subject: subject.into(),
             predicate: predicate.into(),
@@ -223,8 +263,8 @@ pub fn is_continuation(question: &str) -> bool {
         return false;
     }
     [
-        "还有", "其他", "别的", "另外", "接着", "继续", "上面", "刚才", "之前", "前面",
-        "同样", "补充", "再说", "再多", "那",
+        "还有", "其他", "别的", "另外", "接着", "继续", "上面", "刚才", "之前", "前面", "同样",
+        "补充", "再说", "再多", "那",
     ]
     .iter()
     .any(|cue| q.contains(cue))
@@ -257,7 +297,10 @@ impl QueryFrame {
         let explicit_anchors = normalized_entities(input.explicit_anchors);
         let mut anchors = explicit_anchors.clone();
         if anchors.is_empty() {
-            anchors = normalized_entities(input.focus.iter().cloned()).into_iter().take(3).collect();
+            anchors = normalized_entities(input.focus.iter().cloned())
+                .into_iter()
+                .take(3)
+                .collect();
             if !anchors.is_empty() {
                 notes.push("问句未出现新实体：以对话焦点作为检索锚点。".to_string());
             }
@@ -632,13 +675,16 @@ fn assemble_internal(
         receipt.contextual_support += usize::from(contextual > 0.001);
         let mut reasons = candidate.reasons;
         reasons.extend(contextual_notes);
-        let mut channels: Vec<String> =
-            candidate.channels.iter().map(|channel| channel.to_string()).collect();
+        let mut channels: Vec<String> = candidate
+            .channels
+            .iter()
+            .map(|channel| channel.to_string())
+            .collect();
         if contextual > 0.001 && !channels.iter().any(|channel| channel == "上下文") {
             channels.push("上下文".to_string());
         }
-        let arbitration_rank = arbitration
-            .map(|report| report.rank_for(&key.subject, &key.predicate, &key.object));
+        let arbitration_rank =
+            arbitration.map(|report| report.rank_for(&key.subject, &key.predicate, &key.object));
         candidates.push(EvidenceItem {
             id: String::new(),
             subject: key.subject,
@@ -692,7 +738,9 @@ fn assemble_internal(
                 receipt,
             };
         }
-        receipt.notes.push("没有通过锚定与硬核查的证据。".to_string());
+        receipt
+            .notes
+            .push("没有通过锚定与硬核查的证据。".to_string());
         return EvidenceAssembly {
             frame: frame.clone(),
             bundle: None,
@@ -746,7 +794,9 @@ fn assemble_internal(
     );
     receipt.selected = ordered.len();
     if frame.notes.is_empty() {
-        receipt.notes.push("已按对话焦点与槽位约束装配证据。".to_string());
+        receipt
+            .notes
+            .push("已按对话焦点与槽位约束装配证据。".to_string());
     } else {
         receipt.notes.extend(frame.notes.clone());
     }
@@ -799,7 +849,10 @@ fn contextual_signal(
         AnswerExpectation::Number | AnswerExpectation::Time => {
             if frame.expectation.value_matches(&key.object) {
                 score += 0.05;
-                notes.push(format!("答案类型：符合「{}」形态", frame.expectation.label()));
+                notes.push(format!(
+                    "答案类型：符合「{}」形态",
+                    frame.expectation.label()
+                ));
             } else {
                 score -= 0.03;
             }
@@ -820,7 +873,10 @@ fn contextual_signal(
                 };
                 if expected {
                     score += 0.05;
-                    notes.push(format!("答案类型：与「{}」类型相容", frame.expectation.label()));
+                    notes.push(format!(
+                        "答案类型：与「{}」类型相容",
+                        frame.expectation.label()
+                    ));
                 } else {
                     score -= 0.05;
                 }
@@ -867,12 +923,7 @@ fn mmr_select(candidates: &[EvidenceItem], max_items: usize, lambda: f64) -> Vec
     let mut selected: Vec<EvidenceItem> = Vec::new();
     while selected.len() < max_items && !pool.is_empty() {
         let mut best_index = pool[0];
-        let mut best_value = mmr_value(
-            &candidates[pool[0]],
-            &selected,
-            max_score,
-            lambda,
-        );
+        let mut best_value = mmr_value(&candidates[pool[0]], &selected, max_score, lambda);
         for &index in pool.iter().skip(1) {
             let value = mmr_value(&candidates[index], &selected, max_score, lambda);
             let prefer = value > best_value + 1e-12
@@ -897,8 +948,7 @@ fn mmr_value(
 ) -> f64 {
     let relevance = match candidate.arbitration {
         Some(rank) => {
-            rank.priority_score() as f64 * 1000.0
-                + (candidate.score / max_score).clamp(0.0, 1.0)
+            rank.priority_score() as f64 * 1000.0 + (candidate.score / max_score).clamp(0.0, 1.0)
         }
         None => candidate.score / max_score,
     };
@@ -956,10 +1006,7 @@ fn find_path_indices(items: &[EvidenceItem], start: &str, goal: &str) -> Option<
     None
 }
 
-fn classify(
-    frame: &QueryFrame,
-    selected: Vec<EvidenceItem>,
-) -> (BundleKind, Vec<EvidenceItem>) {
+fn classify(frame: &QueryFrame, selected: Vec<EvidenceItem>) -> (BundleKind, Vec<EvidenceItem>) {
     let anchors = &frame.anchors;
     if let (Some(start), Some(goal)) = (anchors.first(), anchors.get(1)) {
         if let Some(indices) = find_path_indices(&selected, start, goal) {
@@ -1033,7 +1080,10 @@ fn render_bundle_answer(
         }
         BundleKind::Profile => {
             if let Some(anchor) = anchor {
-                output.push_str(&format!("关于「{}」，证据索引里有这些可核对的事实：\n", anchor));
+                output.push_str(&format!(
+                    "关于「{}」，证据索引里有这些可核对的事实：\n",
+                    anchor
+                ));
             } else {
                 output.push_str("证据索引里有这些可核对的事实：\n");
             }
@@ -1249,7 +1299,10 @@ mod tests {
         );
         let bundle = assembly.bundle.expect("已核查全息候选应可作答");
         assert!(bundle.answer.contains("唐"));
-        assert!(bundle.items[0].channels.iter().any(|channel| channel == "全息"));
+        assert!(bundle.items[0]
+            .channels
+            .iter()
+            .any(|channel| channel == "全息"));
     }
 
     #[test]
@@ -1439,13 +1492,14 @@ mod tests {
         );
     }
 
-    fn arbitration_report(namespaces: &[(&str, TrustLevel)], facts: &[(&str, &str, &str)]) -> ArbitrationReport {
+    fn arbitration_report(
+        namespaces: &[(&str, TrustLevel)],
+        facts: &[(&str, &str, &str)],
+    ) -> ArbitrationReport {
         let catalog = SourceCatalog::from_records(
             &namespaces
                 .iter()
-                .map(|(id, trust)| {
-                    NamespaceRecord::new(id, id, NamespaceKind::Import, *trust)
-                })
+                .map(|(id, trust)| NamespaceRecord::new(id, id, NamespaceKind::Import, *trust))
                 .collect::<Vec<_>>(),
         );
         let assertions = facts
@@ -1499,10 +1553,7 @@ mod tests {
     fn arbitration_exposes_contested_slots_instead_of_picking_one() {
         let frame = frame("李白的年龄是多少", &["李白"], Some("年龄"));
         let report = arbitration_report(
-            &[
-                ("a", TrustLevel::Imported),
-                ("b", TrustLevel::Imported),
-            ],
+            &[("a", TrustLevel::Imported), ("b", TrustLevel::Imported)],
             &[("a", "61岁", "年龄"), ("b", "62岁", "年龄")],
         );
         let assembly = assemble_with_arbitration(

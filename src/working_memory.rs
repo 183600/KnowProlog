@@ -120,10 +120,7 @@ impl AttentionItem {
         }
     }
 
-    pub fn with_entities(
-        mut self,
-        entities: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
+    pub fn with_entities(mut self, entities: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.entities = entities.into_iter().map(Into::into).collect();
         self
     }
@@ -168,7 +165,9 @@ impl AttentionItem {
         self.entities
             .iter()
             .any(|candidate| TextIdentity::new(candidate).same_identity(&needle))
-            || TextIdentity::new(&self.text).identity().contains(needle.identity())
+            || TextIdentity::new(&self.text)
+                .identity()
+                .contains(needle.identity())
     }
 
     fn predicate_matches(&self, predicate: &str) -> bool {
@@ -179,7 +178,9 @@ impl AttentionItem {
         self.predicates
             .iter()
             .any(|candidate| TextIdentity::new(candidate).same_identity(&needle))
-            || TextIdentity::new(&self.text).identity().contains(needle.identity())
+            || TextIdentity::new(&self.text)
+                .identity()
+                .contains(needle.identity())
     }
 }
 
@@ -533,8 +534,7 @@ pub fn select_attention(
         .iter()
         .enumerate()
         .map(|(index, item)| {
-            let (score, mut reasons) =
-                score_item(item, index, max_recency, considered, query);
+            let (score, mut reasons) = score_item(item, index, max_recency, considered, query);
             reasons.sort();
             reasons.dedup();
             (index, score, reasons)
@@ -759,11 +759,19 @@ mod tests {
         let query = AttentionQuery::new().with_focus(["姚\u{200B}明"]);
         let packet = select_attention(&items, &query, AttentionBudget::new(2, 200, 1));
         assert_eq!(packet.items.len(), 2);
-        assert_eq!(packet.items[0].id, "turn:1", "{}", packet.render_receipt(AttentionBudget::new(2, 200, 1)));
+        assert_eq!(
+            packet.items[0].id,
+            "turn:1",
+            "{}",
+            packet.render_receipt(AttentionBudget::new(2, 200, 1))
+        );
         assert!(packet.items[0]
             .reasons
             .contains(&AttentionReason::FocusMatch));
-        assert_eq!(packet.dropped_reason("turn:2"), Some(DropReason::ItemBudget));
+        assert_eq!(
+            packet.dropped_reason("turn:2"),
+            Some(DropReason::ItemBudget)
+        );
     }
 
     #[test]
@@ -782,7 +790,10 @@ mod tests {
         );
         assert_eq!(packet.items.len(), 1);
         assert_eq!(packet.items[0].id, "focus:1");
-        assert_eq!(packet.dropped_reason("turn:1"), Some(DropReason::ItemBudget));
+        assert_eq!(
+            packet.dropped_reason("turn:1"),
+            Some(DropReason::ItemBudget)
+        );
         assert!(!packet.over_budget);
     }
 
@@ -799,7 +810,10 @@ mod tests {
         );
         assert_eq!(packet.items.len(), 1);
         assert_eq!(packet.items[0].id, "turn:2");
-        assert_eq!(packet.dropped_reason("turn:1"), Some(DropReason::CharBudget));
+        assert_eq!(
+            packet.dropped_reason("turn:1"),
+            Some(DropReason::CharBudget)
+        );
         assert!(!packet.over_budget);
         assert_eq!(packet.retained_chars, 1);
     }

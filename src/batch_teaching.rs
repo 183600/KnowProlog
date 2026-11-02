@@ -25,7 +25,16 @@ pub const MAX_EPISODES: usize = 16;
 pub const MAX_ACTIVE_RULES: usize = 16;
 
 const INGEST_PREFIXES: &[&str] = &[
-    "录入：", "录入:", "添加：", "添加:", "新增：", "新增:", "记录：", "记录:", "导入：", "导入:",
+    "录入：",
+    "录入:",
+    "添加：",
+    "添加:",
+    "新增：",
+    "新增:",
+    "记录：",
+    "记录:",
+    "导入：",
+    "导入:",
 ];
 const FUNCTION_POS: &[&str] = &[
     "u", "p", "c", "d", "r", "y", "e", "o", "f", "t", "q", "m", "v", "a", "ad", "an", "vd", "vn",
@@ -584,7 +593,10 @@ pub fn split_sentences(text: &str) -> Vec<String> {
     let mut sentences = Vec::new();
     let mut current = String::new();
     for ch in text.chars() {
-        if matches!(ch, '。' | '！' | '？' | '!' | '?' | ';' | '；' | '\n' | '\r') {
+        if matches!(
+            ch,
+            '。' | '！' | '？' | '!' | '?' | ';' | '；' | '\n' | '\r'
+        ) {
             let sentence = current.trim();
             if !sentence.is_empty() {
                 sentences.push(strip_ingest_prefix(sentence));
@@ -645,7 +657,12 @@ fn resolve_property(
             .properties
             .iter()
             .find(|property| property.name == "name")
-            .or_else(|| entity_type.properties.iter().find(|property| property.required))
+            .or_else(|| {
+                entity_type
+                    .properties
+                    .iter()
+                    .find(|property| property.required)
+            })
             .or_else(|| {
                 entity_type
                     .properties
@@ -1016,7 +1033,9 @@ impl BatchTeachingLedger {
             text.push_str(&format!("\n  {}", rule.render_text().replace('\n', "\n  ")));
         }
         if candidates > 0 {
-            text.push_str("\n候选需显式采纳后才参与抽取（batch-teach --adopt <id> 或「采纳教学 <id>」）。");
+            text.push_str(
+                "\n候选需显式采纳后才参与抽取（batch-teach --adopt <id> 或「采纳教学 <id>」）。",
+            );
         }
         text
     }
@@ -1304,10 +1323,9 @@ process_error = ""
     #[test]
     fn base_rules_covering_all_examples_force_review() {
         let config = Arc::new(
-            toml::from_str::<SystemConfig>(
-                &CONFIG.replace(
-                    "extraction_rules = []\nprolog_rules = []",
-                    r#"prolog_rules = []
+            toml::from_str::<SystemConfig>(&CONFIG.replace(
+                "extraction_rules = []\nprolog_rules = []",
+                r#"prolog_rules = []
 [[extraction_rules]]
 name = "已有年龄规则"
 entity_type = "Person"
@@ -1316,8 +1334,7 @@ priority = 10
 [[extraction_rules.patterns]]
 pos_pattern = ["nr", "u", "n", "v", "m", "q"]
 property_mappings = { name = "pos:nr", age = "pos:m" }"#,
-                ),
-            )
+            ))
             .expect("测试配置应可解析"),
         );
         let teacher = BatchTeacher::new(config);
@@ -1326,7 +1343,10 @@ property_mappings = { name = "pos:nr", age = "pos:m" }"#,
         let episode = teacher.teach(facts, corpus, "", &options(1));
         let rule = &episode.candidates[0];
         assert_eq!(rule.decision, RuleDecision::Review);
-        assert!(rule.reasons.iter().any(|reason| reason.contains("现有抽取规则")));
+        assert!(rule
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("现有抽取规则")));
     }
 
     #[test]

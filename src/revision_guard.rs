@@ -293,9 +293,7 @@ fn op_touches(op: &ChangeOp, conflict: &RevisionConflict) -> bool {
             .atoms
             .iter()
             .any(|candidate| candidate == &atom.display()),
-        ChangeOp::AddRule(clause) | ChangeOp::RemoveRule(clause) => {
-            rule_touches(clause, conflict)
-        }
+        ChangeOp::AddRule(clause) | ChangeOp::RemoveRule(clause) => rule_touches(clause, conflict),
     }
 }
 
@@ -422,7 +420,10 @@ mod tests {
             .expect("无冲突写入应提交");
         assert_eq!(receipt.receipt.applied_ops, 1);
         assert_eq!(guard.revision(), 1);
-        assert!(guard.facts().iter().any(|atom| atom.display() == "师傅(王五, 赵六)"));
+        assert!(guard
+            .facts()
+            .iter()
+            .any(|atom| atom.display() == "师傅(王五, 赵六)"));
 
         guard.undo_last().expect("应能撤销最新回执");
         assert_eq!(guard.revision(), 2, "撤销是一次新的提交");

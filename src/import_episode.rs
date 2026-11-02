@@ -900,10 +900,7 @@ fn parse_ordinal_batch(text: &str) -> Option<usize> {
             continue;
         };
         let rest = rest.trim_start();
-        let digits: String = rest
-            .chars()
-            .take_while(|ch| is_numeral_char(*ch))
-            .collect();
+        let digits: String = rest.chars().take_while(|ch| is_numeral_char(*ch)).collect();
         if !digits.is_empty() {
             return parse_chinese_number(&digits).filter(|seq| *seq > 0);
         }
@@ -914,9 +911,7 @@ fn parse_ordinal_batch(text: &str) -> Option<usize> {
 fn is_compact_batch_boundary(ch: Option<char>) -> bool {
     match ch {
         None => true,
-        Some(ch) => {
-            !ch.is_ascii_alphanumeric() && !matches!(ch, '/' | '\\' | '_' | '-' | '.')
-        }
+        Some(ch) => !ch.is_ascii_alphanumeric() && !matches!(ch, '/' | '\\' | '_' | '-' | '.'),
     }
 }
 

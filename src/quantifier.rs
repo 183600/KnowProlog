@@ -154,9 +154,9 @@ const CARDINAL_EXACT: [&str; 4] = ["恰好", "正好", "刚好", "整整"];
 
 /// 常见分类词。顺序只影响同长度匹配的稳定性，不影响语义。
 pub const CLASSIFIERS: [&str; 39] = [
-    "个", "位", "名", "只", "条", "张", "本", "部", "台", "辆", "头", "匹", "件", "次", "份",
-    "家", "所", "座", "枚", "颗", "支", "首", "篇", "项", "种", "人", "间", "组", "对", "双",
-    "套", "批", "堆", "群", "列", "行", "页", "章", "节",
+    "个", "位", "名", "只", "条", "张", "本", "部", "台", "辆", "头", "匹", "件", "次", "份", "家",
+    "所", "座", "枚", "颗", "支", "首", "篇", "项", "种", "人", "间", "组", "对", "双", "套", "批",
+    "堆", "群", "列", "行", "页", "章", "节",
 ];
 
 /// 分类词选择来源，按可信度从高到低。
@@ -202,12 +202,24 @@ impl ClassifierChoice {
 }
 
 const PERSON_NOUNS: [&str; 20] = [
-    "人物", "学生", "老师", "教授", "医生", "律师", "作家", "经理", "员工", "朋友", "徒弟",
-    "师傅", "孩子", "男孩", "女孩", "演员", "歌手", "官员", "记者", "警察",
+    "人物", "学生", "老师", "教授", "医生", "律师", "作家", "经理", "员工", "朋友", "徒弟", "师傅",
+    "孩子", "男孩", "女孩", "演员", "歌手", "官员", "记者", "警察",
 ];
 const ORGANIZATION_NOUNS: [&str; 14] = [
-    "组织", "公司", "集团", "大学", "学院", "医院", "银行", "博物馆", "图书馆", "研究院",
-    "委员会", "政府", "法院", "机构",
+    "组织",
+    "公司",
+    "集团",
+    "大学",
+    "学院",
+    "医院",
+    "银行",
+    "博物馆",
+    "图书馆",
+    "研究院",
+    "委员会",
+    "政府",
+    "法院",
+    "机构",
 ];
 const ANIMAL_NOUNS: [&str; 7] = ["动物", "鸟", "猫", "狗", "马", "牛", "鱼"];
 const WORK_NOUNS: [&str; 6] = ["作品", "书", "小说", "文章", "论文", "电影"];
@@ -224,8 +236,15 @@ pub fn classifier_for_noun(noun: &str) -> ClassifierChoice {
         return ClassifierChoice::new("位", ClassifierSource::Noun, format!("人物名词「{hit}」"));
     }
     if let Some(hit) = longest_suffix_hit(noun, &ORGANIZATION_NOUNS) {
-        if matches!(hit, "大学" | "学院" | "医院" | "博物馆" | "图书馆" | "研究院") {
-            return ClassifierChoice::new("所", ClassifierSource::Noun, format!("机构名词「{hit}」"));
+        if matches!(
+            hit,
+            "大学" | "学院" | "医院" | "博物馆" | "图书馆" | "研究院"
+        ) {
+            return ClassifierChoice::new(
+                "所",
+                ClassifierSource::Noun,
+                format!("机构名词「{hit}」"),
+            );
         }
         return ClassifierChoice::new("家", ClassifierSource::Noun, format!("组织名词「{hit}」"));
     }
@@ -233,8 +252,16 @@ pub fn classifier_for_noun(noun: &str) -> ClassifierChoice {
         return ClassifierChoice::new("只", ClassifierSource::Noun, format!("动物名词「{hit}」"));
     }
     if let Some(hit) = longest_suffix_hit(noun, &WORK_NOUNS) {
-        let classifier = if matches!(hit, "文章" | "论文") { "篇" } else { "部" };
-        return ClassifierChoice::new(classifier, ClassifierSource::Noun, format!("作品名词「{hit}」"));
+        let classifier = if matches!(hit, "文章" | "论文") {
+            "篇"
+        } else {
+            "部"
+        };
+        return ClassifierChoice::new(
+            classifier,
+            ClassifierSource::Noun,
+            format!("作品名词「{hit}」"),
+        );
     }
     if let Some(hit) = longest_suffix_hit(noun, &VEHICLE_NOUNS) {
         return ClassifierChoice::new("辆", ClassifierSource::Noun, format!("交通工具「{hit}」"));
@@ -267,7 +294,11 @@ pub fn classifier_for_type(etype: &str) -> ClassifierChoice {
     }
     let choice = classifier_for_noun(label);
     if choice.source == ClassifierSource::Noun {
-        ClassifierChoice::new(&choice.classifier, ClassifierSource::Schema, format!("类型「{label}」"))
+        ClassifierChoice::new(
+            &choice.classifier,
+            ClassifierSource::Schema,
+            format!("类型「{label}」"),
+        )
     } else {
         choice
     }
@@ -344,7 +375,10 @@ fn normalize_classifier(text: &str) -> Option<String> {
     if text.is_empty() || text.chars().count() > 3 {
         return None;
     }
-    if text.chars().any(|ch| ch.is_ascii_digit() || ch.is_whitespace()) {
+    if text
+        .chars()
+        .any(|ch| ch.is_ascii_digit() || ch.is_whitespace())
+    {
         return None;
     }
     Some(text.to_string())
@@ -564,7 +598,10 @@ pub fn requested_classifier(question: &str) -> Option<String> {
     }
     // 「人物有多少位」这类量词在句尾：取问号/语气词前的分类词。
     let tail = question.trim_end_matches(|ch: char| {
-        matches!(ch, '？' | '?' | '。' | '！' | '!' | '呢' | '吗' | '啊' | '吧' | ' ' | '的')
+        matches!(
+            ch,
+            '？' | '?' | '。' | '！' | '!' | '呢' | '吗' | '啊' | '吧' | ' ' | '的'
+        )
     });
     CLASSIFIERS
         .iter()
@@ -723,10 +760,7 @@ mod tests {
         let at_least = parse_quantifier("至少三名学生通过了考试").expect("下界");
         assert_eq!(
             at_least.force,
-            QuantifierForce::Cardinal {
-                min: 3,
-                max: None
-            }
+            QuantifierForce::Cardinal { min: 3, max: None }
         );
         assert_eq!(at_least.classifier.as_deref(), Some("名"));
 
@@ -750,11 +784,23 @@ mod tests {
 
     #[test]
     fn requested_classifier_keeps_user_measure_word() {
-        assert_eq!(requested_classifier("一共有多少位人物？"), Some("位".to_string()));
+        assert_eq!(
+            requested_classifier("一共有多少位人物？"),
+            Some("位".to_string())
+        );
         assert_eq!(requested_classifier("人物有多少个"), Some("个".to_string()));
-        assert_eq!(requested_classifier("张三教过多少名学生"), Some("名".to_string()));
-        assert_eq!(requested_classifier("张三教过多少个学生"), Some("个".to_string()));
-        assert_eq!(requested_classifier("张三有几个师傅"), Some("个".to_string()));
+        assert_eq!(
+            requested_classifier("张三教过多少名学生"),
+            Some("名".to_string())
+        );
+        assert_eq!(
+            requested_classifier("张三教过多少个学生"),
+            Some("个".to_string())
+        );
+        assert_eq!(
+            requested_classifier("张三有几个师傅"),
+            Some("个".to_string())
+        );
         assert_eq!(requested_classifier("张三的年龄是多少"), None);
     }
 
@@ -785,10 +831,36 @@ mod tests {
 
     #[test]
     fn chinese_number_generation_roundtrips() {
-        for value in [0_u64, 1, 2, 9, 10, 11, 12, 19, 20, 21, 99, 100, 101, 108, 110, 200,
-            1000, 1001, 1010, 2000, 10_000, 12_000, 20_000, 22_000, 100_000, 1_000_000,
-            100_000_000, 1_000_000_000]
-        {
+        for value in [
+            0_u64,
+            1,
+            2,
+            9,
+            10,
+            11,
+            12,
+            19,
+            20,
+            21,
+            99,
+            100,
+            101,
+            108,
+            110,
+            200,
+            1000,
+            1001,
+            1010,
+            2000,
+            10_000,
+            12_000,
+            20_000,
+            22_000,
+            100_000,
+            1_000_000,
+            100_000_000,
+            1_000_000_000,
+        ] {
             let rendered = format_chinese_number(value);
             assert_eq!(
                 parse_chinese_number_u64(&rendered),

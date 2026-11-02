@@ -343,11 +343,7 @@ impl QualityIndex {
                         entity_type,
                         properties,
                     } => {
-                        add(
-                            name,
-                            "type",
-                            FactRef::type_assertion(name, entity_type),
-                        );
+                        add(name, "type", FactRef::type_assertion(name, entity_type));
                         for (key, value) in properties {
                             add(name, key, FactRef::attribute(name, key, value));
                         }
@@ -1552,9 +1548,10 @@ mod tests {
         worse.summary.witnessed_retraction_cost = 1;
         let verdict = compare_baseline(&baseline, &worse, RATCHET_EPSILON);
         assert!(!verdict.passed);
-        assert!(verdict.deltas.iter().any(|delta| {
-            delta.metric == "witnessed_conflicts" && !delta.passed
-        }));
+        assert!(verdict
+            .deltas
+            .iter()
+            .any(|delta| { delta.metric == "witnessed_conflicts" && !delta.passed }));
 
         // 旧基线 JSON 没有新字段：默认 0，不因反序列化失败而丢失棘轮。
         let old: QualityBaseline = serde_json::from_str(
@@ -1656,12 +1653,8 @@ mod tests {
             &entity_config(),
             Some(&ledger),
         );
-        let index = QualityIndex::from_report_with_provenance(
-            &report,
-            &facts,
-            &registry,
-            Some(&ledger),
-        );
+        let index =
+            QualityIndex::from_report_with_provenance(&report, &facts, &registry, Some(&ledger));
         let warrant = index.warrant_for("张三", Some("师傅")).unwrap();
         assert_eq!(warrant.source_ids.len(), 1);
         let citation = warrant.citation_note();
@@ -1774,13 +1767,10 @@ mod tests {
             after.consistency
         );
         assert!(
-            after
-                .gaps
-                .iter()
-                .any(|gap| gap.contains("已见证冲突")
-                    && gap.contains("李四")
-                    && gap.contains("王五")
-                    && gap.contains("至少删 1 条")),
+            after.gaps.iter().any(|gap| gap.contains("已见证冲突")
+                && gap.contains("李四")
+                && gap.contains("王五")
+                && gap.contains("至少删 1 条")),
             "{:?}",
             after.gaps
         );
@@ -1803,7 +1793,11 @@ mod tests {
         assert_ne!(report.digest, String::new());
         assert_eq!(report.summary.witnessed_conflicts, 1);
         assert_eq!(report.summary.witnessed_retraction_cost, 1);
-        assert!(report.render_text().contains("已见证冲突 1 点"), "{}", report.render_text());
+        assert!(
+            report.render_text().contains("已见证冲突 1 点"),
+            "{}",
+            report.render_text()
+        );
     }
 
     #[test]
@@ -1832,12 +1826,19 @@ mod tests {
             "3 个取值 → 删 2 条 → 一致性触底：{}",
             passport.consistency
         );
-        assert!(passport
-            .gaps
-            .iter()
-            .any(|gap| gap.contains("至少删 2 条")), "{:?}", passport.gaps);
-        assert_eq!(report.summary.witnessed_conflicts, 1, "3 个取值仍只有 1 个冲突点");
-        assert_eq!(report.summary.witnessed_retraction_cost, 2, "修复代价是 2 条");
+        assert!(
+            passport.gaps.iter().any(|gap| gap.contains("至少删 2 条")),
+            "{:?}",
+            passport.gaps
+        );
+        assert_eq!(
+            report.summary.witnessed_conflicts, 1,
+            "3 个取值仍只有 1 个冲突点"
+        );
+        assert_eq!(
+            report.summary.witnessed_retraction_cost, 2,
+            "修复代价是 2 条"
+        );
     }
 
     #[test]

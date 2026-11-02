@@ -31,8 +31,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::answer_plan::AnswerPlan;
 use crate::confidence::{
-    ClaimEnvelope, ConfidenceConfig, DecisionRecord, EnvelopeGrade, EnvelopeVerdict,
-    ENVELOPE_SCALE,
+    ClaimEnvelope, ConfidenceConfig, DecisionRecord, EnvelopeGrade, EnvelopeVerdict, ENVELOPE_SCALE,
 };
 use crate::epistemic_turn::TurnEnvelope;
 use crate::plugin::PluginOutcome;
@@ -359,12 +358,7 @@ impl<T> StageEnvelope<T> {
     }
 
     /// 用点估计构造信封；调用方应只在没有更细证据时使用。
-    pub fn from_point(
-        stage: Stage,
-        module: impl Into<String>,
-        value: T,
-        score: f64,
-    ) -> Self {
+    pub fn from_point(stage: Stage, module: impl Into<String>, value: T, score: f64) -> Self {
         let score = clamp_score(score);
         Self {
             stage,
@@ -385,10 +379,7 @@ impl<T> StageEnvelope<T> {
 
     pub fn with_witness(mut self, witness: Witness) -> Self {
         if self.witnesses.len() < MAX_WITNESSES
-            && !self
-                .witnesses
-                .iter()
-                .any(|existing| existing == &witness)
+            && !self.witnesses.iter().any(|existing| existing == &witness)
         {
             self.witnesses.push(witness);
         }
@@ -397,8 +388,7 @@ impl<T> StageEnvelope<T> {
 
     pub fn with_residual(mut self, residual: impl Into<String>) -> Self {
         let residual = residual.into();
-        self.residual = (!residual.trim().is_empty())
-            .then(|| truncate_chars(residual.trim(), 200));
+        self.residual = (!residual.trim().is_empty()).then(|| truncate_chars(residual.trim(), 200));
         self
     }
 
@@ -1267,11 +1257,7 @@ impl BeliefLedger {
             turn
         );
         for (key, beliefs) in &self.beliefs {
-            out.push_str(&format!(
-                "\n{} 的 {}：",
-                key.subject,
-                key.predicate
-            ));
+            out.push_str(&format!("\n{} 的 {}：", key.subject, key.predicate));
             let mut sorted = beliefs.clone();
             sorted.sort_by(|left, right| {
                 right
@@ -1415,11 +1401,7 @@ impl ClarificationChoice {
     pub fn render_zh(&self) -> String {
         format!(
             "建议澄清「{}」：预期最大后验从 {} 降到 {}，收益 {} 个万分点，提问成本 {}。",
-            self.text,
-            self.prior_max_bps,
-            self.expected_max_bps,
-            self.gain_bps,
-            self.cost_units
+            self.text, self.prior_max_bps, self.expected_max_bps, self.gain_bps, self.cost_units
         )
     }
 }
@@ -1633,21 +1615,17 @@ mod tests {
             vec![("soft_route".to_string(), "pattern_library".to_string())]
         );
         let duplicate = ModuleCard::new("soft_route", Stage::Intent);
-        assert!(catalog.register(duplicate).contains(&"module_duplicate_id".to_string()));
+        assert!(catalog
+            .register(duplicate)
+            .contains(&"module_duplicate_id".to_string()));
     }
 
     #[test]
     fn interval_comparison_is_strict_and_preserves_contested() {
         let low = ClaimEnvelope::new(4_000, 5_000);
         let high = ClaimEnvelope::new(6_000, 7_000);
-        assert_eq!(
-            compare_envelopes(high, low),
-            IntervalRelation::Dominates
-        );
-        assert_eq!(
-            compare_envelopes(low, high),
-            IntervalRelation::Dominated
-        );
+        assert_eq!(compare_envelopes(high, low), IntervalRelation::Dominates);
+        assert_eq!(compare_envelopes(low, high), IntervalRelation::Dominated);
         assert_eq!(
             compare_envelopes(ClaimEnvelope::new(5_000, 7_000), high),
             IntervalRelation::Contested
@@ -1670,10 +1648,7 @@ mod tests {
         ]);
         assert!(contested.winner.is_none());
         assert_eq!(contested.relation, IntervalRelation::Contested);
-        assert_eq!(
-            contested.envelope,
-            Some(ClaimEnvelope::new(5_000, 9_000))
-        );
+        assert_eq!(contested.envelope, Some(ClaimEnvelope::new(5_000, 9_000)));
         assert_eq!(contested.contenders.len(), 2);
     }
 
@@ -1701,16 +1676,13 @@ mod tests {
             0.85,
             ClaimEnvelope::new(8_000, 9_000),
         ));
-        assert!(!bus.observe_scored(
-            Stage::Rewrite,
-            "plugin",
-            "",
-            0.7,
-            ClaimEnvelope::point(0.7),
-        ));
+        assert!(!bus.observe_scored(Stage::Rewrite, "plugin", "", 0.7, ClaimEnvelope::point(0.7),));
         let decision = bus.decide(&test_config());
         assert_eq!(decision.readings.len(), 3);
-        assert_eq!(decision.record.confidence, decision.record.fused.probability);
+        assert_eq!(
+            decision.record.confidence,
+            decision.record.fused.probability
+        );
         assert_eq!(
             decision
                 .record
@@ -1726,11 +1698,7 @@ mod tests {
     #[test]
     fn bus_records_failures_without_turning_them_into_zero_evidence() {
         let mut bus = EvidenceBus::new(0.9);
-        bus.fail(StageFailure::new(
-            Stage::Retrieve,
-            "sparql",
-            "存储读取失败",
-        ));
+        bus.fail(StageFailure::new(Stage::Retrieve, "sparql", "存储读取失败"));
         let decision = bus.decide(&test_config());
         assert_eq!(decision.failures.len(), 1);
         assert!(decision
@@ -1746,20 +1714,49 @@ mod tests {
         let direct = ClaimEnvelope::from_grade(EnvelopeGrade::SessionDirect, 0, 0);
         assert!(ledger.observe(
             1,
-            BeliefObservation::new("小明", "年龄", "18", "用户", EnvelopeGrade::SessionDirect, direct),
+            BeliefObservation::new(
+                "小明",
+                "年龄",
+                "18",
+                "用户",
+                EnvelopeGrade::SessionDirect,
+                direct
+            ),
         ));
         assert!(ledger.observe(
             2,
-            BeliefObservation::new("小明", "年龄", "18", "用户", EnvelopeGrade::SessionDirect, direct),
+            BeliefObservation::new(
+                "小明",
+                "年龄",
+                "18",
+                "用户",
+                EnvelopeGrade::SessionDirect,
+                direct
+            ),
         ));
         let beliefs = ledger.slot_beliefs("小明", "年龄");
         assert_eq!(beliefs.len(), 1);
         assert_eq!(beliefs[0].corroborations, 1);
-        assert_eq!(ledger.resolve("小明", "年龄", 2).unwrap().winner.unwrap().value, "18");
+        assert_eq!(
+            ledger
+                .resolve("小明", "年龄", 2)
+                .unwrap()
+                .winner
+                .unwrap()
+                .value,
+            "18"
+        );
 
         assert!(ledger.observe(
             3,
-            BeliefObservation::new("小明", "年龄", "19", "更正", EnvelopeGrade::SessionCorrection, ClaimEnvelope::new(8_000, 9_000)),
+            BeliefObservation::new(
+                "小明",
+                "年龄",
+                "19",
+                "更正",
+                EnvelopeGrade::SessionCorrection,
+                ClaimEnvelope::new(8_000, 9_000)
+            ),
         ));
         let resolution = ledger.resolve("小明", "年龄", 3).unwrap();
         assert!(resolution.winner.is_none(), "{:?}", resolution);
@@ -1810,13 +1807,7 @@ mod tests {
         for (turn, subject) in [(1, "甲"), (2, "乙"), (3, "丙")] {
             ledger.observe(
                 turn,
-                BeliefObservation::from_grade(
-                    subject,
-                    "属性",
-                    "值",
-                    "测试",
-                    EnvelopeGrade::Graph,
-                ),
+                BeliefObservation::from_grade(subject, "属性", "值", "测试", EnvelopeGrade::Graph),
             );
         }
         assert_eq!(ledger.len(), 2);
@@ -1847,7 +1838,11 @@ mod tests {
         ];
         assert!(plan_clarification(
             &candidates,
-            &[ClarificationQuestion::new("all", "是 A 或 B 吗？", ["a", "b"])]
+            &[ClarificationQuestion::new(
+                "all",
+                "是 A 或 B 吗？",
+                ["a", "b"]
+            )]
         )
         .is_none());
         assert!(plan_clarification(&candidates[..1], &[]).is_none());
@@ -1878,12 +1873,7 @@ mod tests {
 
     #[test]
     fn witness_list_is_bounded_and_deduplicated() {
-        let mut envelope = StageEnvelope::from_point(
-            Stage::Retrieve,
-            "sparql",
-            "value",
-            0.8,
-        );
+        let mut envelope = StageEnvelope::from_point(Stage::Retrieve, "sparql", "value", 0.8);
         for _ in 0..(MAX_WITNESSES + 4) {
             envelope = envelope.with_witness(Witness::new("sparql", "同一见证"));
         }
@@ -1902,7 +1892,13 @@ mod tests {
         let mut ledger = BeliefLedger::new(4);
         ledger.observe(
             1,
-            BeliefObservation::from_grade("小明", "年龄", "18", "用户", EnvelopeGrade::SessionDirect),
+            BeliefObservation::from_grade(
+                "小明",
+                "年龄",
+                "18",
+                "用户",
+                EnvelopeGrade::SessionDirect,
+            ),
         );
         let encoded = serde_json::to_string(&ledger).unwrap();
         let decoded: BeliefLedger = serde_json::from_str(&encoded).unwrap();

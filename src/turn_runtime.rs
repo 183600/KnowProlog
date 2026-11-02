@@ -163,9 +163,7 @@ impl TurnFaultKind {
             TurnFaultKind::Prolog => {
                 "我的推理引擎出错了（已记录）；这不是图谱里没有记录，请稍后重试。"
             }
-            TurnFaultKind::Panic => {
-                "我这边推理时崩溃了（已记录）；会话仍然可用，可以继续这一问。"
-            }
+            TurnFaultKind::Panic => "我这边推理时崩溃了（已记录）；会话仍然可用，可以继续这一问。",
             TurnFaultKind::Snapshot => {
                 "我无法安全保存这一轮的状态（已记录）；为避免半状态污染，本轮没有提交。"
             }
@@ -187,7 +185,12 @@ pub struct TurnFault {
 }
 
 impl TurnFault {
-    pub fn new(kind: TurnFaultKind, phase: TurnPhase, detail: impl Into<String>, elapsed_ms: u64) -> Self {
+    pub fn new(
+        kind: TurnFaultKind,
+        phase: TurnPhase,
+        detail: impl Into<String>,
+        elapsed_ms: u64,
+    ) -> Self {
         Self {
             kind,
             phase,
@@ -228,7 +231,12 @@ impl TurnFault {
         if self.detail.is_empty() {
             self.kind.statement().to_string()
         } else {
-            format!("{}（{}：{}）", self.kind.statement(), self.phase.label(), self.detail)
+            format!(
+                "{}（{}：{}）",
+                self.kind.statement(),
+                self.phase.label(),
+                self.detail
+            )
         }
     }
 }
@@ -290,7 +298,8 @@ impl TurnBudget {
     }
 
     pub fn wall_ms(&self) -> Option<u64> {
-        self.wall.map(|wall| wall.as_millis().min(u64::MAX as u128) as u64)
+        self.wall
+            .map(|wall| wall.as_millis().min(u64::MAX as u128) as u64)
     }
 }
 
@@ -620,11 +629,8 @@ mod tests {
         let started = Instant::now()
             .checked_sub(Duration::from_secs(5))
             .expect("测试起点");
-        let mut control = TurnControl::starting_at(
-            1,
-            TurnBudget::enforced(Duration::from_millis(10)),
-            started,
-        );
+        let mut control =
+            TurnControl::starting_at(1, TurnBudget::enforced(Duration::from_millis(10)), started);
         let fault = control.enter(TurnPhase::Reason).expect_err("应超时");
         assert_eq!(fault.kind, TurnFaultKind::Deadline);
         assert_eq!(fault.phase, TurnPhase::Reason);
@@ -638,11 +644,8 @@ mod tests {
         let started = Instant::now()
             .checked_sub(Duration::from_secs(5))
             .expect("测试起点");
-        let mut control = TurnControl::starting_at(
-            2,
-            TurnBudget::observed(Duration::from_millis(10)),
-            started,
-        );
+        let mut control =
+            TurnControl::starting_at(2, TurnBudget::observed(Duration::from_millis(10)), started);
         control.enter(TurnPhase::Recall).expect("Observe 不中止");
         assert_eq!(control.observed_overrun(), Some(TurnPhase::Recall));
     }

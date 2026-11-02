@@ -147,11 +147,7 @@ impl AttributeProfile {
 
     /// 旧式平面谓词 IRI：`{base}{规范名}`（只读兼容，不切换默认写路径）。
     pub fn legacy_iri(&self) -> String {
-        format!(
-            "{}{}",
-            crate::identity::DEFAULT_BASE_NS,
-            self.canonical
-        )
+        format!("{}{}", crate::identity::DEFAULT_BASE_NS, self.canonical)
     }
 }
 
@@ -373,12 +369,10 @@ impl AttributeRegistry {
             return None;
         }
         // 读兼容：规范属性 IRI 与旧式平面谓词 IRI 都归一到本地名。
-        let local = crate::identity::attribute_local_name(
-            crate::identity::DEFAULT_BASE_NS,
-            surface,
-        )
-        .or_else(|| legacy_predicate_local_name(surface))
-        .unwrap_or_else(|| surface.to_string());
+        let local =
+            crate::identity::attribute_local_name(crate::identity::DEFAULT_BASE_NS, surface)
+                .or_else(|| legacy_predicate_local_name(surface))
+                .unwrap_or_else(|| surface.to_string());
         let key = normalize_key(&local);
         if key.is_empty() {
             return None;
@@ -399,11 +393,8 @@ impl AttributeRegistry {
     ///
     /// 实体路径与外部命名空间一律返回 `None`，避免把实体名误读成属性。
     pub fn resolve_iri(&self, iri: &str) -> Option<&AttributeProfile> {
-        let local = crate::identity::attribute_local_name(
-            crate::identity::DEFAULT_BASE_NS,
-            iri,
-        )
-        .or_else(|| legacy_predicate_local_name(iri))?;
+        let local = crate::identity::attribute_local_name(crate::identity::DEFAULT_BASE_NS, iri)
+            .or_else(|| legacy_predicate_local_name(iri))?;
         self.resolve(&local)
     }
 
@@ -607,7 +598,11 @@ impl AttributeRegistry {
     /// 同一句里的后续属性可以省略主体（「姚明身高226，体重120」）：
     /// 优先使用属性词面左侧最近的姓名 token，找不到时沿用前一条候选的
     /// 主体。值域以下一个属性词面为右边界，避免把「226体重120」粘成一个值。
-    pub fn extract_mentions(&self, text: &str, tagged_words: &[TaggedWord]) -> Vec<AttributeMention> {
+    pub fn extract_mentions(
+        &self,
+        text: &str,
+        tagged_words: &[TaggedWord],
+    ) -> Vec<AttributeMention> {
         if text.trim().is_empty() || self.profiles.is_empty() {
             return Vec::new();
         }
@@ -858,10 +853,7 @@ struct ParsedValue {
     dimension: Option<Dimension>,
 }
 
-fn parse_attribute_value(
-    profile: &AttributeProfile,
-    raw: &str,
-) -> Result<ParsedValue, String> {
+fn parse_attribute_value(profile: &AttributeProfile, raw: &str) -> Result<ParsedValue, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err("属性取值为空".to_string());
@@ -920,10 +912,7 @@ fn parse_attribute_value(
     }
 }
 
-fn parse_quantity_value(
-    profile: &AttributeProfile,
-    raw: &str,
-) -> Result<ParsedValue, String> {
+fn parse_quantity_value(profile: &AttributeProfile, raw: &str) -> Result<ParsedValue, String> {
     let normalized_raw = raw
         .strip_prefix("约为")
         .or_else(|| raw.strip_prefix("约是"))
@@ -1008,11 +997,7 @@ fn extract_subject(
     Some(cleaned)
 }
 
-fn last_name_token(
-    text: &str,
-    alias_start: usize,
-    tagged_words: &[TaggedWord],
-) -> Option<String> {
+fn last_name_token(text: &str, alias_start: usize, tagged_words: &[TaggedWord]) -> Option<String> {
     let mut cursor = 0usize;
     let mut last = None;
     for word in tagged_words {
@@ -1037,10 +1022,26 @@ fn last_name_token(
 }
 
 fn clean_subject(prefix: &str) -> String {
-    let mut subject = prefix.trim().trim_end_matches(['。', '，', ',', '；', ';', '！', '!', '？', '?']);
+    let mut subject = prefix
+        .trim()
+        .trim_end_matches(['。', '，', ',', '；', ';', '！', '!', '？', '?']);
     for directive in [
-        "录入：", "录入:", "添加：", "添加:", "新增：", "新增:", "记录：", "记录:", "导入：",
-        "导入:", "补充：", "补充:", "记住：", "记住:", "告诉", "我说",
+        "录入：",
+        "录入:",
+        "添加：",
+        "添加:",
+        "新增：",
+        "新增:",
+        "记录：",
+        "记录:",
+        "导入：",
+        "导入:",
+        "补充：",
+        "补充:",
+        "记住：",
+        "记住:",
+        "告诉",
+        "我说",
     ] {
         if let Some(rest) = subject.strip_prefix(directive) {
             subject = rest.trim();
@@ -1069,9 +1070,9 @@ fn clean_subject(prefix: &str) -> String {
 }
 
 fn clean_value(suffix: &str) -> Option<String> {
-    let mut value = suffix
-        .trim()
-        .trim_matches(['：', ':', '，', ',', '。', '；', ';', '！', '!', '？', '?', ' ', '\t']);
+    let mut value = suffix.trim().trim_matches([
+        '：', ':', '，', ',', '。', '；', ';', '！', '!', '？', '?', ' ', '\t',
+    ]);
     loop {
         let next = value
             .strip_prefix("是")
@@ -1203,10 +1204,7 @@ mod tests {
     fn attribute_iris_are_stable_and_read_both_new_and_legacy_forms() {
         let registry = AttributeRegistry::from_config(&sample_config());
         let height = registry.profile("height").expect("height 已登记");
-        assert_eq!(
-            height.iri(),
-            "http://example.org/kg/attribute/height"
-        );
+        assert_eq!(height.iri(), "http://example.org/kg/attribute/height");
         assert_eq!(height.legacy_iri(), "http://example.org/kg/height");
         assert_eq!(
             registry.iri_for("身高").as_deref(),
@@ -1238,9 +1236,7 @@ mod tests {
                 .is_none(),
             "实体路径不得被误读成属性"
         );
-        assert!(registry
-            .resolve_iri("http://other.org/kg/height")
-            .is_none());
+        assert!(registry.resolve_iri("http://other.org/kg/height").is_none());
         assert!(registry.iri_for("未登记").is_none());
     }
 
@@ -1253,8 +1249,7 @@ mod tests {
             "http://example.org/kg/height",
             "http://example.org/kg/身高",
         ] {
-            let assessment =
-                registry.assess(&types, &type_set(&["Person"]), attribute, "2.26米");
+            let assessment = registry.assess(&types, &type_set(&["Person"]), attribute, "2.26米");
             assert_eq!(
                 assessment.verdict,
                 AttributeVerdict::Accepted,
@@ -1398,7 +1393,10 @@ patterns = [{ pos_pattern = ["nr"], keyword_patterns = ["公司"], property_mapp
         let registry = AttributeRegistry::from_config(&sample_config());
         let parent_keys = registry.lookup_keys("身高");
         for expected in ["height", "net_height", "身高", "净身高", "身长"] {
-            assert!(parent_keys.iter().any(|key| key == expected), "{parent_keys:?}");
+            assert!(
+                parent_keys.iter().any(|key| key == expected),
+                "{parent_keys:?}"
+            );
         }
         assert_eq!(parent_keys.len(), 5, "{parent_keys:?}");
         assert_eq!(
@@ -1515,7 +1513,10 @@ patterns = [{ pos_pattern = ["nr"], keyword_patterns = ["公司"], property_mapp
             ],
         });
         assert_eq!(registry.len(), 2);
-        assert!(registry.issues().iter().any(|issue| issue.detail.contains("未知单位")));
+        assert!(registry
+            .issues()
+            .iter()
+            .any(|issue| issue.detail.contains("未知单位")));
         assert!(registry
             .issues()
             .iter()
@@ -1735,5 +1736,4 @@ parent = "height"
         assert!(registry.resolve("净身高").is_some());
         assert_eq!(registry.ancestors("净身高"), vec!["height".to_string()]);
     }
-
 }

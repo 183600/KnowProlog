@@ -723,10 +723,8 @@ pub fn diagnose(question: &str, plan: Option<&QueryPlan>) -> Reading {
         return reading;
     }
 
-    if let Some((marker, span)) = find_marker(
-        trimmed,
-        &["吗", "是不是", "有没有", "是否", "吧"],
-    ) {
+    if let Some((marker, span)) = find_marker(trimmed, &["吗", "是不是", "有没有", "是否", "吧"])
+    {
         reading.push(
             Residual::new(
                 ResidualKind::MissingPredicate,
@@ -743,7 +741,9 @@ pub fn diagnose(question: &str, plan: Option<&QueryPlan>) -> Reading {
 
     if let Some((marker, span)) = find_marker(
         trimmed,
-        &["谁", "什么", "哪个", "哪家", "哪里", "多少", "几", "何人", "啥"],
+        &[
+            "谁", "什么", "哪个", "哪家", "哪里", "多少", "几", "何人", "啥",
+        ],
     ) {
         reading.push(
             Residual::new(
@@ -907,7 +907,10 @@ mod tests {
         let reading = diagnose(&long, None);
         assert_eq!(reading.residuals[0].kind, ResidualKind::InputTooLong);
         assert_eq!(reading.residuals[0].repair, RepairKind::ShortenInput);
-        assert_eq!(reading.residuals[0].span, Some(TextSpan::new(0, long.chars().count())));
+        assert_eq!(
+            reading.residuals[0].span,
+            Some(TextSpan::new(0, long.chars().count()))
+        );
     }
 
     #[test]
@@ -931,7 +934,11 @@ mod tests {
         assert_eq!(residual.span, Some(TextSpan::new(0, 2)));
         assert_eq!(residual.surface.as_deref(), Some("体重"));
         assert_eq!(residual.repair, RepairKind::AskClarification);
-        assert!(residual.expected.as_deref().unwrap_or_default().contains("实体"));
+        assert!(residual
+            .expected
+            .as_deref()
+            .unwrap_or_default()
+            .contains("实体"));
     }
 
     #[test]

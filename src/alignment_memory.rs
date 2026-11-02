@@ -606,10 +606,7 @@ impl AlignmentMemory {
     }
 
     pub fn echo_surfaces(&self, canonical: &str) -> &[String] {
-        self.echoes
-            .get(canonical)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+        self.echoes.get(canonical).map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// 单次词面的前向对齐（用于反向生成的复核、纠正与 CLI 查询）。
@@ -632,10 +629,7 @@ impl AlignmentMemory {
         let full_known = resolve(surface);
         let mut best: Option<AlignmentMatch> = None;
         for rule in self.rules.values() {
-            if !rule.is_active_at(turn)
-                || rule.kind != kind
-                || rule.exceptions.contains(surface)
-            {
+            if !rule.is_active_at(turn) || rule.kind != kind || rule.exceptions.contains(surface) {
                 continue;
             }
             let candidate = if rule.matches_literal(surface) {
@@ -780,8 +774,7 @@ impl AlignmentMemory {
         }
         let mut out = Vec::new();
         for ((_, _), mut matches) in by_span {
-            let mut canonicals: Vec<String> =
-                matches.iter().map(|m| m.canonical.clone()).collect();
+            let mut canonicals: Vec<String> = matches.iter().map(|m| m.canonical.clone()).collect();
             canonicals.sort();
             canonicals.dedup();
             if canonicals.len() != 1 {
@@ -805,9 +798,9 @@ impl AlignmentMemory {
         });
         let mut selected: Vec<AlignmentMatch> = Vec::new();
         for candidate in out {
-            let overlaps = selected.iter().any(|kept| {
-                candidate.start < kept.end && kept.start < candidate.end
-            });
+            let overlaps = selected
+                .iter()
+                .any(|kept| candidate.start < kept.end && kept.start < candidate.end);
             if !overlaps {
                 selected.push(candidate);
             }
@@ -870,13 +863,22 @@ impl AlignmentMemory {
             right_specific
                 .cmp(&left_specific)
                 .then_with(|| right_rule.support.cmp(&left_rule.support))
-                .then_with(|| left_surface.chars().count().cmp(&right_surface.chars().count()))
+                .then_with(|| {
+                    left_surface
+                        .chars()
+                        .count()
+                        .cmp(&right_surface.chars().count())
+                })
                 .then_with(|| left_rule.id.cmp(&right_rule.id))
         });
         candidates.into_iter().next().map(|(rule, surface)| {
             (
                 surface,
-                format!("镜像规则：{}（支持 {}）", rule.shape.notation(), rule.support),
+                format!(
+                    "镜像规则：{}（支持 {}）",
+                    rule.shape.notation(),
+                    rule.support
+                ),
             )
         })
     }
@@ -921,7 +923,9 @@ impl AlignmentMemory {
             self.echoes.len()
         );
         if self.rules.is_empty() {
-            output.push_str("暂无对齐规则；用「对齐纠正：用户词面 = 规范身份」或「记住身份」教学。\n");
+            output.push_str(
+                "暂无对齐规则；用「对齐纠正：用户词面 = 规范身份」或「记住身份」教学。\n",
+            );
         } else {
             for rule in self.rules.values() {
                 output.push_str("  ");
@@ -1006,11 +1010,7 @@ impl AlignmentMemory {
 
 fn rule_id(kind: AlignmentKind, shape: &RewriteShape, target: &str) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for part in [
-        format!("{:?}", kind),
-        shape.key(),
-        target.to_string(),
-    ] {
+    for part in [format!("{:?}", kind), shape.key(), target.to_string()] {
         for byte in part.as_bytes() {
             hash ^= u64::from(*byte);
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
@@ -1056,9 +1056,7 @@ fn rule_allows(
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let observed = type_of(canonical);
-    type_allows(expected, observed.as_deref())
-        && expected.is_some()
-        && observed.is_some()
+    type_allows(expected, observed.as_deref()) && expected.is_some() && observed.is_some()
 }
 
 fn better_match(
@@ -1073,8 +1071,7 @@ fn better_match(
         return candidate.literal;
     }
     candidate.support > current.support
-        || (candidate.support == current.support
-            && candidate.rule_id < current.rule_id)
+        || (candidate.support == current.support && candidate.rule_id < current.rule_id)
         || (candidate_rule.id == current.rule_id
             && candidate.support == current.support
             && candidate.canonical < current.canonical)
@@ -1108,9 +1105,7 @@ fn rule_spans(rule: &AlignmentRule, chars: &[char]) -> Vec<(usize, usize)> {
             let needle: Vec<char> = prefix.chars().collect();
             for start in find_all(chars, &needle) {
                 let body_start = start + needle.len();
-                for end in
-                    body_start + 1..=(body_start + MAX_CANONICAL_CHARS).min(chars.len())
-                {
+                for end in body_start + 1..=(body_start + MAX_CANONICAL_CHARS).min(chars.len()) {
                     if end - start <= MAX_SURFACE_CHARS {
                         spans.push((start, end));
                     }
@@ -1207,19 +1202,9 @@ mod tests {
             ("远山科技", "远山科技"),
             ("张三", "张三"),
         ]);
-        let type_of = types(&[
-            ("未名科技", "组织"),
-            ("远山科技", "组织"),
-            ("张三", "人物"),
-        ]);
+        let type_of = types(&[("未名科技", "组织"), ("远山科技", "组织"), ("张三", "人物")]);
         let matched = memory
-            .canonicalize_with(
-                "远山科技公司",
-                AlignmentKind::Entity,
-                1,
-                &resolve,
-                &type_of,
-            )
+            .canonicalize_with("远山科技公司", AlignmentKind::Entity, 1, &resolve, &type_of)
             .expect("形状规则应泛化到未登录词面");
         assert_eq!(matched.canonical, "远山科技");
 
@@ -1250,38 +1235,20 @@ mod tests {
     #[test]
     fn known_full_surface_wins_over_rewrite() {
         let memory = learn_suffix_memory();
-        let resolve = resolver(&[
-            ("未名科技", "未名科技"),
-            ("未名科技公司", "未名科技公司"),
-        ]);
+        let resolve = resolver(&[("未名科技", "未名科技"), ("未名科技公司", "未名科技公司")]);
         let type_of = types(&[("未名科技", "组织"), ("未名科技公司", "组织")]);
         assert!(memory
-            .canonicalize_with(
-                "未名科技公司",
-                AlignmentKind::Entity,
-                1,
-                &resolve,
-                &type_of
-            )
+            .canonicalize_with("未名科技公司", AlignmentKind::Entity, 1, &resolve, &type_of)
             .is_none());
     }
 
     #[test]
     fn ambiguous_anchor_is_refused() {
         let memory = learn_suffix_memory();
-        let resolve = resolver(&[
-            ("远山科技", "远山科技"),
-            ("远山科技", "远山科技集团"),
-        ]);
+        let resolve = resolver(&[("远山科技", "远山科技"), ("远山科技", "远山科技集团")]);
         let type_of = types(&[("远山科技", "组织"), ("远山科技集团", "组织")]);
         assert!(memory
-            .canonicalize_with(
-                "远山科技公司",
-                AlignmentKind::Entity,
-                1,
-                &resolve,
-                &type_of
-            )
+            .canonicalize_with("远山科技公司", AlignmentKind::Entity, 1, &resolve, &type_of)
             .is_none());
     }
 
@@ -1354,23 +1321,11 @@ mod tests {
         let resolve = resolver(&[("未名科技", "未名科技"), ("远山科技", "远山科技")]);
         let type_of = types(&[("未名科技", "组织"), ("远山科技", "组织")]);
         let matched = memory
-            .canonicalize_with(
-                "未名科技公司",
-                AlignmentKind::Entity,
-                1,
-                &resolve,
-                &type_of,
-            )
+            .canonicalize_with("未名科技公司", AlignmentKind::Entity, 1, &resolve, &type_of)
             .unwrap();
         assert!(memory.refute_rule(1, &matched.rule_id, "未名科技公司"));
         assert!(memory
-            .canonicalize_with(
-                "未名科技公司",
-                AlignmentKind::Entity,
-                1,
-                &resolve,
-                &type_of
-            )
+            .canonicalize_with("未名科技公司", AlignmentKind::Entity, 1, &resolve, &type_of)
             .is_none());
         let again = memory.learn_pair(
             1,
@@ -1383,13 +1338,7 @@ mod tests {
         );
         assert!(matches!(again, LearnOutcome::Refuted { .. }));
         assert!(memory
-            .canonicalize_with(
-                "未名科技公司",
-                AlignmentKind::Entity,
-                1,
-                &resolve,
-                &type_of
-            )
+            .canonicalize_with("未名科技公司", AlignmentKind::Entity, 1, &resolve, &type_of)
             .is_none());
     }
 
@@ -1507,7 +1456,8 @@ mod tests {
     #[test]
     fn eviction_keeps_high_support_active_rules() {
         let mut memory = AlignmentMemory::new(2);
-        for (surface, canonical) in [("未名科技公司", "未名科技"), ("远山科技公司", "远山科技")] {
+        for (surface, canonical) in [("未名科技公司", "未名科技"), ("远山科技公司", "远山科技")]
+        {
             memory.learn_pair(
                 1,
                 surface,
@@ -1566,16 +1516,8 @@ mod tests {
             "书名号",
             AlignmentScope::Session,
         );
-        let resolve = resolver(&[
-            ("张三", "张三"),
-            ("李四", "李四"),
-            ("三体", "三体"),
-        ]);
-        let type_of = types(&[
-            ("张三", "人物"),
-            ("李四", "人物"),
-            ("三体", "作品"),
-        ]);
+        let resolve = resolver(&[("张三", "张三"), ("李四", "李四"), ("三体", "三体")]);
+        let type_of = types(&[("张三", "人物"), ("李四", "人物"), ("三体", "作品")]);
         let mentions = memory.mention_spans_with(
             "张三先生和李四先生都读过《三体》",
             AlignmentKind::Entity,

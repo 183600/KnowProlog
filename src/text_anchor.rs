@@ -249,15 +249,14 @@ impl<'a> TextProjection<'a> {
         let mut omitted_edits = 0usize;
         let mut pending_space: Option<CharSpan> = None;
 
-        let emit_edit = |edit: NormalizationEdit,
-                             edits: &mut Vec<NormalizationEdit>,
-                             omitted: &mut usize| {
-            if edits.len() < MAX_AUDIT_EDITS {
-                edits.push(edit);
-            } else {
-                *omitted += 1;
-            }
-        };
+        let emit_edit =
+            |edit: NormalizationEdit, edits: &mut Vec<NormalizationEdit>, omitted: &mut usize| {
+                if edits.len() < MAX_AUDIT_EDITS {
+                    edits.push(edit);
+                } else {
+                    *omitted += 1;
+                }
+            };
 
         for (index, ch) in raw.chars().enumerate() {
             if options.strip_invisible && is_invisible(ch) {
@@ -440,11 +439,7 @@ impl<'a> TextProjection<'a> {
         self.raw_chars_to_surface_chars(point)
     }
 
-    fn build_anchor(
-        &self,
-        surface: CharSpan,
-        raw: CharSpan,
-    ) -> Result<AnchoredSpan, AnchorError> {
+    fn build_anchor(&self, surface: CharSpan, raw: CharSpan) -> Result<AnchoredSpan, AnchorError> {
         let normalized = self.chars_to_bytes(&self.normalized_char_bytes, surface)?;
         let raw_bytes = self.chars_to_bytes(&self.raw_char_bytes, raw)?;
         Ok(AnchoredSpan {
@@ -481,12 +476,10 @@ impl<'a> TextProjection<'a> {
                 len,
             });
         }
-        let start = position_at(starts, span.start).ok_or(AnchorError::NotCharBoundary {
-            offset: span.start,
-        })?;
-        let end = position_at(starts, span.end).ok_or(AnchorError::NotCharBoundary {
-            offset: span.end,
-        })?;
+        let start = position_at(starts, span.start)
+            .ok_or(AnchorError::NotCharBoundary { offset: span.start })?;
+        let end = position_at(starts, span.end)
+            .ok_or(AnchorError::NotCharBoundary { offset: span.end })?;
         Ok(CharSpan::new(start, end))
     }
 
@@ -571,7 +564,11 @@ fn push_char(
 ) {
     let normalized_span = CharSpan::new(sources.len(), sources.len() + 1);
     if let Some(kind) = edit {
-        let replacement = if kind == EditKind::Whitespace { Some(' ') } else { Some(ch) };
+        let replacement = if kind == EditKind::Whitespace {
+            Some(' ')
+        } else {
+            Some(ch)
+        };
         let edit = NormalizationEdit {
             kind,
             raw,
@@ -624,7 +621,10 @@ mod tests {
         assert_eq!(anchor.raw, ByteSpan::new(9, 15));
         assert_eq!(anchor.raw_chars, CharSpan::new(3, 5));
         assert_eq!(anchor.normalized, ByteSpan::new(7, 13));
-        assert_eq!(anchor.normalized_text(projection.normalized()), Some("身高"));
+        assert_eq!(
+            anchor.normalized_text(projection.normalized()),
+            Some("身高")
+        );
     }
 
     #[test]
@@ -675,7 +675,15 @@ mod tests {
             .expect("应能投影");
         assert_eq!(anchor.raw_text(raw), Some("张三"));
         assert_eq!(anchor.raw, ByteSpan::new(2, 8));
-        assert_eq!(projection.receipt().edits.iter().filter(|e| e.kind == EditKind::Trim).count(), 2);
+        assert_eq!(
+            projection
+                .receipt()
+                .edits
+                .iter()
+                .filter(|e| e.kind == EditKind::Trim)
+                .count(),
+            2
+        );
     }
 
     #[test]

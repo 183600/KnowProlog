@@ -425,8 +425,7 @@ impl PrologEngine {
     }
 
     fn count_facts(facts: &[PrologFact]) -> HashMap<String, (PrologFact, usize)> {
-        let mut counts: HashMap<String, (PrologFact, usize)> =
-            HashMap::with_capacity(facts.len());
+        let mut counts: HashMap<String, (PrologFact, usize)> = HashMap::with_capacity(facts.len());
         for fact in facts {
             let entry = counts
                 .entry(Self::fact_key(fact))
@@ -660,10 +659,7 @@ impl PrologEngine {
     ///
     /// 这是给「同一轮必须区分查无与引擎故障」的调用方准备的；[`Self::query`]
     /// 保留为兼容视图（故障信息仍可在 [`Self::last_fault`] 取走）。
-    pub fn query_checked(
-        &mut self,
-        query: &str,
-    ) -> Result<Vec<HashMap<String, String>>, String> {
+    pub fn query_checked(&mut self, query: &str) -> Result<Vec<HashMap<String, String>>, String> {
         match self.query_outcome(query) {
             QueryOutcome::Solutions(solutions) => Ok(render_binding_rows(solutions)),
             QueryOutcome::NoSolution => Ok(Vec::new()),
@@ -1245,11 +1241,13 @@ mod tests {
         engine
             .load_facts_checked(vec![edge.clone(), edge.clone()])
             .unwrap();
-        let count = engine.query("findall(To, oxigraph_relation('A', knows, To), Toes), length(Toes, N)");
+        let count =
+            engine.query("findall(To, oxigraph_relation('A', knows, To), Toes), length(Toes, N)");
         assert_eq!(count[0].get("N").map(String::as_str), Some("2"));
 
         engine.load_facts_checked(vec![edge]).unwrap();
-        let count = engine.query("findall(To, oxigraph_relation('A', knows, To), Toes), length(Toes, N)");
+        let count =
+            engine.query("findall(To, oxigraph_relation('A', knows, To), Toes), length(Toes, N)");
         assert_eq!(
             count[0].get("N").map(String::as_str),
             Some("1"),

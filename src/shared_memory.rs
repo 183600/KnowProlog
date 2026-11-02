@@ -379,11 +379,7 @@ impl SharedState {
                         (key.clone(), index, claim.revision, claim.id.clone())
                     })
                 })
-                .min_by(|left, right| {
-                    left.2
-                        .cmp(&right.2)
-                        .then_with(|| left.3.cmp(&right.3))
-                });
+                .min_by(|left, right| left.2.cmp(&right.2).then_with(|| left.3.cmp(&right.3)));
             let Some((key, index, _, _)) = oldest else {
                 break;
             };
@@ -601,12 +597,7 @@ impl SharedMemoryBoard {
         state.revision = state.revision.saturating_add(1);
         let revision = state.revision;
         let claim = SharedClaim {
-            id: claim_id(
-                &claim.scope,
-                &subject_key,
-                &predicate_key,
-                &value_key,
-            ),
+            id: claim_id(&claim.scope, &subject_key, &predicate_key, &value_key),
             scope: claim.scope.clone(),
             subject: subject_display,
             subject_key,
@@ -625,16 +616,21 @@ impl SharedMemoryBoard {
         state.total = state.total.saturating_add(1);
         let evicted = state.evict_overflow();
         let conflict = state.entries.get(&entry_key).and_then(|claims| {
-            (claims.iter().map(|item| item.value_key.as_str()).collect::<std::collections::BTreeSet<_>>().len() > 1)
-                .then(|| {
-                    certificate_for(
-                        &claim.scope,
-                        &claim.subject_key,
-                        &claim.predicate_key,
-                        claims,
-                        state.revision,
-                    )
-                })
+            (claims
+                .iter()
+                .map(|item| item.value_key.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                > 1)
+            .then(|| {
+                certificate_for(
+                    &claim.scope,
+                    &claim.subject_key,
+                    &claim.predicate_key,
+                    claims,
+                    state.revision,
+                )
+            })
         });
         let outcome = PublishOutcome::Published {
             claim,
@@ -658,8 +654,7 @@ impl SharedMemoryBoard {
     /// 管理/诊断视图：包含全部作用域，不用于回答。
     pub fn snapshot_all(&self) -> Arc<SharedMemoryView> {
         let state = self.state.read();
-        let mut claims: Vec<SharedClaim> =
-            state.entries.values().flatten().cloned().collect();
+        let mut claims: Vec<SharedClaim> = state.entries.values().flatten().cloned().collect();
         claims.sort_by(|left, right| {
             left.scope
                 .cmp(&right.scope)
@@ -725,10 +720,7 @@ fn certificate_for(
         .map(|claim| claim.predicate.clone())
         .unwrap_or_default();
     let value_keys: Vec<String> = values.iter().map(|(key, _)| key.clone()).collect();
-    let claim_ids: Vec<String> = values
-        .iter()
-        .map(|(_, claim)| claim.id.clone())
-        .collect();
+    let claim_ids: Vec<String> = values.iter().map(|(_, claim)| claim.id.clone()).collect();
     let value_texts: Vec<String> = values
         .iter()
         .map(|(_, claim)| claim.value.clone())
@@ -740,7 +732,10 @@ fn certificate_for(
         "values": value_keys,
     });
     ConflictCertificate {
-        id: format!("conflict:{}", fnv1a_hex(canonical_json(&id_value).as_bytes())),
+        id: format!(
+            "conflict:{}",
+            fnv1a_hex(canonical_json(&id_value).as_bytes())
+        ),
         scope: scope.clone(),
         subject,
         subject_key: subject_key.to_string(),
@@ -777,7 +772,10 @@ fn collect_conflicts(claims: &[SharedClaim], revision: u64) -> Vec<ConflictCerti
                 &first.scope,
                 &first.subject_key,
                 &first.predicate_key,
-                &group.iter().map(|claim| (*claim).clone()).collect::<Vec<_>>(),
+                &group
+                    .iter()
+                    .map(|claim| (*claim).clone())
+                    .collect::<Vec<_>>(),
                 revision,
             ))
         })
@@ -904,9 +902,7 @@ mod tests {
         let board = SharedMemoryBoard::new(2);
         board.publish(NewClaim::global("甲", "属性", "1")).unwrap();
         board.publish(NewClaim::global("乙", "属性", "2")).unwrap();
-        let third = board
-            .publish(NewClaim::global("丙", "属性", "3"))
-            .unwrap();
+        let third = board.publish(NewClaim::global("丙", "属性", "3")).unwrap();
         match third {
             PublishOutcome::Published { evicted, .. } => assert_eq!(evicted, 1),
             other => panic!("预期新增并淘汰，实际 {:?}", other),
@@ -1137,7 +1133,10 @@ mod tests {
         assert_eq!(board.revision(), revision + 1);
         assert_eq!(board.len(), 2);
         assert!(board.snapshot_for("s-1").values("姚明", "身高").is_empty());
-        assert_eq!(board.snapshot_for("s-2").values("姚明", "身高"), vec!["229cm"]);
+        assert_eq!(
+            board.snapshot_for("s-2").values("姚明", "身高"),
+            vec!["229cm"]
+        );
         assert_eq!(board.snapshot().values("叶莉", "身高"), vec!["190cm"]);
         assert_eq!(board.purge_session("s-1"), 0);
         assert_eq!(board.revision(), revision + 1);

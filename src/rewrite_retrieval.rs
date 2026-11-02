@@ -398,9 +398,7 @@ pub fn plan_entities(plan: &QueryPlan) -> Vec<&str> {
 /// 计划中出现的谓词词面（用于上下文连续性先验）。
 pub fn plan_predicates(plan: &QueryPlan) -> Vec<&str> {
     match plan {
-        QueryPlan::FindObject { segments } => {
-            segments.iter().skip(1).map(String::as_str).collect()
-        }
+        QueryPlan::FindObject { segments } => segments.iter().skip(1).map(String::as_str).collect(),
         QueryPlan::FindSubject { predicate, .. }
         | QueryPlan::FindObjectByPredicate { predicate, .. }
         | QueryPlan::FindObjectExcept { predicate, .. }
@@ -952,7 +950,10 @@ where
         + config.consistency_gain * (consistency - config.consistency_pivot);
     let confidence = sigmoid(log_odds);
     if context_bonus.abs() > f64::EPSILON {
-        notes.push(format!("上下文先验 {:+.2} 已计入 log-odds。", context_bonus));
+        notes.push(format!(
+            "上下文先验 {:+.2} 已计入 log-odds。",
+            context_bonus
+        ));
     }
     if answers.len() > 1 {
         notes.push(format!(
@@ -995,7 +996,13 @@ pub fn assess<F>(
 where
     F: FnMut(&str, usize, &SearchConstraints) -> EvidenceSearch,
 {
-    assess_with_schema(question, candidates, config, &CanonicalSchema::new(), search)
+    assess_with_schema(
+        question,
+        candidates,
+        config,
+        &CanonicalSchema::new(),
+        search,
+    )
 }
 
 /// 与 [`assess`] 相同，但用调用方已声明的律归一候选身份。
@@ -1156,9 +1163,7 @@ impl EvalCase {
         if line.is_empty() || line.starts_with('#') {
             return None;
         }
-        let (question, expected) = line
-            .split_once('\t')
-            .or_else(|| line.split_once("=>"))?;
+        let (question, expected) = line.split_once('\t').or_else(|| line.split_once("=>"))?;
         let question = question.trim();
         let expected = expected.trim();
         if question.is_empty() || expected.is_empty() {
@@ -1175,9 +1180,7 @@ impl EvalCase {
         self.expected.split('|').any(|expected| {
             let expected = expected.trim();
             !expected.is_empty()
-                && (answer == expected
-                    || answer.contains(expected)
-                    || expected.contains(answer))
+                && (answer == expected || answer.contains(expected) || expected.contains(answer))
         })
     }
 }
@@ -1500,10 +1503,13 @@ mod tests {
         let merged = normalise_candidates_with_schema(vec![alias, canonical], &schema);
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].source, HypothesisSource::ExactPlan);
-        assert_eq!(merged[0].plan, QueryPlan::FindObjectByPredicate {
-            subject: "张三".to_string(),
-            predicate: "师傅".to_string(),
-        });
+        assert_eq!(
+            merged[0].plan,
+            QueryPlan::FindObjectByPredicate {
+                subject: "张三".to_string(),
+                predicate: "师傅".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -1532,9 +1538,8 @@ mod tests {
 
     #[test]
     fn corpus_parsing_skips_comments_and_malformed_lines() {
-        let cases = parse_corpus(
-            "# 注释\n张三的师傅是谁\t李四\n\n谁的师傅是李四 => 张三\n没有分隔符\n",
-        );
+        let cases =
+            parse_corpus("# 注释\n张三的师傅是谁\t李四\n\n谁的师傅是李四 => 张三\n没有分隔符\n");
         assert_eq!(cases.len(), 2);
         assert_eq!(cases[0].question, "张三的师傅是谁");
         assert_eq!(cases[1].expected, "张三");

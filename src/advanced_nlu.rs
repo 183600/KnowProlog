@@ -540,10 +540,9 @@ impl AdvancedNLU {
         // 实体抽取（正则给出的是归一化串的字节区间）
         let mut entities = self.extract_entities(normalized_query).await?;
         for entity in &mut entities {
-            if let Ok(anchor) = projection.surface_bytes_to_raw(ByteSpan::new(
-                entity.start_pos,
-                entity.end_pos,
-            )) {
+            if let Ok(anchor) =
+                projection.surface_bytes_to_raw(ByteSpan::new(entity.start_pos, entity.end_pos))
+            {
                 entity.start_pos = anchor.raw.start;
                 entity.end_pos = anchor.raw.end;
             }
@@ -599,10 +598,7 @@ impl AdvancedNLU {
                 let weighted_confidence =
                     max_pattern_confidence * (pattern_info.priority as f64 / 20.0);
 
-                prefer_intent_candidate(
-                    &mut best,
-                    (intent_name.clone(), weighted_confidence),
-                );
+                prefer_intent_candidate(&mut best, (intent_name.clone(), weighted_confidence));
             }
         }
 
@@ -1303,11 +1299,37 @@ fn trim_entity_surface(text: &str) -> (&str, usize, usize) {
         ch.is_whitespace()
             || matches!(
                 ch,
-                '，' | '。' | '！' | '？' | '；' | '：' | '、'
-                    | ',' | '.' | '!' | '?' | ';' | ':' | '的'
-                    | '“' | '”' | '‘' | '’' | '「' | '」' | '『' | '』'
-                    | '(' | ')' | '（' | '）' | '[' | ']' | '【' | '】'
-                    | '"' | '\''
+                '，' | '。'
+                    | '！'
+                    | '？'
+                    | '；'
+                    | '：'
+                    | '、'
+                    | ','
+                    | '.'
+                    | '!'
+                    | '?'
+                    | ';'
+                    | ':'
+                    | '的'
+                    | '“'
+                    | '”'
+                    | '‘'
+                    | '’'
+                    | '「'
+                    | '」'
+                    | '『'
+                    | '』'
+                    | '('
+                    | ')'
+                    | '（'
+                    | '）'
+                    | '['
+                    | ']'
+                    | '【'
+                    | '】'
+                    | '"'
+                    | '\''
             )
     }
 
@@ -1380,7 +1402,8 @@ mod tests {
     async fn test_context_memory_respects_configured_window() {
         let nlu = AdvancedNLU::new().with_context_window_size(Some(2));
         assert_eq!(nlu.context_window_size(), 2);
-        for query in ["刘德华是谁", "刘德华的年龄是多少", "刘德华的身高是多少"] {
+        for query in ["刘德华是谁", "刘德华的年龄是多少", "刘德华的身高是多少"]
+        {
             nlu.analyze_query(query).await.unwrap();
         }
         assert_eq!(nlu.get_context_history().len(), 2);

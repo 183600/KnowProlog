@@ -653,14 +653,17 @@ struct Evaluator<'a> {
 
 impl<'a> Evaluator<'a> {
     fn constraints_hold(&self, binding: &BTreeMap<String, String>) -> bool {
-        self.pattern.constraints.iter().all(|constraint| match constraint {
-            PatternConstraint::Equal { variable, value } => {
-                binding.get(variable) == Some(value)
-            }
-            PatternConstraint::NotEqual { variable, value } => {
-                binding.get(variable) != Some(value)
-            }
-        })
+        self.pattern
+            .constraints
+            .iter()
+            .all(|constraint| match constraint {
+                PatternConstraint::Equal { variable, value } => {
+                    binding.get(variable) == Some(value)
+                }
+                PatternConstraint::NotEqual { variable, value } => {
+                    binding.get(variable) != Some(value)
+                }
+            })
     }
 
     fn search(
@@ -1057,11 +1060,7 @@ impl ConversationalGraph {
         self.refinement_command(core, lexicon)
     }
 
-    fn refinement_command(
-        &self,
-        core: &str,
-        lexicon: &PatternLexicon,
-    ) -> Option<GraphCommand> {
+    fn refinement_command(&self, core: &str, lexicon: &PatternLexicon) -> Option<GraphCommand> {
         let mut core = core.trim();
         for prefix in ["如果", "要是", "若是", "那么"] {
             if let Some(rest) = core.strip_prefix(prefix) {
@@ -1678,13 +1677,20 @@ mod tests {
             .interpret("那科幻片呢", &lexicon, &facts, MatchOptions::default())
             .unwrap()
             .unwrap();
-        assert!(matches!(narrowed, GraphReply::Changed { total: 1, .. }), "{:?}", narrowed);
+        assert!(
+            matches!(narrowed, GraphReply::Changed { total: 1, .. }),
+            "{:?}",
+            narrowed
+        );
         assert_eq!(conversation.pattern().edges.len(), 3);
-        assert!(conversation
-            .pattern()
-            .edges
-            .iter()
-            .any(|edge| edge.predicate == "type" && edge.object == PatternTerm::constant("科幻片")));
+        assert!(
+            conversation
+                .pattern()
+                .edges
+                .iter()
+                .any(|edge| edge.predicate == "type"
+                    && edge.object == PatternTerm::constant("科幻片"))
+        );
     }
 
     #[test]
@@ -1704,11 +1710,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(narrowed, GraphReply::Changed { total: 1, .. }));
-        assert!(conversation
-            .pattern()
-            .edges
-            .iter()
-            .any(|edge| edge.predicate == "type" && edge.object == PatternTerm::constant("中国人")));
+        assert!(
+            conversation
+                .pattern()
+                .edges
+                .iter()
+                .any(|edge| edge.predicate == "type"
+                    && edge.object == PatternTerm::constant("中国人"))
+        );
     }
 
     #[test]
@@ -1735,10 +1744,11 @@ mod tests {
                 value: "张三".to_string(),
             }));
         let outcome = conversation.outcome();
-        assert!(outcome
-            .solutions
-            .iter()
-            .all(|solution| solution.binding.get("person").map(String::as_str) != Some("张三")));
+        assert!(outcome.solutions.iter().all(|solution| solution
+            .binding
+            .get("person")
+            .map(String::as_str)
+            != Some("张三")));
         let restored = conversation
             .interpret("撤回", &lexicon, &facts, MatchOptions::default())
             .unwrap()

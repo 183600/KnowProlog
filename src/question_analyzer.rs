@@ -507,10 +507,9 @@ impl QuestionAnalyzer {
         // 提取实体（正则给出的是归一化串的字节区间）
         let mut entities = self.extract_entities(normalized_question).await?;
         for entity in &mut entities {
-            if let Ok(anchor) = projection.surface_bytes_to_raw(ByteSpan::new(
-                entity.start_pos,
-                entity.end_pos,
-            )) {
+            if let Ok(anchor) =
+                projection.surface_bytes_to_raw(ByteSpan::new(entity.start_pos, entity.end_pos))
+            {
                 entity.start_pos = anchor.raw.start;
                 entity.end_pos = anchor.raw.end;
             }

@@ -174,9 +174,7 @@ pub fn classify(input: &str) -> Option<RecallIntent> {
     if let Some(target) = parse_said_target(stripped) {
         return Some(RecallIntent::AlreadySaid(target));
     }
-    if CORRECTION_WORDS
-        .iter()
-        .any(|word| stripped.contains(word))
+    if CORRECTION_WORDS.iter().any(|word| stripped.contains(word))
         && CORRECTION_CONTEXTS
             .iter()
             .any(|context| stripped.contains(context))

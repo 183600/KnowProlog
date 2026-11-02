@@ -337,7 +337,9 @@ impl SchemaView {
     pub fn type_alias_pairs(&self) -> Vec<(String, String)> {
         let mut pairs: BTreeMap<String, String> = BTreeMap::new();
         for (alias, canonical) in &self.type_aliases {
-            pairs.entry(alias.clone()).or_insert_with(|| canonical.clone());
+            pairs
+                .entry(alias.clone())
+                .or_insert_with(|| canonical.clone());
         }
         pairs.into_iter().collect()
     }

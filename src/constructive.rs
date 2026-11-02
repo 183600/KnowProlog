@@ -151,7 +151,11 @@ pub struct FactKey {
 }
 
 impl FactKey {
-    pub fn new(subject: impl Into<String>, predicate: impl Into<String>, object: impl Into<String>) -> Self {
+    pub fn new(
+        subject: impl Into<String>,
+        predicate: impl Into<String>,
+        object: impl Into<String>,
+    ) -> Self {
         Self {
             subject: subject.into(),
             predicate: predicate.into(),
@@ -541,7 +545,12 @@ impl ConstructiveReasoner {
             .enumerate()
             .filter_map(|(index, rule)| ConstructionRule::from_horn(rule, index))
             .collect();
-        Self::new(config, revision, ObservedGraph::from_triples(triples), rules)
+        Self::new(
+            config,
+            revision,
+            ObservedGraph::from_triples(triples),
+            rules,
+        )
     }
 
     pub fn enabled(&self) -> bool {
@@ -568,12 +577,7 @@ impl ConstructiveReasoner {
     ///
     /// `inverted = true` 时目标形如 `?X predicate seed`；返回的
     /// [`VirtualFact`] 始终保持原始三元组方向，调用方按需取另一端。
-    pub fn derive(
-        &mut self,
-        seed: &str,
-        predicate: &str,
-        inverted: bool,
-    ) -> ConstructionReport {
+    pub fn derive(&mut self, seed: &str, predicate: &str, inverted: bool) -> ConstructionReport {
         if !self.config.enabled {
             return self.report(seed, predicate, inverted, ConstructionStatus::Disabled, 0);
         }
@@ -620,7 +624,9 @@ impl ConstructiveReasoner {
                     fact.key.subject == seed
                 }
             })
-            .filter(|fact| fact.state != VirtualState::Invalidated && fact.state != VirtualState::Refuted)
+            .filter(|fact| {
+                fact.state != VirtualState::Invalidated && fact.state != VirtualState::Refuted
+            })
             .cloned()
             .collect();
         target_facts.sort_by(|left, right| {
@@ -703,11 +709,12 @@ impl ConstructiveReasoner {
         }
         let virtuals: Vec<FactKey> = self.virtuals.keys().cloned().collect();
         for key in virtuals {
-            if self
-                .virtuals
-                .get(&key)
-                .is_some_and(|fact| matches!(fact.state, VirtualState::Hypothesis | VirtualState::Confirmed))
-            {
+            if self.virtuals.get(&key).is_some_and(|fact| {
+                matches!(
+                    fact.state,
+                    VirtualState::Hypothesis | VirtualState::Confirmed
+                )
+            }) {
                 self.enqueue(key);
             }
         }
@@ -773,7 +780,10 @@ impl ConstructiveReasoner {
             if fact.key.subject == subject
                 && fact.key.predicate == predicate
                 && !self.forbidden.contains(&fact.key)
-                && matches!(fact.state, VirtualState::Hypothesis | VirtualState::Confirmed)
+                && matches!(
+                    fact.state,
+                    VirtualState::Hypothesis | VirtualState::Confirmed
+                )
             {
                 refs.push(FactRef {
                     key: fact.key.clone(),
@@ -809,7 +819,10 @@ impl ConstructiveReasoner {
             if fact.key.object == object
                 && fact.key.predicate == predicate
                 && !self.forbidden.contains(&fact.key)
-                && matches!(fact.state, VirtualState::Hypothesis | VirtualState::Confirmed)
+                && matches!(
+                    fact.state,
+                    VirtualState::Hypothesis | VirtualState::Confirmed
+                )
             {
                 refs.push(FactRef {
                     key: fact.key.clone(),
@@ -867,8 +880,12 @@ impl ConstructiveReasoner {
 
             let mut ranked: Vec<Candidate> = candidates.into_values().collect();
             ranked.sort_by(compare_candidates);
-            let omitted = ranked.len().saturating_sub(self.config.max_candidates_per_round);
-            let accepted = ranked.into_iter().take(self.config.max_candidates_per_round);
+            let omitted = ranked
+                .len()
+                .saturating_sub(self.config.max_candidates_per_round);
+            let accepted = ranked
+                .into_iter()
+                .take(self.config.max_candidates_per_round);
             let mut inserted = 0usize;
             for candidate in accepted {
                 if self.virtuals.len() >= self.config.max_virtual_facts {
@@ -882,7 +899,11 @@ impl ConstructiveReasoner {
                 {
                     continue;
                 }
-                if candidate.support.iter().any(|premise| premise == &candidate.key) {
+                if candidate
+                    .support
+                    .iter()
+                    .any(|premise| premise == &candidate.key)
+                {
                     continue;
                 }
                 if inserted >= self.config.beam_width {
@@ -1055,8 +1076,7 @@ impl ConstructiveReasoner {
         for _ in 0..virtual_premises {
             confidence = confidence.saturating_mul(u32::from(VIRTUAL_DAMPING_BPS)) / 10_000;
         }
-        let confidence_bps = confidence
-            .min(u32::from(MAX_VIRTUAL_CONFIDENCE_BPS)) as u16;
+        let confidence_bps = confidence.min(u32::from(MAX_VIRTUAL_CONFIDENCE_BPS)) as u16;
         Candidate {
             key,
             confidence_bps,
@@ -1187,7 +1207,8 @@ impl ConstructiveReasoner {
                 dependents.remove(key);
             }
         }
-        self.dependents.retain(|_, dependents| !dependents.is_empty());
+        self.dependents
+            .retain(|_, dependents| !dependents.is_empty());
         self.active.clear();
         self.queued.clear();
         self.loaded_entities.clear();
@@ -1234,7 +1255,13 @@ impl ConstructiveReasoner {
             .virtuals
             .values()
             .filter(|fact| fact.scope == FactScope::Session)
-            .map(|fact| (fact.key.clone(), fact.touched, fact.state == VirtualState::Confirmed))
+            .map(|fact| {
+                (
+                    fact.key.clone(),
+                    fact.touched,
+                    fact.state == VirtualState::Confirmed,
+                )
+            })
             .collect();
         if session.len() <= self.config.session_capacity {
             return;
@@ -1386,7 +1413,10 @@ mod tests {
         }
     }
 
-    fn engine(triples: &[(&str, &str, &str)], rules: Vec<ConstructionRule>) -> ConstructiveReasoner {
+    fn engine(
+        triples: &[(&str, &str, &str)],
+        rules: Vec<ConstructionRule>,
+    ) -> ConstructiveReasoner {
         let triples: Vec<Triple> = triples
             .iter()
             .map(|(s, p, o)| Triple::new(s, p, o))
@@ -1395,19 +1425,19 @@ mod tests {
             enabled: true,
             ..ConstructionConfig::default()
         };
-        ConstructiveReasoner::new(
-            config,
-            1,
-            ObservedGraph::from_triples(&triples),
-            rules,
-        )
+        ConstructiveReasoner::new(config, 1, ObservedGraph::from_triples(&triples), rules)
     }
 
     #[test]
     fn compose_fills_missing_target_edge() {
         let mut reasoner = engine(
             &[("甲", "同事", "丙"), ("丙", "师傅", "乙")],
-            vec![rule(ConstructionOperator::Compose, &["同事", "师傅"], "师傅", 9_000)],
+            vec![rule(
+                ConstructionOperator::Compose,
+                &["同事", "师傅"],
+                "师傅",
+                9_000,
+            )],
         );
         let report = reasoner.derive("甲", "师傅", false);
         assert_eq!(report.status, ConstructionStatus::Constructed);
@@ -1430,8 +1460,18 @@ mod tests {
                 ("丙", "认识", "丁"),
             ],
             vec![
-                rule(ConstructionOperator::Compose, &["认识", "认识"], "熟识", 9_500),
-                rule(ConstructionOperator::Compose, &["熟识", "认识"], "熟识", 9_500),
+                rule(
+                    ConstructionOperator::Compose,
+                    &["认识", "认识"],
+                    "熟识",
+                    9_500,
+                ),
+                rule(
+                    ConstructionOperator::Compose,
+                    &["熟识", "认识"],
+                    "熟识",
+                    9_500,
+                ),
             ],
         );
         let report = reasoner.derive("甲", "熟识", false);
@@ -1460,7 +1500,12 @@ mod tests {
     fn inverse_rule_derives_incoming_target() {
         let mut reasoner = engine(
             &[("甲", "师傅", "乙")],
-            vec![rule(ConstructionOperator::Inverse, &["师傅"], "徒弟", 9_000)],
+            vec![rule(
+                ConstructionOperator::Inverse,
+                &["师傅"],
+                "徒弟",
+                9_000,
+            )],
         );
         let report = reasoner.derive("乙", "徒弟", false);
         assert_eq!(report.status, ConstructionStatus::Constructed);
@@ -1471,7 +1516,12 @@ mod tests {
     fn refuting_a_premise_invalidates_the_dependents() {
         let mut reasoner = engine(
             &[("甲", "同事", "丙"), ("丙", "师傅", "乙")],
-            vec![rule(ConstructionOperator::Compose, &["同事", "师傅"], "师傅", 9_000)],
+            vec![rule(
+                ConstructionOperator::Compose,
+                &["同事", "师傅"],
+                "师傅",
+                9_000,
+            )],
         );
         let report = reasoner.derive("甲", "师傅", false);
         let derived = report.target_facts[0].key.clone();
@@ -1486,9 +1536,16 @@ mod tests {
     fn confirmation_promotes_only_session_facts() {
         let mut reasoner = engine(
             &[("甲", "同事", "丙"), ("丙", "师傅", "乙")],
-            vec![rule(ConstructionOperator::Compose, &["同事", "师傅"], "师傅", 9_000)],
+            vec![rule(
+                ConstructionOperator::Compose,
+                &["同事", "师傅"],
+                "师傅",
+                9_000,
+            )],
         );
-        let key = reasoner.derive("甲", "师傅", false).target_facts[0].key.clone();
+        let key = reasoner.derive("甲", "师傅", false).target_facts[0]
+            .key
+            .clone();
         assert!(reasoner.confirm(&key));
         assert_eq!(reasoner.session_facts().len(), 1);
         assert_eq!(reasoner.promotable().len(), 1);
@@ -1503,20 +1560,39 @@ mod tests {
     fn revision_drops_query_facts_and_invalidates_session_hypotheses() {
         let mut reasoner = engine(
             &[("甲", "同事", "丙"), ("丙", "师傅", "乙")],
-            vec![rule(ConstructionOperator::Compose, &["同事", "师傅"], "师傅", 9_000)],
+            vec![rule(
+                ConstructionOperator::Compose,
+                &["同事", "师傅"],
+                "师傅",
+                9_000,
+            )],
         );
-        let query_key = reasoner.derive("甲", "师傅", false).target_facts[0].key.clone();
+        let query_key = reasoner.derive("甲", "师傅", false).target_facts[0]
+            .key
+            .clone();
         reasoner.confirm(&query_key);
         let second = reasoner.derive("乙", "徒弟", true);
-        assert!(second.is_empty() || second.target_facts.iter().all(|fact| fact.state == VirtualState::Hypothesis));
+        assert!(
+            second.is_empty()
+                || second
+                    .target_facts
+                    .iter()
+                    .all(|fact| fact.state == VirtualState::Hypothesis)
+        );
         assert_eq!(reasoner.on_revision(2), 0);
-        assert!(reasoner.session_facts().iter().all(|fact| fact.state == VirtualState::Confirmed));
+        assert!(reasoner
+            .session_facts()
+            .iter()
+            .all(|fact| fact.state == VirtualState::Confirmed));
         assert_eq!(reasoner.revision(), 2);
     }
 
     #[test]
     fn disabled_engine_never_derives() {
-        let triples = vec![Triple::new("甲", "同事", "丙"), Triple::new("丙", "师傅", "乙")];
+        let triples = vec![
+            Triple::new("甲", "同事", "丙"),
+            Triple::new("丙", "师傅", "乙"),
+        ];
         let mut reasoner = ConstructiveReasoner::from_predictor(
             ConstructionConfig::default(),
             1,
@@ -1541,7 +1617,12 @@ mod tests {
         let build = || {
             engine(
                 &[("甲", "同事", "丙"), ("丙", "师傅", "乙")],
-                vec![rule(ConstructionOperator::Compose, &["同事", "师傅"], "师傅", 9_000)],
+                vec![rule(
+                    ConstructionOperator::Compose,
+                    &["同事", "师傅"],
+                    "师傅",
+                    9_000,
+                )],
             )
         };
         let mut left = build();
@@ -1556,7 +1637,10 @@ mod tests {
 
     #[test]
     fn config_limits_and_min_confidence_are_enforced() {
-        let triples = vec![Triple::new("甲", "同事", "丙"), Triple::new("丙", "师傅", "乙")];
+        let triples = vec![
+            Triple::new("甲", "同事", "丙"),
+            Triple::new("丙", "师傅", "乙"),
+        ];
         let config = ConstructionConfig {
             enabled: true,
             min_confidence_bps: 9_999,
@@ -1566,7 +1650,12 @@ mod tests {
             config,
             1,
             ObservedGraph::from_triples(&triples),
-            vec![rule(ConstructionOperator::Compose, &["同事", "师傅"], "师傅", 9_000)],
+            vec![rule(
+                ConstructionOperator::Compose,
+                &["同事", "师傅"],
+                "师傅",
+                9_000,
+            )],
         );
         let report = reasoner.derive("甲", "师傅", false);
         assert!(report.target_facts.is_empty());
@@ -1577,7 +1666,12 @@ mod tests {
     fn observed_target_is_not_duplicated_as_a_virtual_fact() {
         let mut reasoner = engine(
             &[("甲", "师傅", "乙")],
-            vec![rule(ConstructionOperator::Inverse, &["师傅"], "徒弟", 9_000)],
+            vec![rule(
+                ConstructionOperator::Inverse,
+                &["师傅"],
+                "徒弟",
+                9_000,
+            )],
         );
         let report = reasoner.derive("甲", "师傅", false);
         assert_eq!(report.status, ConstructionStatus::AlreadyObserved);
@@ -1626,7 +1720,12 @@ mod tests {
         let premise = FactKey::new("甲", "同事", "丙");
         let mut reasoner = engine(
             &[("甲", "同事", "丙"), ("丙", "师傅", "乙")],
-            vec![rule(ConstructionOperator::Compose, &["同事", "师傅"], "师傅", 9_000)],
+            vec![rule(
+                ConstructionOperator::Compose,
+                &["同事", "师傅"],
+                "师傅",
+                9_000,
+            )],
         );
         reasoner.refute(&premise);
         let report = reasoner.derive("甲", "师傅", false);
@@ -1681,7 +1780,12 @@ mod tests {
             ..ConstructionConfig::default()
         };
         let rules = vec![
-            rule(ConstructionOperator::Compose, &["同事", "师傅"], "师傅", 9_000),
+            rule(
+                ConstructionOperator::Compose,
+                &["同事", "师傅"],
+                "师傅",
+                9_000,
+            ),
             rule(ConstructionOperator::Inverse, &["师傅"], "徒弟", 9_000),
         ];
         let mut reasoner =

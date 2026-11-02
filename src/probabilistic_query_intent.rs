@@ -226,7 +226,11 @@ impl ProbabilisticQueryIntent {
             .cues
             .iter()
             .map(|cue| {
-                let scope = if cue.negated { "（否定作用域）" } else { "" };
+                let scope = if cue.negated {
+                    "（否定作用域）"
+                } else {
+                    ""
+                };
                 format!("{}{}", cue.phrase, scope)
             })
             .collect::<Vec<_>>()
@@ -263,7 +267,11 @@ impl ProbabilisticQueryIntent {
             }
             EpistemicMode::Probability if self.threshold_explicit => format!(
                 "概率阈值算子：检查 P {} {:.2}",
-                if self.threshold_at_least { "≥" } else { "≤" },
+                if self.threshold_at_least {
+                    "≥"
+                } else {
+                    "≤"
+                },
                 self.threshold
             ),
             EpistemicMode::Probability => "概率算子：返回基原子的精确 P".to_string(),
@@ -303,10 +311,28 @@ fn threshold_for(mode: EpistemicMode, cues: &[EpistemicCue], negated: bool) -> f
 /// 只在已识别出情态线索后调用；没有数字时返回 None，沿用情态默认阈值。
 fn parse_threshold_expression(text: &str) -> Option<(f64, bool)> {
     const UPPER: [&str; 10] = [
-        "不低于", "不小于", "至少", "超过", "大于", "高于", "达到", "以上", "≥", ">=",
+        "不低于",
+        "不小于",
+        "至少",
+        "超过",
+        "大于",
+        "高于",
+        "达到",
+        "以上",
+        "≥",
+        ">=",
     ];
     const LOWER: [&str; 10] = [
-        "不超过", "不大于", "至多", "低于", "小于", "不足", "不到", "以下", "≤", "<=",
+        "不超过",
+        "不大于",
+        "至多",
+        "低于",
+        "小于",
+        "不足",
+        "不到",
+        "以下",
+        "≤",
+        "<=",
     ];
     let mut marker: Option<(usize, usize, bool)> = None;
     for (list, at_least) in [(UPPER.as_slice(), true), (LOWER.as_slice(), false)] {
@@ -363,7 +389,21 @@ fn parse_probability_value(text: &str) -> Option<f64> {
             .take_while(|ch| {
                 ch.is_ascii_digit()
                     || *ch == '.'
-                    || matches!(ch, '零' | '一' | '二' | '两' | '三' | '四' | '五' | '六' | '七' | '八' | '九' | '十' | '百')
+                    || matches!(
+                        ch,
+                        '零' | '一'
+                            | '二'
+                            | '两'
+                            | '三'
+                            | '四'
+                            | '五'
+                            | '六'
+                            | '七'
+                            | '八'
+                            | '九'
+                            | '十'
+                            | '百'
+                    )
             })
             .collect::<String>()
             .chars()
@@ -517,8 +557,7 @@ fn scan_cues(text: &str) -> Vec<EpistemicCue> {
             continue;
         };
         let end = start + phrase.len();
-        let explicitly_negated = phrase.starts_with('不')
-            && !matches!(phrase, "不一定" | "不见得");
+        let explicitly_negated = phrase.starts_with('不') && !matches!(phrase, "不一定" | "不见得");
         let negated = explicitly_negated || preceding_negation(text, start);
         cues.push(EpistemicCue {
             phrase: phrase.to_string(),
@@ -651,10 +690,7 @@ fn posterior(cues: &[EpistemicCue]) -> Vec<(EpistemicMode, f64)> {
     }
     // 固定按 MODES 顺序累加与取数：HashMap 的迭代序会让浮点求和的最后
     // 一位随进程漂移，破坏「同一问句后验逐位可复现」的承诺。
-    let total: f64 = MODES
-        .iter()
-        .filter_map(|mode| scores.get(mode))
-        .sum();
+    let total: f64 = MODES.iter().filter_map(|mode| scores.get(mode)).sum();
     let mut posterior: Vec<(EpistemicMode, f64)> = MODES
         .iter()
         .map(|mode| {
@@ -662,10 +698,7 @@ fn posterior(cues: &[EpistemicCue]) -> Vec<(EpistemicMode, f64)> {
             (*mode, score / total.max(1e-12))
         })
         .collect();
-    posterior.sort_by(|a, b| {
-        b.1.total_cmp(&a.1)
-            .then_with(|| a.0.code().cmp(b.0.code()))
-    });
+    posterior.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.code().cmp(b.0.code())));
     posterior
 }
 
@@ -718,9 +751,9 @@ fn clean_question(question: &str) -> String {
 }
 
 fn strip_question_tail(raw: &str) -> String {
-    let mut text = raw
-        .trim()
-        .trim_end_matches(['？', '?', '！', '!', '。', '.', '，', ',', '；', ';', '：', ':', ' ']);
+    let mut text = raw.trim().trim_end_matches([
+        '？', '?', '！', '!', '。', '.', '，', ',', '；', ';', '：', ':', ' ',
+    ]);
     loop {
         match text.chars().last() {
             Some('吗') | Some('呢') | Some('吧') | Some('呀') | Some('啊') | Some('嘛') => {
@@ -749,8 +782,12 @@ fn trim_leading_phrases<'a>(raw: &'a str, phrases: &[&str]) -> &'a str {
 }
 
 fn contains_interrogative(text: &str) -> bool {
-    text.chars()
-        .any(|ch| matches!(ch, '谁' | '什' | '么' | '哪' | '几' | '多' | '少' | '吗' | '呢'))
+    text.chars().any(|ch| {
+        matches!(
+            ch,
+            '谁' | '什' | '么' | '哪' | '几' | '多' | '少' | '吗' | '呢'
+        )
+    })
 }
 
 fn parse_claim(raw: &str) -> Option<Claim> {
@@ -886,9 +923,7 @@ fn parse_probability_target(raw: &str) -> Option<EpistemicTarget> {
 }
 
 fn parse_most_likely_target(raw: &str, cues: &[EpistemicCue]) -> Option<EpistemicTarget> {
-    let cue = cues
-        .iter()
-        .find(|cue| cue.kind == CueKind::MostLikely)?;
+    let cue = cues.iter().find(|cue| cue.kind == CueKind::MostLikely)?;
     let prefix = clean_question(&raw[..cue.start]);
     let prefix = strip_comparison_question_suffix(&prefix).to_string();
     let suffix = clean_question(&raw[cue.end..]);
@@ -922,7 +957,9 @@ fn parse_most_likely_target(raw: &str, cues: &[EpistemicCue]) -> Option<Epistemi
     // 谁最可能是 X 的 P / 最可能是 X 的 P / 最可能的是 X 的 P
     if prefix.is_empty() || prefix == "谁" {
         if let Some((subject, predicate)) = parse_possessive(&suffix) {
-            if subject != "谁" && !contains_interrogative(&subject) && !contains_interrogative(&predicate)
+            if subject != "谁"
+                && !contains_interrogative(&subject)
+                && !contains_interrogative(&predicate)
             {
                 return Some(EpistemicTarget::ObjectsOf { subject, predicate });
             }
@@ -959,20 +996,14 @@ fn parse_most_likely_target(raw: &str, cues: &[EpistemicCue]) -> Option<Epistemi
         }
     }
     // 李四最可能是王五的师傅：单个断言的概率，而不是候选 argmax。
-    if !prefix.is_empty()
-        && prefix != "谁"
-        && !prefix.contains('谁')
-        && !suffix.contains('谁')
-    {
+    if !prefix.is_empty() && prefix != "谁" && !prefix.contains('谁') && !suffix.contains('谁') {
         return parse_claim(&format!("{}是{}", prefix, suffix)).map(EpistemicTarget::GroundClaim);
     }
     None
 }
 
 fn parse_comparison(raw: &str, cues: &[EpistemicCue]) -> Option<EpistemicTarget> {
-    let cue = cues
-        .iter()
-        .find(|cue| cue.kind == CueKind::Comparison)?;
+    let cue = cues.iter().find(|cue| cue.kind == CueKind::Comparison)?;
     let cleaned = clean_question(&raw[..cue.start]);
     let prefix = trim_leading_phrases(&cleaned, &["比较", "对比"]);
     let prefix = strip_comparison_question_suffix(prefix);
@@ -1031,7 +1062,14 @@ fn strip_comparison_question_suffix(prefix: &str) -> &str {
 /// 「最可能是李四的师傅**的人是谁**」里的尾部是问句外壳，不是谓词的一部分。
 fn strip_most_likely_tail(suffix: &str) -> &str {
     let mut suffix = suffix.trim();
-    for tail in ["的那个人是谁", "的人是谁", "的那个人", "的人", "的是谁", "是谁"] {
+    for tail in [
+        "的那个人是谁",
+        "的人是谁",
+        "的那个人",
+        "的人",
+        "的是谁",
+        "是谁",
+    ] {
         if let Some(rest) = suffix.strip_suffix(tail) {
             let rest = rest.trim();
             if !rest.is_empty() {
@@ -1115,8 +1153,7 @@ mod tests {
 
     #[test]
     fn probability_frame_extracts_a_ground_claim() {
-        let intent =
-            ProbabilisticQueryIntent::analyze("李四有多大的可能是王五的师傅？").unwrap();
+        let intent = ProbabilisticQueryIntent::analyze("李四有多大的可能是王五的师傅？").unwrap();
         assert_eq!(intent.mode, EpistemicMode::Probability);
         assert_eq!(
             intent.target,
@@ -1132,8 +1169,7 @@ mod tests {
 
     #[test]
     fn probability_suffix_extracts_a_ground_claim() {
-        let intent =
-            ProbabilisticQueryIntent::analyze("李四的师傅是王五的概率是多少").unwrap();
+        let intent = ProbabilisticQueryIntent::analyze("李四的师傅是王五的概率是多少").unwrap();
         assert_eq!(intent.mode, EpistemicMode::Probability);
         assert_eq!(
             intent.target,
@@ -1201,8 +1237,7 @@ mod tests {
 
     #[test]
     fn comparison_extracts_two_ground_claims() {
-        let intent =
-            ProbabilisticQueryIntent::analyze("李四和王五谁更可能是张三的师傅").unwrap();
+        let intent = ProbabilisticQueryIntent::analyze("李四和王五谁更可能是张三的师傅").unwrap();
         assert_eq!(intent.mode, EpistemicMode::Comparison);
         let Some(EpistemicTarget::Comparison { left, right }) = intent.target else {
             panic!("应抽出两个待比较的基原子：{:?}", intent.target);
@@ -1216,8 +1251,7 @@ mod tests {
 
     #[test]
     fn negation_is_kept_in_scope() {
-        let intent =
-            ProbabilisticQueryIntent::analyze("李四不可能是王五的师傅").unwrap();
+        let intent = ProbabilisticQueryIntent::analyze("李四不可能是王五的师傅").unwrap();
         assert_eq!(intent.mode, EpistemicMode::Possibility);
         assert!(intent.negated);
         assert_eq!(
@@ -1246,8 +1280,7 @@ mod tests {
 
     #[test]
     fn probability_frame_keeps_a_negated_copula() {
-        let intent =
-            ProbabilisticQueryIntent::analyze("李四有多大的可能不是王五的师傅").unwrap();
+        let intent = ProbabilisticQueryIntent::analyze("李四有多大的可能不是王五的师傅").unwrap();
         let Some(EpistemicTarget::GroundClaim(claim)) = intent.target else {
             panic!("应抽出带否定的基原子");
         };
@@ -1268,7 +1301,10 @@ mod tests {
             let intent = ProbabilisticQueryIntent::analyze(question).unwrap();
             assert_eq!(intent.mode, EpistemicMode::Comparison, "{}", question);
             let Some(EpistemicTarget::Comparison { left, right }) = intent.target else {
-                panic!("应抽出两个待比较的基原子：{} => {:?}", question, intent.target);
+                panic!(
+                    "应抽出两个待比较的基原子：{} => {:?}",
+                    question, intent.target
+                );
             };
             assert_eq!(left.subject, "张三");
             assert_eq!(right.subject, "张三");
@@ -1279,8 +1315,7 @@ mod tests {
 
     #[test]
     fn most_likely_with_two_named_candidates_is_a_comparison() {
-        let intent =
-            ProbabilisticQueryIntent::analyze("李四和王五谁最可能是张三的师傅").unwrap();
+        let intent = ProbabilisticQueryIntent::analyze("李四和王五谁最可能是张三的师傅").unwrap();
         assert_eq!(intent.mode, EpistemicMode::MostLikely);
         let Some(EpistemicTarget::Comparison { left, right }) = intent.target else {
             panic!("两个具名候选应做比较而不是全图 argmax：{:?}", intent.target);
@@ -1293,8 +1328,7 @@ mod tests {
 
     #[test]
     fn most_likely_accepts_the_person_tail() {
-        let intent =
-            ProbabilisticQueryIntent::analyze("最可能是李四的师傅的人是谁").unwrap();
+        let intent = ProbabilisticQueryIntent::analyze("最可能是李四的师傅的人是谁").unwrap();
         assert_eq!(
             intent.target,
             Some(EpistemicTarget::ObjectsOf {
@@ -1312,8 +1346,7 @@ mod tests {
         assert!(upper.threshold_at_least);
         assert!((upper.threshold - 0.80).abs() < 1e-9, "{}", upper.threshold);
 
-        let lower =
-            ProbabilisticQueryIntent::analyze("李四的师傅是王五的概率低于80%吗").unwrap();
+        let lower = ProbabilisticQueryIntent::analyze("李四的师傅是王五的概率低于80%吗").unwrap();
         assert!(lower.threshold_explicit);
         assert!(!lower.threshold_at_least);
         assert!((lower.threshold - 0.80).abs() < 1e-9, "{}", lower.threshold);
@@ -1325,8 +1358,7 @@ mod tests {
 
     #[test]
     fn plain_probability_question_keeps_the_default_threshold() {
-        let intent =
-            ProbabilisticQueryIntent::analyze("李四的师傅是王五的概率是多少").unwrap();
+        let intent = ProbabilisticQueryIntent::analyze("李四的师傅是王五的概率是多少").unwrap();
         assert!(!intent.threshold_explicit);
         assert!((intent.threshold - 0.50).abs() < 1e-9);
     }

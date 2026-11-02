@@ -560,11 +560,9 @@ impl std::fmt::Display for ForgeError {
             ForgeError::NoTokens => write!(f, "正例没有可用的词元"),
             ForgeError::EmptyPattern => write!(f, "正则至少要有一个要素"),
             ForgeError::EmptyAlternative => write!(f, "选择分支不能为空"),
-            ForgeError::TooManyExpansions => write!(
-                f,
-                "正则展开超过上限 {} 条；请收窄选择分支",
-                MAX_EXPANSIONS
-            ),
+            ForgeError::TooManyExpansions => {
+                write!(f, "正则展开超过上限 {} 条；请收窄选择分支", MAX_EXPANSIONS)
+            }
             ForgeError::NegativeAccepted { negative, pattern } => write!(
                 f,
                 "反例「{}」仍被模式「{}」命中：这两句话我分不开，拒绝学习",
@@ -576,16 +574,18 @@ impl std::fmt::Display for ForgeError {
                 "正例「{}」与主正例的 token 数不同；请先用同一句式，或拆成两条规则",
                 positive
             ),
-            ForgeError::PositiveNotCovered { positive } => write!(
-                f,
-                "合并后的模式没有覆盖正例「{}」，拒绝学习",
-                positive
-            ),
+            ForgeError::PositiveNotCovered { positive } => {
+                write!(f, "合并后的模式没有覆盖正例「{}」，拒绝学习", positive)
+            }
             ForgeError::BudgetExhausted { max } => {
                 write!(f, "锻造记录已达上限 {} 条；请先退役或遗忘不用的规则", max)
             }
             ForgeError::ActiveBudgetExhausted { max } => {
-                write!(f, "同时激活的锻造规则已达上限 {} 条；请先退役不用的规则", max)
+                write!(
+                    f,
+                    "同时激活的锻造规则已达上限 {} 条；请先退役不用的规则",
+                    max
+                )
             }
             ForgeError::NotFound(key) => write!(f, "没有找到锻造规则「{}」", key),
             ForgeError::Ambiguous(key) => {
@@ -666,7 +666,8 @@ fn learn_regex(tokens: &[TaggedWord]) -> (TokenRegex, BTreeMap<String, String>) 
         if text.is_empty() || is_punctuation(text) {
             continue;
         }
-        let atom = if crate::pos_ontology::tag_matches("nr", &token.pos) && !is_question_word(text) {
+        let atom = if crate::pos_ontology::tag_matches("nr", &token.pos) && !is_question_word(text)
+        {
             let name = next_slot_name(&mut counts, "人物");
             fills.insert(name.clone(), text.to_string());
             ForgeAtom::slot(name, "人名")
@@ -738,14 +739,8 @@ fn merge_atom(left: &ForgeAtom, right: &ForgeAtom) -> ForgeAtom {
             sort: sort.clone(),
             hints: hints.clone(),
         },
-        (
-            ForgeAtom::Slot { name, sort, hints },
-            ForgeAtom::Literal { .. },
-        )
-        | (
-            ForgeAtom::Literal { .. },
-            ForgeAtom::Slot { name, sort, hints },
-        ) => ForgeAtom::Slot {
+        (ForgeAtom::Slot { name, sort, hints }, ForgeAtom::Literal { .. })
+        | (ForgeAtom::Literal { .. }, ForgeAtom::Slot { name, sort, hints }) => ForgeAtom::Slot {
             name: name.clone(),
             sort: sort.clone(),
             hints: hints.clone(),
@@ -1127,11 +1122,7 @@ impl PatternForge {
             pattern.status = ForgeStatus::Active;
             pattern.last_used_turn = self.turn;
         }
-        let pattern = self
-            .patterns
-            .get(&id)
-            .expect("刚激活的锻造规则")
-            .clone();
+        let pattern = self.patterns.get(&id).expect("刚激活的锻造规则").clone();
         let entries = pattern.materialize();
         Ok(ForgeActivation { pattern, entries })
     }
@@ -1171,10 +1162,11 @@ impl PatternForge {
 
     /// 记录一次命中（来源串为 `induced#forge#<id>` 或锻造 id）。
     pub fn record_hit(&mut self, source_or_id: &str) -> bool {
-        let Some(id) = source_or_id
-            .strip_prefix(FORGE_SOURCE_PREFIX)
-            .or_else(|| self.patterns.contains_key(source_or_id).then_some(source_or_id))
-        else {
+        let Some(id) = source_or_id.strip_prefix(FORGE_SOURCE_PREFIX).or_else(|| {
+            self.patterns
+                .contains_key(source_or_id)
+                .then_some(source_or_id)
+        }) else {
             return false;
         };
         let turn = self.turn;
@@ -1203,9 +1195,11 @@ impl PatternForge {
     /// 返回 `Some(retired)` 表示找到了规则，`retired` 说明本次是否触发了
     /// 自动退役（调用方据此把条目移出模式库）。
     pub fn record_refutation(&mut self, source_or_id: &str) -> Option<bool> {
-        let id = source_or_id
-            .strip_prefix(FORGE_SOURCE_PREFIX)
-            .or_else(|| self.patterns.contains_key(source_or_id).then_some(source_or_id))?;
+        let id = source_or_id.strip_prefix(FORGE_SOURCE_PREFIX).or_else(|| {
+            self.patterns
+                .contains_key(source_or_id)
+                .then_some(source_or_id)
+        })?;
         self.turn += 1;
         let turn = self.turn;
         let pattern = self.patterns.get_mut(id)?;
@@ -1369,10 +1363,9 @@ pub fn parse_forge_spec(spec: &str) -> Result<ForgeRequest, ForgeError> {
         None => 10,
     };
     let guard = match parts.get(5).filter(|part| !part.is_empty()) {
-        Some(part) => Some(
-            crate::pattern_ir::parse_context_guard(part)
-                .map_err(ForgeError::BadSpec)?,
-        ),
+        Some(part) => {
+            Some(crate::pattern_ir::parse_context_guard(part).map_err(ForgeError::BadSpec)?)
+        }
         None => None,
     };
     Ok(ForgeRequest {
@@ -1624,7 +1617,9 @@ mod tests {
             Err(ForgeError::ActiveBudgetExhausted { .. })
         ));
         forge.retire(&first.pattern.id).expect("退役第一条");
-        forge.activate(&second.pattern.id).expect("释放预算后可激活");
+        forge
+            .activate(&second.pattern.id)
+            .expect("释放预算后可激活");
     }
 
     #[test]
@@ -1646,9 +1641,7 @@ mod tests {
         let (_, retired) = forge.refute(prefix).expect("按前缀找到规则");
         assert!(retired);
         assert_eq!(
-            forge
-                .get(&outcome.pattern.id)
-                .map(|pattern| pattern.status),
+            forge.get(&outcome.pattern.id).map(|pattern| pattern.status),
             Some(ForgeStatus::Retired)
         );
     }
@@ -1664,7 +1657,10 @@ mod tests {
         assert_eq!(request.priority, 30);
         assert_eq!(request.positives().len(), 2);
         assert_eq!(request.negatives.len(), 2);
-        assert_eq!(request.guard, Some(crate::pattern_ir::ContextGuard::focus()));
+        assert_eq!(
+            request.guard,
+            Some(crate::pattern_ir::ContextGuard::focus())
+        );
         assert!(parse_forge_spec("只有名字").is_err());
     }
 

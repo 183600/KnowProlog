@@ -22,8 +22,20 @@ const HONORIFIC_SUFFIXES: [&str; 12] = [
     "先生", "女士", "小姐", "老师", "教授", "博士", "医生", "律师", "导演", "总统", "主席", "同志",
 ];
 const ORGANIZATION_SUFFIXES: [&str; 14] = [
-    "股份有限公司", "有限责任公司", "有限公司", "公司", "集团", "大学", "学院", "研究院",
-    "研究所", "委员会", "银行", "医院", "博物馆", "图书馆",
+    "股份有限公司",
+    "有限责任公司",
+    "有限公司",
+    "公司",
+    "集团",
+    "大学",
+    "学院",
+    "研究院",
+    "研究所",
+    "委员会",
+    "银行",
+    "医院",
+    "博物馆",
+    "图书馆",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -129,9 +141,9 @@ fn contain_cjk(text: &str) -> bool {
 
 fn is_ascii_words(text: &str) -> bool {
     !text.is_empty()
-        && text
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ch.is_ascii_whitespace() || ch == '-' || ch == '\'')
+        && text.chars().all(|ch| {
+            ch.is_ascii_alphanumeric() || ch.is_ascii_whitespace() || ch == '-' || ch == '\''
+        })
         && text.chars().any(|ch| ch.is_ascii_alphabetic())
 }
 
@@ -373,13 +385,16 @@ impl VariantCandidate {
             if self.anchor_types.is_empty() {
                 "未知".to_string()
             } else {
-                self.anchor_types.iter().cloned().collect::<Vec<_>>().join("、")
+                self.anchor_types
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("、")
             },
             self.validity.render()
         )
     }
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct VariantSnapshot {
@@ -633,12 +648,19 @@ impl VariantResolution {
     pub fn render(&self) -> String {
         match self {
             VariantResolution::Canonical(candidate) => {
-                format!("「{}」已是规范身份；{}", candidate.anchor, candidate.render())
+                format!(
+                    "「{}」已是规范身份；{}",
+                    candidate.anchor,
+                    candidate.render()
+                )
             }
             VariantResolution::Resolved(candidate) => {
                 format!("解析为「{}」：{}", candidate.anchor, candidate.render())
             }
-            VariantResolution::Ambiguous { surface, candidates } => {
+            VariantResolution::Ambiguous {
+                surface,
+                candidates,
+            } => {
                 let mut text = format!("「{}」有多个锚定候选，需语境或澄清：", surface);
                 for candidate in candidates {
                     text.push_str(&format!("\n  - {}", candidate.render()));
@@ -691,7 +713,10 @@ impl VariantSurface {
         for step in &self.path {
             text.push_str(&format!("—[{}]→「{}」", step.kind.label(), step.to));
         }
-        format!("{}（锚定「{}」，{:.2}）", text, self.anchor, self.confidence)
+        format!(
+            "{}（锚定「{}」，{:.2}）",
+            text, self.anchor, self.confidence
+        )
     }
 }
 
@@ -712,7 +737,11 @@ impl VariantSurfaceChoice {
             self.surface,
             self.source,
             self.confidence,
-            if self.reversible { "" } else { "，未通过反向解析" }
+            if self.reversible {
+                ""
+            } else {
+                "，未通过反向解析"
+            }
         )
     }
 }
@@ -777,11 +806,14 @@ impl VariantClosure {
         if key.is_empty() {
             return false;
         }
-        let entry = self.anchors.entry(key.clone()).or_insert_with(|| VariantAnchor {
-            canonical: canonical.to_string(),
-            types: BTreeSet::new(),
-            observed: false,
-        });
+        let entry = self
+            .anchors
+            .entry(key.clone())
+            .or_insert_with(|| VariantAnchor {
+                canonical: canonical.to_string(),
+                types: BTreeSet::new(),
+                observed: false,
+            });
         let mut changed = false;
         if entry.canonical != canonical {
             changed = true;
@@ -894,12 +926,7 @@ impl VariantClosure {
             } else {
                 format!(
                     "同义词图（{}）",
-                    entry
-                        .sources
-                        .iter()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join("、")
+                    entry.sources.iter().cloned().collect::<Vec<_>>().join("、")
                 )
             };
             if entry.status == SynonymStatus::Proposed {
@@ -965,10 +992,7 @@ impl VariantClosure {
             .entry(from_key.clone())
             .or_default()
             .push(index);
-        self.incoming
-            .entry(to_key.clone())
-            .or_default()
-            .push(index);
+        self.incoming.entry(to_key.clone()).or_default().push(index);
         self.anchor_lookup
             .entry(from_key)
             .or_default()
@@ -1061,7 +1085,12 @@ impl VariantClosure {
             }
         }
         for edge in snapshot.edges {
-            if !closure.add_edge(edge.clone()) && !closure.edges.iter().any(|existing| existing.key() == edge.key()) {
+            if !closure.add_edge(edge.clone())
+                && !closure
+                    .edges
+                    .iter()
+                    .any(|existing| existing.key() == edge.key())
+            {
                 return None;
             }
         }
@@ -1142,18 +1171,19 @@ impl VariantClosure {
         }
         let start_key = fold_surface(surface);
         if self.anchors.contains_key(&start_key) {
-            let anchor = self
-                .anchors
-                .get(&start_key)
-                .expect("锚刚存在")
-                .clone();
+            let anchor = self.anchors.get(&start_key).expect("锚刚存在").clone();
             if !self.anchor_admits(&anchor, context) {
                 return VariantResolution::Unresolved {
                     surface: surface.to_string(),
                     reason: VariantUnresolvedReason::GuardRejected,
                 };
             }
-            return VariantResolution::Canonical(self.candidate_for(anchor.canonical, Vec::new(), 1.0, Validity::Unknown));
+            return VariantResolution::Canonical(self.candidate_for(
+                anchor.canonical,
+                Vec::new(),
+                1.0,
+                Validity::Unknown,
+            ));
         }
 
         let mut frontier = vec![WalkState {
@@ -1182,12 +1212,8 @@ impl VariantClosure {
                         .map(|anchor| anchor.canonical.clone())
                         .unwrap_or_else(|| state.display.clone());
                     let confidence = state.confidence;
-                    let candidate = self.candidate_for(
-                        anchor,
-                        state.path.clone(),
-                        confidence,
-                        state.validity,
-                    );
+                    let candidate =
+                        self.candidate_for(anchor, state.path.clone(), confidence, state.validity);
                     let replace = candidates
                         .get(&candidate.anchor)
                         .map(|existing| {
@@ -1273,8 +1299,7 @@ impl VariantClosure {
                     .get(&visit_key)
                     .map(|(score, hops)| {
                         confidence > *score + f64::EPSILON
-                            || ((confidence - *score).abs() <= f64::EPSILON
-                                && path.len() < *hops)
+                            || ((confidence - *score).abs() <= f64::EPSILON && path.len() < *hops)
                     })
                     .unwrap_or(true);
                 if !replace {
@@ -1330,7 +1355,11 @@ impl VariantClosure {
                     .get(1)
                     .map(|second| first.confidence - second.confidence >= context.ambiguity_margin)
                     .unwrap_or(true);
-            if decisive && (ranked.len() == 1 || context.has_disambiguating_evidence() || first.confidence >= 0.75) {
+            if decisive
+                && (ranked.len() == 1
+                    || context.has_disambiguating_evidence()
+                    || first.confidence >= 0.75)
+            {
                 let candidate = ranked.remove(0);
                 return VariantResolution::Resolved(candidate);
             }
@@ -1537,7 +1566,12 @@ impl VariantClosure {
                 .partial_cmp(&left.confidence)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| left.path.len().cmp(&right.path.len()))
-                .then_with(|| left.surface.chars().count().cmp(&right.surface.chars().count()))
+                .then_with(|| {
+                    left.surface
+                        .chars()
+                        .count()
+                        .cmp(&right.surface.chars().count())
+                })
                 .then_with(|| left.surface.cmp(&right.surface))
         });
         variants.truncate(context.budget.max_candidates.max(1));
@@ -1629,11 +1663,12 @@ impl VariantClosure {
             if let Some(stem) = surface.strip_suffix(suffix) {
                 let stem = stem.trim();
                 if stem.chars().count() >= 2 && stem != surface {
-                    out.entry(stem.to_string()).or_insert(MorphologicalCandidate {
-                        surface: stem.to_string(),
-                        kind: VariantKind::Honorific,
-                        rule: format!("去除尊称后缀「{}」", suffix),
-                    });
+                    out.entry(stem.to_string())
+                        .or_insert(MorphologicalCandidate {
+                            surface: stem.to_string(),
+                            kind: VariantKind::Honorific,
+                            rule: format!("去除尊称后缀「{}」", suffix),
+                        });
                 }
             }
         }
@@ -1641,11 +1676,12 @@ impl VariantClosure {
             if let Some(stem) = surface.strip_suffix(suffix) {
                 let stem = stem.trim();
                 if stem.chars().count() >= 2 && stem != surface {
-                    out.entry(stem.to_string()).or_insert(MorphologicalCandidate {
-                        surface: stem.to_string(),
-                        kind: VariantKind::Elision,
-                        rule: format!("去除机构通名「{}」", suffix),
-                    });
+                    out.entry(stem.to_string())
+                        .or_insert(MorphologicalCandidate {
+                            surface: stem.to_string(),
+                            kind: VariantKind::Elision,
+                            rule: format!("去除机构通名「{}」", suffix),
+                        });
                 }
             }
         }
@@ -1653,11 +1689,12 @@ impl VariantClosure {
             if surface.ends_with('）') || surface.ends_with(')') {
                 let inner = surface[..open].trim();
                 if inner.chars().count() >= 2 && inner != surface {
-                    out.entry(inner.to_string()).or_insert(MorphologicalCandidate {
-                        surface: inner.to_string(),
-                        kind: VariantKind::Elision,
-                        rule: "去除括注".to_string(),
-                    });
+                    out.entry(inner.to_string())
+                        .or_insert(MorphologicalCandidate {
+                            surface: inner.to_string(),
+                            kind: VariantKind::Elision,
+                            rule: "去除括注".to_string(),
+                        });
                 }
             }
         }
@@ -1666,9 +1703,12 @@ impl VariantClosure {
             .filter(|word| !word.is_empty())
             .collect();
         if words.len() >= 2
-            && words
-                .iter()
-                .all(|word| word.chars().next().map(|ch| ch.is_ascii_alphabetic()).unwrap_or(false))
+            && words.iter().all(|word| {
+                word.chars()
+                    .next()
+                    .map(|ch| ch.is_ascii_alphabetic())
+                    .unwrap_or(false)
+            })
         {
             let initials: String = words
                 .iter()
@@ -1676,11 +1716,12 @@ impl VariantClosure {
                 .flat_map(|ch| ch.to_uppercase())
                 .collect();
             if initials.chars().count() >= 2 && initials != surface {
-                out.entry(initials.clone()).or_insert(MorphologicalCandidate {
-                    surface: initials,
-                    kind: VariantKind::Initialism,
-                    rule: "取英文首字母".to_string(),
-                });
+                out.entry(initials.clone())
+                    .or_insert(MorphologicalCandidate {
+                        surface: initials,
+                        kind: VariantKind::Initialism,
+                        rule: "取英文首字母".to_string(),
+                    });
             }
         }
         let mut result: Vec<MorphologicalCandidate> = out.into_values().collect();
@@ -1884,10 +1925,13 @@ mod tests {
         let mut closure = VariantClosure::new();
         closure.declare_anchor("北京");
         assert!(closure.add_edge(
-            VariantEdge::new("北平", "北京", VariantKind::FormerName, "北京").valid_years(1928, 1949)
+            VariantEdge::new("北平", "北京", VariantKind::FormerName, "北京")
+                .valid_years(1928, 1949)
         ));
         assert_eq!(
-            closure.resolve("北平", &VariantContext::new().at_year(1935)).canonical(),
+            closure
+                .resolve("北平", &VariantContext::new().at_year(1935))
+                .canonical(),
             Some("北京")
         );
         let expired = closure.resolve("北平", &VariantContext::new().at_year(2020));
@@ -1906,16 +1950,26 @@ mod tests {
         closure.declare_anchor("中国科学院大学");
         closure.declare_anchor("北京大学");
         closure.add_edge(
-            VariantEdge::new("UCAS", "中国科学院大学", VariantKind::Initialism, "中国科学院大学")
-                .with_confidence(0.95),
+            VariantEdge::new(
+                "UCAS",
+                "中国科学院大学",
+                VariantKind::Initialism,
+                "中国科学院大学",
+            )
+            .with_confidence(0.95),
         );
         closure.add_edge(
             VariantEdge::new("UCAS", "北京大学", VariantKind::Alias, "北京大学")
                 .with_confidence(0.95),
         );
         closure.add_edge(
-            VariantEdge::new("国科大", "中国科学院大学", VariantKind::Abbreviation, "中国科学院大学")
-                .with_confidence(0.95),
+            VariantEdge::new(
+                "国科大",
+                "中国科学院大学",
+                VariantKind::Abbreviation,
+                "中国科学院大学",
+            )
+            .with_confidence(0.95),
         );
         let variants = closure.variants_of("中国科学院大学", &VariantContext::new());
         assert_eq!(variants.len(), 1);
@@ -1935,7 +1989,8 @@ mod tests {
         let mut registry = EntityRegistry::new();
         registry.confirm_alias_with_origin("北大", "北京大学", NominationOrigin::Dialogue);
         registry.confirm_alias_with_origin("北大", "北大方正", NominationOrigin::Dialogue);
-        let ambiguous = VariantClosure::from_registry(&registry).alias_pairs(&VariantContext::new());
+        let ambiguous =
+            VariantClosure::from_registry(&registry).alias_pairs(&VariantContext::new());
         assert!(ambiguous.iter().all(|(surface, _)| surface != "北大"));
     }
 
@@ -1989,8 +2044,16 @@ mod tests {
     fn refuted_edge_is_a_persistent_tombstone() {
         let mut closure = VariantClosure::new();
         closure.declare_anchor("北京");
-        closure.add_edge(VariantEdge::new("北平", "北京", VariantKind::FormerName, "北京"));
-        assert_eq!(closure.resolve("北平", &VariantContext::new()).canonical(), Some("北京"));
+        closure.add_edge(VariantEdge::new(
+            "北平",
+            "北京",
+            VariantKind::FormerName,
+            "北京",
+        ));
+        assert_eq!(
+            closure.resolve("北平", &VariantContext::new()).canonical(),
+            Some("北京")
+        );
         assert!(closure.refute_edge("北平", "北京", "北京"));
         assert!(closure.is_edge_refuted("北平", "北京", "北京"));
         let blocked = closure.resolve("北平", &VariantContext::new());

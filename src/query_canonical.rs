@@ -44,9 +44,7 @@ pub const QUERY_CANONICAL_VERSION: &str = "cqi/0.1";
 pub const MAX_CANONICAL_LABELINGS: u64 = 40_320;
 
 /// 关系核心中的一项：变量或常量。
-#[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum CoreTerm {
     Var(String),
     Const(String),
@@ -77,9 +75,7 @@ impl CoreTerm {
 }
 
 /// 一条正向合取原子；谓词目前要求是常量（变量谓词是模板，不是问题身份）。
-#[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct CoreAtom {
     pub subject: CoreTerm,
     pub predicate: String,
@@ -87,11 +83,7 @@ pub struct CoreAtom {
 }
 
 impl CoreAtom {
-    pub fn new(
-        subject: CoreTerm,
-        predicate: impl Into<String>,
-        object: CoreTerm,
-    ) -> Self {
+    pub fn new(subject: CoreTerm, predicate: impl Into<String>, object: CoreTerm) -> Self {
         Self {
             subject,
             predicate: predicate.into(),
@@ -101,9 +93,7 @@ impl CoreAtom {
 }
 
 /// 关系核心上的过滤器。类型约束保留为过滤器，不物化成肯定前提。
-#[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum CoreFilter {
     Equal { var: String, value: String },
     NotEqual { var: String, value: String },
@@ -183,9 +173,7 @@ impl RelationCore {
         }
         for filter in &self.filters {
             if !variables.contains(filter.var()) {
-                return Err(CanonicalError::UnknownVariable(
-                    filter.var().to_string(),
-                ));
+                return Err(CanonicalError::UnknownVariable(filter.var().to_string()));
             }
         }
         let mut selected = BTreeSet::new();
@@ -215,7 +203,13 @@ impl From<&GraphPattern> for RelationCore {
         let atoms = pattern
             .edges
             .iter()
-            .map(|edge| CoreAtom::new(term(&edge.subject), edge.predicate.clone(), term(&edge.object)))
+            .map(|edge| {
+                CoreAtom::new(
+                    term(&edge.subject),
+                    edge.predicate.clone(),
+                    term(&edge.object),
+                )
+            })
             .collect();
         let filters = pattern
             .constraints
@@ -265,7 +259,9 @@ impl fmt::Display for CanonicalError {
             Self::UnsupportedPlan(kind) => {
                 write!(formatter, "计划类型 {} 暂不能压成关系核心", kind)
             }
-            Self::UnsupportedPattern(reason) => write!(formatter, "模式不能压成关系核心：{}", reason),
+            Self::UnsupportedPattern(reason) => {
+                write!(formatter, "模式不能压成关系核心：{}", reason)
+            }
         }
     }
 }
@@ -287,7 +283,10 @@ impl LawReceipt {
             id: format!("alias:{}->{}", surface, canonical),
             label: "别名".to_string(),
             detail: if inverted {
-                format!("把「{}」归一为「{}」并按互逆方向交换主宾语", surface, canonical)
+                format!(
+                    "把「{}」归一为「{}」并按互逆方向交换主宾语",
+                    surface, canonical
+                )
             } else {
                 format!("把「{}」归一为「{}」", surface, canonical)
             },
@@ -591,7 +590,11 @@ impl PlanEquivalence {
                     )
                 }
             }
-            Self::Unknown { left, right, reason } => format!(
+            Self::Unknown {
+                left,
+                right,
+                reason,
+            } => format!(
                 "未知（左 {}，右 {}）：{}",
                 left.as_deref().unwrap_or("超出核心"),
                 right.as_deref().unwrap_or("超出核心"),
@@ -732,9 +735,7 @@ pub fn core_from_plan(plan: &QueryPlan) -> Result<RelationCore, CanonicalError> 
             "Closure：闭包算子暂不进入关系核心",
         )),
         QueryPlan::PathBetween { .. } => Err(CanonicalError::UnsupportedPlan("PathBetween")),
-        QueryPlan::CommonNeighbor { .. } => {
-            Err(CanonicalError::UnsupportedPlan("CommonNeighbor"))
-        }
+        QueryPlan::CommonNeighbor { .. } => Err(CanonicalError::UnsupportedPlan("CommonNeighbor")),
         QueryPlan::Intermediary { .. } => Err(CanonicalError::UnsupportedPlan("Intermediary")),
         QueryPlan::Similar { .. } => Err(CanonicalError::UnsupportedPlan("Similar")),
         QueryPlan::Analogy { .. } => Err(CanonicalError::UnsupportedPlan("Analogy")),
@@ -865,7 +866,10 @@ pub fn compare_plans(
     right: &QueryPlan,
     schema: &CanonicalSchema,
 ) -> PlanEquivalence {
-    match (canonicalize_plan(left, schema), canonicalize_plan(right, schema)) {
+    match (
+        canonicalize_plan(left, schema),
+        canonicalize_plan(right, schema),
+    ) {
         (Ok(left_query), Ok(right_query)) if left_query.key == right_query.key => {
             let mut laws = left_query.laws;
             laws.extend(right_query.laws);
@@ -894,11 +898,7 @@ pub fn compare_plans(
 }
 
 /// 便捷判定：同键才返回 `true`。
-pub fn plans_equivalent(
-    left: &QueryPlan,
-    right: &QueryPlan,
-    schema: &CanonicalSchema,
-) -> bool {
+pub fn plans_equivalent(left: &QueryPlan, right: &QueryPlan, schema: &CanonicalSchema) -> bool {
     compare_plans(left, right, schema).is_equivalent()
 }
 
@@ -1095,7 +1095,11 @@ fn build_label_graph(
     atoms: &[CoreAtom],
     filters: &[CoreFilter],
     select: &[String],
-) -> (Vec<String>, Vec<(usize, &'static str, usize)>, Vec<(String, usize)>) {
+) -> (
+    Vec<String>,
+    Vec<(usize, &'static str, usize)>,
+    Vec<(String, usize)>,
+) {
     let mut names: BTreeSet<String> = BTreeSet::new();
     for atom in atoms {
         for term in [&atom.subject, &atom.object] {
@@ -1192,15 +1196,10 @@ pub(crate) fn refine_colors(
         .enumerate()
         .map(|(index, label)| (*label, index))
         .collect();
-    let mut colors: Vec<usize> = labels
-        .iter()
-        .map(|label| initial[label.as_str()])
-        .collect();
+    let mut colors: Vec<usize> = labels.iter().map(|label| initial[label.as_str()]).collect();
     loop {
-        let mut signatures: Vec<(usize, Vec<(String, usize)>)> = colors
-            .iter()
-            .map(|color| (*color, Vec::new()))
-            .collect();
+        let mut signatures: Vec<(usize, Vec<(String, usize)>)> =
+            colors.iter().map(|color| (*color, Vec::new())).collect();
         for (from, label, to) in edges {
             signatures[*from]
                 .1
@@ -1356,11 +1355,9 @@ pub fn realize_question(plan: &QueryPlan) -> Option<String> {
         QueryPlan::CheckTriple {
             subject_segments,
             object,
-        } if subject_segments.len() >= 2 => Some(format!(
-            "{}是{}",
-            subject_segments.join("的"),
-            object
-        )),
+        } if subject_segments.len() >= 2 => {
+            Some(format!("{}是{}", subject_segments.join("的"), object))
+        }
         QueryPlan::CheckRelation {
             subject,
             predicate,
@@ -1368,21 +1365,14 @@ pub fn realize_question(plan: &QueryPlan) -> Option<String> {
             negated: false,
         } => Some(format!("{}的{}是{}", subject, predicate, object)),
         QueryPlan::CheckRelation { negated: true, .. } => None,
-        QueryPlan::Count { subject, predicate } => {
-            Some(format!("{}有几个{}", subject, predicate))
-        }
-        QueryPlan::Exist { subject, predicate } => {
-            Some(format!("{}有没有{}", subject, predicate))
-        }
+        QueryPlan::Count { subject, predicate } => Some(format!("{}有几个{}", subject, predicate)),
+        QueryPlan::Exist { subject, predicate } => Some(format!("{}有没有{}", subject, predicate)),
         _ => None,
     }
 }
 
 /// 生成中文问句并用同一 schema 回读，校验规范键是否保持不变。
-pub fn audit_realization(
-    plan: &QueryPlan,
-    schema: &CanonicalSchema,
-) -> Option<RealizationAudit> {
+pub fn audit_realization(plan: &QueryPlan, schema: &CanonicalSchema) -> Option<RealizationAudit> {
     let original = canonicalize_plan(plan, schema).ok()?;
     let question = realize_question(plan)?;
     let readback = crate::query_planner::QueryPlanner::new().parse(&question);
@@ -1492,7 +1482,11 @@ mod tests {
         };
         let direct = find_object("李四", "师傅");
         let identity = canonicalize_plan(&inverse, &schema).expect("互逆谓词应可归一");
-        assert!(plans_equivalent(&inverse, &direct, &schema), "{}", identity.receipt());
+        assert!(
+            plans_equivalent(&inverse, &direct, &schema),
+            "{}",
+            identity.receipt()
+        );
         assert!(identity
             .laws
             .iter()
@@ -1588,10 +1582,12 @@ mod tests {
         .expect("模式应可编译");
         let pattern = declared.get("masters").unwrap();
         let graph_identity = canonicalize_graph_pattern(&graph, &schema).expect("图模式应可归一");
-        let pattern_identity =
-            canonicalize_kg_pattern(pattern, &schema).expect("KGP 模式应可归一");
+        let pattern_identity = canonicalize_kg_pattern(pattern, &schema).expect("KGP 模式应可归一");
         assert_eq!(graph_identity.key, pattern_identity.key);
-        assert_eq!(graph_identity.atom_lines, vec!["a(v0,\"师傅\",v1)".to_string()]);
+        assert_eq!(
+            graph_identity.atom_lines,
+            vec!["a(v0,\"师傅\",v1)".to_string()]
+        );
     }
 
     #[test]

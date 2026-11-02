@@ -211,12 +211,7 @@ fn normalize_tag(tag: &str) -> String {
     tag.trim().to_ascii_lowercase()
 }
 
-fn features(
-    referential: bool,
-    countable: bool,
-    predicate: bool,
-    modifier: bool,
-) -> PosFeatures {
+fn features(referential: bool, countable: bool, predicate: bool, modifier: bool) -> PosFeatures {
     PosFeatures {
         referential,
         countable,

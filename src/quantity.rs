@@ -192,11 +192,17 @@ pub static UNITS: &[(&str, Unit)] = &[
     ("秒", unit(Dimension::Duration, 1.0 / 31_536_000.0, 0.0)),
     // 温度
     ("摄氏度", unit(Dimension::Temperature, 1.0, 0.0)),
-    ("华氏度", unit(Dimension::Temperature, 5.0 / 9.0, -32.0 * 5.0 / 9.0)),
+    (
+        "华氏度",
+        unit(Dimension::Temperature, 5.0 / 9.0, -32.0 * 5.0 / 9.0),
+    ),
     ("开尔文", unit(Dimension::Temperature, 1.0, -273.15)),
     ("℃", unit(Dimension::Temperature, 1.0, 0.0)),
     ("°C", unit(Dimension::Temperature, 1.0, 0.0)),
-    ("°F", unit(Dimension::Temperature, 5.0 / 9.0, -32.0 * 5.0 / 9.0)),
+    (
+        "°F",
+        unit(Dimension::Temperature, 5.0 / 9.0, -32.0 * 5.0 / 9.0),
+    ),
     ("K", unit(Dimension::Temperature, 1.0, -273.15)),
     // 计数
     ("个", unit(Dimension::Count, 1.0, 0.0)),
@@ -481,10 +487,7 @@ impl Comparison {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Incomparable {
     /// 两侧量纲不同（例如长度与质量）。
-    DimensionMismatch {
-        left: Dimension,
-        right: Dimension,
-    },
+    DimensionMismatch { left: Dimension, right: Dimension },
     /// 至少一侧无法解析成数量。
     NotAQuantity,
 }
@@ -796,7 +799,8 @@ pub struct RankOutcome<T> {
 /// 同量纲内按基准值排序，约数区间重叠的相邻项共享名次并标记 `uncertain`。
 /// 名次分配在 `offset/limit` 之前完成，因此「第二高」仍能拿到第 2 名。
 pub fn rank<T: Clone>(items: Vec<(T, Quantity)>, spec: &RankSpec) -> RankOutcome<T> {
-    let mut counts: std::collections::BTreeMap<Dimension, usize> = std::collections::BTreeMap::new();
+    let mut counts: std::collections::BTreeMap<Dimension, usize> =
+        std::collections::BTreeMap::new();
     for (_, quantity) in &items {
         *counts.entry(quantity.dimension()).or_insert(0) += 1;
     }
@@ -890,7 +894,10 @@ mod tests {
         assert_eq!(parse_quantity("226").unwrap().base_value(), 226.0);
         assert_eq!(parse_quantity("67万").unwrap().base_value(), 670_000.0);
         assert_eq!(parse_quantity("三亿").unwrap().base_value(), 300_000_000.0);
-        assert_eq!(parse_quantity("四十六亿").unwrap().base_value(), 4_600_000_000.0);
+        assert_eq!(
+            parse_quantity("四十六亿").unwrap().base_value(),
+            4_600_000_000.0
+        );
         assert_eq!(parse_quantity("1.5万").unwrap().base_value(), 15_000.0);
         assert!(parse_quantity("张三").is_none());
         assert!(parse_quantity("").is_none());
@@ -1000,10 +1007,12 @@ mod tests {
                 .compare(&parse_quantity("零下10摄氏度").unwrap()),
             Comparison::Less
         );
-        assert!((parse_quantity("零下40华氏度").unwrap().base_value()
-            - (-40.0 * 5.0 / 9.0 - 32.0 * 5.0 / 9.0))
-            .abs()
-            < 1e-9);
+        assert!(
+            (parse_quantity("零下40华氏度").unwrap().base_value()
+                - (-40.0 * 5.0 / 9.0 - 32.0 * 5.0 / 9.0))
+                .abs()
+                < 1e-9
+        );
     }
 
     #[test]
@@ -1043,8 +1052,14 @@ mod tests {
             parse_quantity("226厘米").unwrap().format_canonical(),
             "2.26米"
         );
-        assert_eq!(parse_quantity("3.5吨").unwrap().format_canonical(), "3500千克");
-        assert_eq!(parse_quantity("约20岁").unwrap().format_canonical(), "约20年");
+        assert_eq!(
+            parse_quantity("3.5吨").unwrap().format_canonical(),
+            "3500千克"
+        );
+        assert_eq!(
+            parse_quantity("约20岁").unwrap().format_canonical(),
+            "约20年"
+        );
         assert_eq!(parse_quantity("226").unwrap().format_canonical(), "226");
     }
 
@@ -1061,7 +1076,10 @@ mod tests {
             Some("约226厘米")
         );
         assert_eq!(
-            parse_quantity("18岁").unwrap().format_in_unit("岁").as_deref(),
+            parse_quantity("18岁")
+                .unwrap()
+                .format_in_unit("岁")
+                .as_deref(),
             Some("18岁")
         );
         assert_eq!(height.format_in_unit("千克"), None);

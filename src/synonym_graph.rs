@@ -160,11 +160,7 @@ pub struct SynonymSense {
 }
 
 impl SynonymSense {
-    pub fn new(
-        type_name: Option<&str>,
-        domain: Option<&str>,
-        range: Option<&str>,
-    ) -> Self {
+    pub fn new(type_name: Option<&str>, domain: Option<&str>, range: Option<&str>) -> Self {
         Self {
             type_name: clean_optional(type_name),
             domain: clean_optional(domain),
@@ -266,9 +262,7 @@ impl SynonymContext {
     }
 
     fn active_domain(&self) -> Option<&str> {
-        self.domain
-            .as_deref()
-            .or(self.predicate.as_deref())
+        self.domain.as_deref().or(self.predicate.as_deref())
     }
 }
 
@@ -567,8 +561,7 @@ impl SynonymGraph {
             }
             let old_observations = existing.observations.max(1);
             let incoming = confidence.clamp(0.0, 1.0);
-            existing.confidence = ((existing.confidence * f64::from(old_observations))
-                + incoming)
+            existing.confidence = ((existing.confidence * f64::from(old_observations)) + incoming)
                 / f64::from(old_observations + 1);
             existing.confidence = existing.confidence.clamp(0.0, 1.0);
             existing.observations = existing.observations.saturating_add(1);
@@ -648,8 +641,8 @@ impl SynonymGraph {
                     graph.confirm(&id, turn);
                 }
                 for alias in &profile.aliases {
-                    if let ObserveOutcome::Added { id } | ObserveOutcome::Reinforced { id } =
-                        graph.observe(
+                    if let ObserveOutcome::Added { id } | ObserveOutcome::Reinforced { id } = graph
+                        .observe(
                             turn,
                             alias,
                             &profile.name,
@@ -681,8 +674,8 @@ impl SynonymGraph {
                     graph.confirm(&id, turn);
                 }
                 for alias in &profile.aliases {
-                    if let ObserveOutcome::Added { id } | ObserveOutcome::Reinforced { id } =
-                        graph.observe(
+                    if let ObserveOutcome::Added { id } | ObserveOutcome::Reinforced { id } = graph
+                        .observe(
                             turn,
                             alias,
                             &profile.name,
@@ -698,17 +691,15 @@ impl SynonymGraph {
             }
         }
         for alias in &config.type_system.aliases {
-            if let ObserveOutcome::Added { id } | ObserveOutcome::Reinforced { id } = graph
-                .observe(
-                    turn,
-                    &alias.alias,
-                    &alias.canonical,
-                    SynonymKind::Type,
-                    SynonymSense::default(),
-                    "type_system",
-                    1.0,
-                )
-            {
+            if let ObserveOutcome::Added { id } | ObserveOutcome::Reinforced { id } = graph.observe(
+                turn,
+                &alias.alias,
+                &alias.canonical,
+                SynonymKind::Type,
+                SynonymSense::default(),
+                "type_system",
+                1.0,
+            ) {
                 graph.confirm(&id, turn);
             }
         }
@@ -726,17 +717,15 @@ impl SynonymGraph {
         let mut pairs: Vec<(&String, &String)> = mappings.iter().collect();
         pairs.sort();
         for (surface, canonical) in pairs {
-            if let ObserveOutcome::Added { id } | ObserveOutcome::Reinforced { id } = graph
-                .observe(
-                    turn,
-                    surface,
-                    canonical,
-                    kind,
-                    SynonymSense::default(),
-                    "config",
-                    1.0,
-                )
-            {
+            if let ObserveOutcome::Added { id } | ObserveOutcome::Reinforced { id } = graph.observe(
+                turn,
+                surface,
+                canonical,
+                kind,
+                SynonymSense::default(),
+                "config",
+                1.0,
+            ) {
                 graph.confirm(&id, turn);
             }
         }
@@ -755,15 +744,14 @@ impl SynonymGraph {
                         continue;
                     }
                     let before = existing.clone();
-                    existing.observations = existing
-                        .observations
-                        .saturating_add(incoming.observations);
+                    existing.observations =
+                        existing.observations.saturating_add(incoming.observations);
                     let total = existing.observations.max(1);
                     existing.confidence = (((existing.confidence
                         * f64::from(before.observations.max(1)))
                         + (incoming.confidence * f64::from(incoming.observations.max(1))))
                         / f64::from(total))
-                        .clamp(0.0, 1.0);
+                    .clamp(0.0, 1.0);
                     existing.last_turn = existing.last_turn.max(incoming.last_turn);
                     existing.first_turn = existing.first_turn.min(incoming.first_turn);
                     existing.sources.extend(incoming.sources.iter().cloned());
@@ -909,9 +897,7 @@ impl SynonymGraph {
                 };
             }
             let canonical = self.entries.values().any(|entry| {
-                entry.kind == kind
-                    && entry.canonical == surface
-                    && !entry.is_refuted()
+                entry.kind == kind && entry.canonical == surface && !entry.is_refuted()
             });
             return SynonymResolution::Unresolved {
                 surface: surface.clone(),
@@ -1007,7 +993,12 @@ impl SynonymGraph {
             right_score
                 .partial_cmp(left_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| left_surface.chars().count().cmp(&right_surface.chars().count()))
+                .then_with(|| {
+                    left_surface
+                        .chars()
+                        .count()
+                        .cmp(&right_surface.chars().count())
+                })
                 .then_with(|| left_surface.cmp(right_surface))
         });
         if let Some((surface, _)) = echo_candidates.into_iter().next() {
@@ -1171,8 +1162,7 @@ impl SynonymGraph {
         let entry_class = Term::NamedNode(NamedNode::new(ENTRY_CLASS)?);
         let mut quads = Vec::with_capacity(self.entries.len() * 8 + 6);
         for entry in self.entries.values() {
-            let subject =
-                NamedNode::new(format!("{}entry/{}", SYNONYM_LEDGER_NS, entry.id))?;
+            let subject = NamedNode::new(format!("{}entry/{}", SYNONYM_LEDGER_NS, entry.id))?;
             quads.push(Quad::new(
                 subject.clone(),
                 rdf_type.clone(),
@@ -1186,13 +1176,13 @@ impl SynonymGraph {
                 &graph,
             )?);
             quads.push(literal_quad(&subject, P_SURFACE, &entry.surface, &graph)?);
-            quads.push(literal_quad(&subject, P_CANONICAL, &entry.canonical, &graph)?);
             quads.push(literal_quad(
                 &subject,
-                P_KIND,
-                entry.kind.key(),
+                P_CANONICAL,
+                &entry.canonical,
                 &graph,
             )?);
+            quads.push(literal_quad(&subject, P_KIND, entry.kind.key(), &graph)?);
             quads.push(literal_quad(
                 &subject,
                 P_STATUS,
@@ -1305,10 +1295,7 @@ impl SynonymGraph {
                     };
                     if let Ok(entry) = serde_json::from_str::<SynonymEntry>(value.value()) {
                         graph.turn = graph.turn.max(entry.last_turn);
-                        graph
-                            .entries
-                            .entry(entry.id.clone())
-                            .or_insert(entry);
+                        graph.entries.entry(entry.id.clone()).or_insert(entry);
                     }
                 }
                 _ => {}
@@ -1428,7 +1415,10 @@ fn senses_for(type_names: &[String], domains: &[String], ranges: &[String]) -> V
     let type_values: Vec<Option<&str>> = if type_names.is_empty() {
         vec![None]
     } else {
-        type_names.iter().map(|value| Some(value.as_str())).collect()
+        type_names
+            .iter()
+            .map(|value| Some(value.as_str()))
+            .collect()
     };
     let domain_values: Vec<Option<&str>> = if domains.is_empty() {
         vec![None]
@@ -1614,8 +1604,7 @@ mod tests {
         let mut graph = SynonymGraph::new(16);
         add(&mut graph, "苹果", "苹果公司", Some("组织"));
         add(&mut graph, "苹果", "苹果", Some("水果"));
-        let resolution =
-            graph.canonicalize("苹果", SynonymKind::Entity, &SynonymContext::new());
+        let resolution = graph.canonicalize("苹果", SynonymKind::Entity, &SynonymContext::new());
         assert!(resolution.is_ambiguous(), "无语境时应保留原词面");
         match resolution {
             SynonymResolution::Ambiguous { candidates, .. } => {
@@ -1693,8 +1682,7 @@ mod tests {
         );
         assert!(matches!(rejected, ObserveOutcome::Rejected { .. }));
         add(&mut graph, "苹果", "苹果", Some("水果"));
-        let resolution =
-            graph.canonicalize("苹果", SynonymKind::Entity, &SynonymContext::new());
+        let resolution = graph.canonicalize("苹果", SynonymKind::Entity, &SynonymContext::new());
         let reading = resolution.resolved().expect("自反条目应解析到自身词义");
         assert_eq!(reading.canonical, "苹果");
         assert!(!reading.changes_surface(), "自反条目不得触发改写");
@@ -1833,16 +1821,13 @@ mod tests {
         let entity = graph.canonicalize("老婆", SynonymKind::Entity, &SynonymContext::new());
         assert_eq!(entity.canonical(), Some("妻子"));
 
-        let predicate =
-            graph.canonicalize("老婆", SynonymKind::Predicate, &SynonymContext::new());
+        let predicate = graph.canonicalize("老婆", SynonymKind::Predicate, &SynonymContext::new());
         assert_eq!(predicate.canonical(), Some("配偶"));
 
-        let teacher =
-            graph.canonicalize("老师", SynonymKind::Predicate, &SynonymContext::new());
+        let teacher = graph.canonicalize("老师", SynonymKind::Predicate, &SynonymContext::new());
         assert_eq!(teacher.canonical(), Some("师傅"));
 
-        let type_alias =
-            graph.canonicalize("Person", SynonymKind::Type, &SynonymContext::new());
+        let type_alias = graph.canonicalize("Person", SynonymKind::Type, &SynonymContext::new());
         assert_eq!(type_alias.canonical(), Some("人物"));
     }
 

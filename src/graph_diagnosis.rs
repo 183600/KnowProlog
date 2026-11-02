@@ -163,7 +163,10 @@ impl MatchDiagnosis {
                     .map(describe_constraint)
                     .collect();
                 if !constraints.is_empty() {
-                    output.push_str(&format!("这些约束无法同时成立：{}。", constraints.join("；")));
+                    output.push_str(&format!(
+                        "这些约束无法同时成立：{}。",
+                        constraints.join("；")
+                    ));
                 }
             }
             DiagnosisKind::BudgetExhausted => {
@@ -238,16 +241,12 @@ pub fn diagnose_failure(
         return Some(diagnosis);
     }
 
-    let options = MatchOptions::new(
-        1,
-        options.max_expansions.max(DEFAULT_MAX_EXPANSIONS),
-    );
+    let options = MatchOptions::new(1, options.max_expansions.max(DEFAULT_MAX_EXPANSIONS));
     let without_constraints = with_constraints(pattern, &[]);
     match satisfiable(&without_constraints, facts, options) {
         Some(true) => {
             diagnosis.kind = DiagnosisKind::ConstraintConflict;
-            diagnosis.failing_constraints =
-                minimal_unsat_constraints(pattern, facts, options);
+            diagnosis.failing_constraints = minimal_unsat_constraints(pattern, facts, options);
         }
         Some(false) => {
             diagnosis.kind = DiagnosisKind::JoinConflict;
@@ -281,9 +280,7 @@ fn inspect_edge(index: &GraphIndex<'_>, edge: &EdgePattern, edge_index: usize) -
     let subject = const_value(&edge.subject);
     let object = const_value(&edge.object);
     let predicate_facts = index.predicate_count(&edge.predicate);
-    let matching_facts = index
-        .candidates(subject, &edge.predicate, object)
-        .len();
+    let matching_facts = index.candidates(subject, &edge.predicate, object).len();
     let issue = if predicate_facts == 0 {
         EdgeIssue::MissingPredicate
     } else if let Some(subject) = subject {
@@ -325,11 +322,7 @@ fn const_value(term: &PatternTerm) -> Option<&str> {
     }
 }
 
-fn satisfiable(
-    pattern: &GraphPattern,
-    facts: &[GraphFact],
-    options: MatchOptions,
-) -> Option<bool> {
+fn satisfiable(pattern: &GraphPattern, facts: &[GraphFact], options: MatchOptions) -> Option<bool> {
     let mut probe = pattern.clone();
     probe.select.clear();
     let outcome = probe.evaluate(facts, options).ok()?;
@@ -484,8 +477,8 @@ mod tests {
             ],
             vec!["person".to_string()],
         );
-        let diagnosis = diagnose_failure(&pattern, &facts(), MatchOptions::default())
-            .expect("零解应产生诊断");
+        let diagnosis =
+            diagnose_failure(&pattern, &facts(), MatchOptions::default()).expect("零解应产生诊断");
         assert_eq!(diagnosis.kind, DiagnosisKind::MissingPredicate);
         assert_eq!(diagnosis.failing_edges, vec![0]);
         let text = diagnosis.render(&pattern);
@@ -501,8 +494,8 @@ mod tests {
             ],
             vec!["city".to_string()],
         );
-        let diagnosis = diagnose_failure(&pattern, &facts(), MatchOptions::default())
-            .expect("零解应产生诊断");
+        let diagnosis =
+            diagnose_failure(&pattern, &facts(), MatchOptions::default()).expect("零解应产生诊断");
         assert_eq!(diagnosis.kind, DiagnosisKind::MissingConstant);
         assert_eq!(diagnosis.failing_edges, vec![1]);
         assert!(diagnosis.render(&pattern).contains("赵六"));
@@ -514,8 +507,8 @@ mod tests {
             vec![EdgePattern::const_const("姚明", "出生地", "北京")],
             vec![],
         );
-        let diagnosis = diagnose_failure(&pattern, &facts(), MatchOptions::default())
-            .expect("零解应产生诊断");
+        let diagnosis =
+            diagnose_failure(&pattern, &facts(), MatchOptions::default()).expect("零解应产生诊断");
         assert_eq!(diagnosis.kind, DiagnosisKind::MissingCombination);
         assert_eq!(diagnosis.edges[0].issue, EdgeIssue::MissingPair);
     }
@@ -529,8 +522,8 @@ mod tests {
             ],
             vec!["city".to_string()],
         );
-        let diagnosis = diagnose_failure(&pattern, &facts(), MatchOptions::default())
-            .expect("零解应产生诊断");
+        let diagnosis =
+            diagnose_failure(&pattern, &facts(), MatchOptions::default()).expect("零解应产生诊断");
         assert_eq!(diagnosis.kind, DiagnosisKind::JoinConflict);
         assert_eq!(diagnosis.failing_edges, vec![0, 1]);
         assert!(diagnosis.render(&pattern).contains("最小冲突组"));
@@ -552,8 +545,8 @@ mod tests {
                 value: "张三".to_string(),
             },
         ]);
-        let diagnosis = diagnose_failure(&pattern, &facts(), MatchOptions::default())
-            .expect("零解应产生诊断");
+        let diagnosis =
+            diagnose_failure(&pattern, &facts(), MatchOptions::default()).expect("零解应产生诊断");
         assert_eq!(diagnosis.kind, DiagnosisKind::ConstraintConflict);
         assert_eq!(diagnosis.failing_constraints, vec![0, 1]);
     }

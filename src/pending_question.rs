@@ -284,7 +284,8 @@ impl PendingQuestionLedger {
     pub fn dismiss_question(&mut self, question: &str) -> bool {
         let question = question.trim();
         let before = self.questions.len() + self.shelved.len();
-        self.questions.retain(|pending| pending.question != question);
+        self.questions
+            .retain(|pending| pending.question != question);
         self.shelved.retain(|pending| pending.question != question);
         self.normalize_active();
         self.questions.len() + self.shelved.len() < before
@@ -302,7 +303,11 @@ impl PendingQuestionLedger {
 
     /// 替换整个队列（恢复快照/批量重排时使用），保持编号单调不回退。
     pub fn replace(&mut self, questions: Vec<PendingQuestion>) {
-        let max_id = questions.iter().map(|pending| pending.id).max().unwrap_or(0);
+        let max_id = questions
+            .iter()
+            .map(|pending| pending.id)
+            .max()
+            .unwrap_or(0);
         self.next_id = self.next_id.max(max_id);
         self.questions = questions;
         if self.questions.len() > MAX_PENDING_QUESTIONS {
@@ -323,17 +328,15 @@ impl PendingQuestionLedger {
             let excess = restored.shelved.len() - MAX_SHELVED_QUESTIONS;
             restored.shelved.drain(0..excess);
         }
-        restored.next_id = saved
-            .next_id
-            .max(
-                restored
-                    .questions
-                    .iter()
-                    .chain(restored.shelved.iter())
-                    .map(|pending| pending.id)
-                    .max()
-                    .unwrap_or(0),
-            );
+        restored.next_id = saved.next_id.max(
+            restored
+                .questions
+                .iter()
+                .chain(restored.shelved.iter())
+                .map(|pending| pending.id)
+                .max()
+                .unwrap_or(0),
+        );
         restored.normalize_active();
         *self = restored;
     }
@@ -342,10 +345,7 @@ impl PendingQuestionLedger {
     pub fn render_ask(pending: &PendingQuestion) -> String {
         let mut output = String::new();
         if pending.support.is_empty() {
-            output.push_str(&format!(
-                "「{}」目前还没有足够的前提。\n",
-                pending.question
-            ));
+            output.push_str(&format!("「{}」目前还没有足够的前提。\n", pending.question));
         } else {
             output.push_str(&format!(
                 "关于「{}」，我现在能证到：{}。\n",
@@ -353,10 +353,7 @@ impl PendingQuestionLedger {
                 pending.support.join("；")
             ));
         }
-        output.push_str(&format!(
-            "还缺一条前提：「{}」。\n",
-            pending.hole.phrase()
-        ));
+        output.push_str(&format!("还缺一条前提：「{}」。\n", pending.hole.phrase()));
         output.push_str(&format!(
             "{} 是谁？直接回复取值即可，我就能回答原来的问题。",
             pending.hole.phrase()
@@ -397,7 +394,10 @@ impl PendingQuestionLedger {
             ));
         }
         if !self.shelved.is_empty() {
-            output.push_str(&format!("已搁置 {} 条（不自动重开）：\n", self.shelved.len()));
+            output.push_str(&format!(
+                "已搁置 {} 条（不自动重开）：\n",
+                self.shelved.len()
+            ));
             for pending in &self.shelved {
                 output.push_str(&format!(
                     "  {}. 「{}」缺「{}」\n",
@@ -516,9 +516,7 @@ pub fn interpret_answer(raw: &str, hole: &PendingHole) -> AnswerBinding {
 }
 
 fn split_fact(text: &str) -> Option<(&str, &str)> {
-    let (left, right) = text
-        .rsplit_once('是')
-        .or_else(|| text.rsplit_once('为'))?;
+    let (left, right) = text.rsplit_once('是').or_else(|| text.rsplit_once('为'))?;
     if left.trim().is_empty() {
         return None;
     }
@@ -569,10 +567,7 @@ fn inverted_fact_subject(left: &str, right: &str, hole: &PendingHole) -> Option<
         return None;
     }
     let compacted = compact(left);
-    let object = compacted
-        .strip_suffix(slot.as_str())?
-        .trim()
-        .to_string();
+    let object = compacted.strip_suffix(slot.as_str())?.trim().to_string();
     if object.is_empty() || object == compact(&hole.subject) {
         return None;
     }
@@ -684,7 +679,10 @@ mod tests {
     #[test]
     fn unknown_is_explicit_and_not_a_negative_fact() {
         assert_eq!(interpret_answer("不知道", &hole()), AnswerBinding::Unknown);
-        assert_eq!(interpret_answer("不清楚。", &hole()), AnswerBinding::Unknown);
+        assert_eq!(
+            interpret_answer("不清楚。", &hole()),
+            AnswerBinding::Unknown
+        );
     }
 
     #[test]

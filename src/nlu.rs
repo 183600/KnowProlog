@@ -1,6 +1,4 @@
-use crate::nlp::{
-    merge_name_fragments, normalize_words_sense_aware_with, preprocess, TaggedWord,
-};
+use crate::nlp::{merge_name_fragments, normalize_words_sense_aware_with, preprocess, TaggedWord};
 use crate::synonym_graph::{SynonymContext, SynonymGraph};
 use crate::type_system::TypeSystem;
 use crate::{NlpConfig, SystemConfig};

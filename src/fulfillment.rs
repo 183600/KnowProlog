@@ -66,7 +66,11 @@ pub struct Fact {
 }
 
 impl Fact {
-    fn new(subject: impl Into<String>, predicate: impl Into<String>, object: impl Into<String>) -> Self {
+    fn new(
+        subject: impl Into<String>,
+        predicate: impl Into<String>,
+        object: impl Into<String>,
+    ) -> Self {
         Self {
             subject: subject.into(),
             predicate: predicate.into(),
@@ -393,11 +397,7 @@ impl FulfillmentReport {
 }
 
 /// 生成义务表（只读配置 + 图，不跑运行时）。
-pub fn plan(
-    registry: &PredicateRegistry,
-    facts: &[PrologFact],
-    max_obligations: usize,
-) -> Plan {
+pub fn plan(registry: &PredicateRegistry, facts: &[PrologFact], max_obligations: usize) -> Plan {
     let graph = NormalizedGraph::from_facts(registry, facts);
     let mut obligations: BTreeMap<String, Obligation> = BTreeMap::new();
     let mut functional_conflicts: Vec<FunctionalConflict> = Vec::new();
@@ -414,12 +414,7 @@ pub fn plan(
 
         if profile.symmetric {
             if pairs.is_empty() {
-                insert_unwitnessed(
-                    &mut obligations,
-                    ObligationKind::Symmetric,
-                    canonical,
-                    None,
-                );
+                insert_unwitnessed(&mut obligations, ObligationKind::Symmetric, canonical, None);
             } else {
                 for (subject, object) in pairs.iter().take(MAX_WITNESSES) {
                     let id = format!("sym:{}:{}->{}", canonical, subject, object);
@@ -464,10 +459,7 @@ pub fn plan(
                     );
                 } else {
                     for (subject, object) in pairs.iter().take(MAX_WITNESSES) {
-                        let id = format!(
-                            "inv:{}|{}:{}->{}",
-                            canonical, inverse, subject, object
-                        );
+                        let id = format!("inv:{}|{}:{}->{}", canonical, inverse, subject, object);
                         let obligation = Obligation {
                             id: id.clone(),
                             kind: ObligationKind::Inverse,
@@ -498,7 +490,10 @@ pub fn plan(
             // 两跳见证：a -P-> b -P-> c，义务是 a 的 P 应包含 c。
             let mut successors: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
             for (subject, object) in &pairs {
-                successors.entry(subject.as_str()).or_default().insert(object.as_str());
+                successors
+                    .entry(subject.as_str())
+                    .or_default()
+                    .insert(object.as_str());
             }
             let mut closures: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
             for (subject, objects) in &successors {
@@ -508,10 +503,7 @@ pub fn plan(
                     };
                     for target in next {
                         if *subject != *target {
-                            closures
-                                .entry(*subject)
-                                .or_default()
-                                .insert(*target);
+                            closures.entry(*subject).or_default().insert(*target);
                         }
                     }
                 }
@@ -528,10 +520,7 @@ pub fn plan(
                     let expected: Vec<String> =
                         expected.iter().map(|value| (*value).to_string()).collect();
                     let id = format!("tra:{}:{}", canonical, subject);
-                    let chain = format!(
-                        "{}的{}的{}是谁",
-                        subject, canonical, canonical
-                    );
+                    let chain = format!("{}的{}的{}是谁", subject, canonical, canonical);
                     let obligation = Obligation {
                         id: id.clone(),
                         kind: ObligationKind::Transitive,
@@ -571,7 +560,10 @@ pub fn plan(
         if profile.functional {
             let mut values: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
             for (subject, object) in &pairs {
-                values.entry(subject.as_str()).or_default().insert(object.as_str());
+                values
+                    .entry(subject.as_str())
+                    .or_default()
+                    .insert(object.as_str());
             }
             for (subject, objects) in values {
                 if objects.len() > 1 {
@@ -742,10 +734,7 @@ fn run_probe(reasoner: &SymbolicReasoner, probe: &Probe) -> ProbeResult {
         .map(|value| normalize_value(value))
         .filter(|value| !value.is_empty())
         .collect();
-    let matched = !expected.is_empty()
-        && expected
-            .iter()
-            .all(|item| observed.contains(item));
+    let matched = !expected.is_empty() && expected.iter().all(|item| observed.contains(item));
     let unknown_answer = answer
         .as_deref()
         .map(is_honest_unknown_answer)
@@ -757,10 +746,7 @@ fn run_probe(reasoner: &SymbolicReasoner, probe: &Probe) -> ProbeResult {
     let (verdict, detail) = if matched {
         (
             Verdict::Fulfilled,
-            format!(
-                "回答包含被蕴涵的取值：{}",
-                render_values(&expected)
-            ),
+            format!("回答包含被蕴涵的取值：{}", render_values(&expected)),
         )
     } else if truncated {
         (
@@ -906,7 +892,9 @@ fn clip(text: &str, limit: usize) -> String {
 }
 
 fn insert_obligation(obligations: &mut BTreeMap<String, Obligation>, obligation: Obligation) {
-    obligations.entry(obligation.id.clone()).or_insert(obligation);
+    obligations
+        .entry(obligation.id.clone())
+        .or_insert(obligation);
 }
 
 fn insert_unwitnessed(
@@ -962,19 +950,17 @@ impl NormalizedGraph {
         };
         for fact in facts {
             match fact {
-                PrologFact::Relation { from, rel_type, to } => {
-                    match registry.lookup(rel_type) {
-                        Some((profile, inverted)) => {
-                            let (subject, object) = if inverted {
-                                (to.as_str(), from.as_str())
-                            } else {
-                                (from.as_str(), to.as_str())
-                            };
-                            graph.insert(profile.canonical.as_str(), subject, object);
-                        }
-                        None => graph.observe_unregistered(rel_type, from, to),
+                PrologFact::Relation { from, rel_type, to } => match registry.lookup(rel_type) {
+                    Some((profile, inverted)) => {
+                        let (subject, object) = if inverted {
+                            (to.as_str(), from.as_str())
+                        } else {
+                            (from.as_str(), to.as_str())
+                        };
+                        graph.insert(profile.canonical.as_str(), subject, object);
                     }
-                }
+                    None => graph.observe_unregistered(rel_type, from, to),
+                },
                 PrologFact::Entity {
                     name, properties, ..
                 } => {
@@ -1347,8 +1333,7 @@ mod tests {
     #[test]
     fn default_config_declares_the_expected_traits() {
         let source = include_str!("../config.toml");
-        let config: crate::SystemConfig =
-            toml::from_str(source).expect("config.toml 应能解析");
+        let config: crate::SystemConfig = toml::from_str(source).expect("config.toml 应能解析");
         let mut registry = PredicateRegistry::new();
         for profile in &config.predicate_profiles {
             registry.declare(profile);

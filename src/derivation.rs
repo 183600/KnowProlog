@@ -182,10 +182,7 @@ impl Derivation {
                 .take(MAX_RENDER_FRONTIER)
                 .map(FailureFrontier::describe)
                 .collect(),
-            frontier_omitted: view
-                .frontier
-                .len()
-                .saturating_sub(MAX_RENDER_FRONTIER)
+            frontier_omitted: view.frontier.len().saturating_sub(MAX_RENDER_FRONTIER)
                 + view.stats.frontier_omitted,
             facts: view.facts,
             rules: view.clauses,
@@ -242,10 +239,7 @@ impl Derivation {
             }
             steps.push(DerivationStep {
                 depth: 0,
-                claim: clip_chars(
-                    &format!("{} 的 {} 是 {}", subject, predicate, object),
-                    240,
-                ),
+                claim: clip_chars(&format!("{} 的 {} 是 {}", subject, predicate, object), 240),
                 canonical: clip_chars(&format!("{}({}, {})", predicate, subject, object), 240),
                 source: DerivationSource::Fact,
                 confidence: 1.0,
@@ -293,12 +287,7 @@ impl Derivation {
                     output.push_str("  证明节点已达到显示预算，未展开具体步骤。\n");
                 } else {
                     output.push_str("  证明步骤：\n");
-                    for (index, step) in self
-                        .steps
-                        .iter()
-                        .take(MAX_RENDER_STEPS)
-                        .enumerate()
-                    {
+                    for (index, step) in self.steps.iter().take(MAX_RENDER_STEPS).enumerate() {
                         let indent = "  ".repeat(step.depth.min(6));
                         output.push_str(&format!(
                             "    {}{}. {}（{}）\n",
@@ -335,13 +324,13 @@ impl Derivation {
                 output.push_str(
                     "没有可展开的完整证明：这次归结搜索已穷尽所有分支，仍未能证明该目标。\n",
                 );
-                output.push_str("  这只能说明当前事实与规则推不出它；开世界假设下，推不出不等于不存在。\n");
+                output.push_str(
+                    "  这只能说明当前事实与规则推不出它；开世界假设下，推不出不等于不存在。\n",
+                );
                 self.render_frontier(&mut output);
             }
             DerivationStatus::Truncated => {
-                output.push_str(
-                    "没有完整的证明：这次归结搜索触发了深度或预算上限，结果被截断。\n",
-                );
+                output.push_str("没有完整的证明：这次归结搜索触发了深度或预算上限，结果被截断。\n");
                 output.push_str("  因此不能据此断言目标不存在，也不能把部分搜索当作证明。\n");
                 self.render_frontier(&mut output);
             }
@@ -486,9 +475,11 @@ mod tests {
             confidence: 0.83,
             proofs: vec![proof],
         };
-        let derivation =
-            Derivation::from_resolution_view(&view(SearchStatus::Proved, vec![solution]), Some("王五"))
-                .expect("应能取到与回答匹配的证明");
+        let derivation = Derivation::from_resolution_view(
+            &view(SearchStatus::Proved, vec![solution]),
+            Some("王五"),
+        )
+        .expect("应能取到与回答匹配的证明");
         assert_eq!(derivation.status, DerivationStatus::Proved);
         assert_eq!(derivation.answer_value(), Some("王五"));
         assert_eq!(derivation.steps.len(), 2);
@@ -522,7 +513,9 @@ mod tests {
             Derivation::from_resolution_view(&view, Some("王五")).expect("应选到匹配答案的解");
         assert_eq!(derivation.answer_value(), Some("王五"));
         assert_eq!(derivation.alternatives, 2);
-        assert!(derivation.render_explanation().contains("另有 2 条独立证明"));
+        assert!(derivation
+            .render_explanation()
+            .contains("另有 2 条独立证明"));
     }
 
     #[test]

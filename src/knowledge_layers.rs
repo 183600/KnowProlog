@@ -57,13 +57,15 @@ impl LayerEntry {
             .collect();
         items.sort();
         items.dedup();
-        let digest = fnv1a_hex(canonical_json(&serde_json::Value::Array(
-            items
-                .iter()
-                .map(|item| serde_json::Value::String(item.clone()))
-                .collect(),
-        ))
-        .as_bytes());
+        let digest = fnv1a_hex(
+            canonical_json(&serde_json::Value::Array(
+                items
+                    .iter()
+                    .map(|item| serde_json::Value::String(item.clone()))
+                    .collect(),
+            ))
+            .as_bytes(),
+        );
         Self {
             id: id.to_string(),
             name: name.to_string(),

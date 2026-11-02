@@ -574,11 +574,7 @@ mod tests {
         let fixed = fix(&path_text, ArtifactKind::DialogueSession).unwrap();
         assert_eq!(fixed.status, ArtifactStatus::Canonical);
 
-        std::fs::write(
-            &path_text,
-            "{\"session_id\":\"\",\"session_version\":1}",
-        )
-        .unwrap();
+        std::fs::write(&path_text, "{\"session_id\":\"\",\"session_version\":1}").unwrap();
         assert!(matches!(
             audit(&path_text, ArtifactKind::DialogueSession).status,
             ArtifactStatus::Damaged(_)

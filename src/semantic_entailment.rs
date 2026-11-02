@@ -692,10 +692,11 @@ fn positive_proof(prop: &Proposition, knowledge: &Knowledge<'_>) -> Option<(Proo
                     keys.push(canonical);
                 }
             }
-            if keys
-                .iter()
-                .any(|key| knowledge.generator.has_attribute(&prop.subject, key, &prop.object))
-            {
+            if keys.iter().any(|key| {
+                knowledge
+                    .generator
+                    .has_attribute(&prop.subject, key, &prop.object)
+            }) {
                 return Some((
                     ProofStep::new(
                         ProofKind::AttributeRecord,
@@ -730,10 +731,9 @@ fn known_values(prop: &Proposition, knowledge: &Knowledge<'_>) -> Vec<String> {
             .predictor
             .objects_of(&prop.subject, &prop.predicate),
         PropositionKind::Attribute => {
-            let mut values =
-                knowledge
-                    .generator
-                    .attribute_values(&prop.subject, &prop.predicate);
+            let mut values = knowledge
+                .generator
+                .attribute_values(&prop.subject, &prop.predicate);
             if let Some(canonical) =
                 crate::symbolic_generator::canonical_predicate_key(&prop.predicate)
             {
@@ -1032,11 +1032,7 @@ mod tests {
     fn test_attribute_entailment_falls_back_to_english_graph_key() {
         let fixture = Fixture::new();
         let mut generator = SymbolicGenerator::new(6, 0.3);
-        generator.observe_entity(
-            "张三",
-            "人物",
-            &[("age".to_string(), "30".to_string())],
-        );
+        generator.observe_entity("张三", "人物", &[("age".to_string(), "30".to_string())]);
         // 模拟配置谓词画像把中文「年龄」登记成独立规范谓词，覆盖了
         // 内置词面表里「年龄」→ age 的映射。
         generator.register_predicate_alias("岁数", "年龄");

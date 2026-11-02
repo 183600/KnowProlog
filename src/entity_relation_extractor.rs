@@ -576,10 +576,7 @@ impl EntityRelationExtractor {
                 continue;
             }
             if word.chars().count() == 1
-                && matches!(
-                    tag_text,
-                    "m" | "q" | "a" | "x" | "j" | "s" | "f" | "n"
-                )
+                && matches!(tag_text, "m" | "q" | "a" | "x" | "j" | "s" | "f" | "n")
             {
                 name.push_str(word);
                 continue;
@@ -645,8 +642,7 @@ impl EntityRelationExtractor {
                     } else {
                         (mat.as_str().to_string(), mat.end())
                     };
-                    let confidence =
-                        self.calculate_entity_confidence(&entity_text, keyword_hits);
+                    let confidence = self.calculate_entity_confidence(&entity_text, keyword_hits);
 
                     if confidence > 0.5 {
                         entities.push(EntityExtraction {
@@ -1401,9 +1397,9 @@ mod tests {
             entities
         );
         assert!(
-            relations.iter().any(|relation| {
-                relation.subject == "张三" && relation.object == "李四"
-            }),
+            relations
+                .iter()
+                .any(|relation| { relation.subject == "张三" && relation.object == "李四" }),
             "{:?}",
             relations
         );
@@ -1422,9 +1418,7 @@ mod tests {
                 relations.iter().any(|relation| {
                     relation.subject == "张三"
                         && relation.object == "李四"
-                        && relation
-                            .extraction_method
-                            .starts_with("dependency_spine_")
+                        && relation.extraction_method.starts_with("dependency_spine_")
                 }),
                 "{} => {:?}",
                 text,

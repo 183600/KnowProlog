@@ -321,7 +321,10 @@ mod tests {
     fn approximate_quantity_is_uncertain_not_a_fake_winner() {
         let exact = BoundTerm::classify("46亿年");
         let approximate = BoundTerm::classify("约46亿年");
-        assert_eq!(compare_quantity(&exact, &approximate), Comparison::Uncertain);
+        assert_eq!(
+            compare_quantity(&exact, &approximate),
+            Comparison::Uncertain
+        );
         assert_eq!(compare_numeric(&exact, &approximate), None);
     }
 

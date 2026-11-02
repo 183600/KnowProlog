@@ -1557,9 +1557,7 @@ impl ClaimLedger {
 
     /// 会话内 claim 台账的文本视图：确定性审计 + 最近更新的断言。
     pub fn render_report(&self) -> String {
-        let mut output = self
-            .audit(None, &AuditOptions::default())
-            .render_zh();
+        let mut output = self.audit(None, &AuditOptions::default()).render_zh();
         if self.claims.is_empty() {
             return output;
         }
@@ -1600,7 +1598,8 @@ impl ClaimLedger {
             .claims
             .get(id)
             .ok_or_else(|| ClaimError::UnknownClaim(id.to_string()))?;
-        let mut output = format!(
+        let mut output =
+            format!(
             "断言 {}：{}（{}）\n  结构：{} / {} / {}{}\n  轮次 {}..{} / 知识版本 v{}\n  曾说：{}",
             record.id,
             record.status.label_zh(),
@@ -1675,7 +1674,6 @@ impl ClaimLedger {
         }
         terms.into_iter().collect()
     }
-
 
     pub fn fact(&self, key: &FactKey) -> Option<&FactRecord> {
         self.facts.get(&key.key())
@@ -2959,15 +2957,16 @@ impl ClaimLedger {
             };
             match event.kind {
                 ClaimEventKind::ClaimEmitted => {
-                    emission_seqs.entry(id.as_str()).or_default().push(event.seq);
+                    emission_seqs
+                        .entry(id.as_str())
+                        .or_default()
+                        .push(event.seq);
                 }
                 ClaimEventKind::ClaimRetracted
                 | ClaimEventKind::ClaimSuperseded
                 | ClaimEventKind::ClaimExpired
                 | ClaimEventKind::ClaimRedacted => {
-                    first_retirement_seq
-                        .entry(id.as_str())
-                        .or_insert(event.seq);
+                    first_retirement_seq.entry(id.as_str()).or_insert(event.seq);
                 }
                 _ => {}
             }
@@ -3033,10 +3032,7 @@ impl ClaimLedger {
                     findings.insert(AuditFinding {
                         code: GateFindingCode::ClaimRetired,
                         claim_id: id.clone(),
-                        detail: format!(
-                            "序号 {} 在首次退役（{}）之后仍被提交",
-                            late, first_seq
-                        ),
+                        detail: format!("序号 {} 在首次退役（{}）之后仍被提交", late, first_seq),
                     });
                 }
             }
@@ -4062,20 +4058,14 @@ mod tests {
         assert_eq!(second.refused.len(), 1);
         let record = ledger.claim(&id).unwrap();
         assert_eq!(record.status, ClaimStatus::Retracted);
-        assert!(!record.origins.iter().any(|origin| matches!(
-            origin,
-            ClaimOrigin::Reply {
-                reply_seq: 2,
-                ..
-            }
-        )));
-        assert!(record.origins.iter().any(|origin| matches!(
-            origin,
-            ClaimOrigin::Reply {
-                reply_seq: 1,
-                ..
-            }
-        )));
+        assert!(!record
+            .origins
+            .iter()
+            .any(|origin| matches!(origin, ClaimOrigin::Reply { reply_seq: 2, .. })));
+        assert!(record
+            .origins
+            .iter()
+            .any(|origin| matches!(origin, ClaimOrigin::Reply { reply_seq: 1, .. })));
     }
 
     #[test]
@@ -4266,13 +4256,7 @@ mod tests {
             )
             .unwrap();
         ledger
-            .retire_claim(
-                &registered.id,
-                RetirementKind::Retracted,
-                "用户否认",
-                2,
-                2,
-            )
+            .retire_claim(&registered.id, RetirementKind::Retracted, "用户否认", 2, 2)
             .unwrap();
         let detail = ledger.explain(&registered.id).unwrap();
         assert!(detail.contains("已撤回"), "{}", detail);
@@ -4382,10 +4366,7 @@ mod tests {
             ledger.revalidate_with_context(&claim.id, 3, 3, &context),
             Err(ClaimError::TombstonedSupport(fact_key.render()))
         );
-        assert_eq!(
-            ledger.claim(&claim.id).unwrap().status,
-            ClaimStatus::Stale
-        );
+        assert_eq!(ledger.claim(&claim.id).unwrap().status, ClaimStatus::Stale);
         assert_eq!(
             ledger.revalidate_with_context(
                 &claim.id,

@@ -432,7 +432,11 @@ impl ShapeSet {
         if attributes.is_empty() {
             return;
         }
-        for shape in self.nodes.iter_mut().flat_map(|node| node.properties.iter_mut()) {
+        for shape in self
+            .nodes
+            .iter_mut()
+            .flat_map(|node| node.properties.iter_mut())
+        {
             apply_attribute_shape(shape, attributes);
         }
         for shape in &mut self.relations {

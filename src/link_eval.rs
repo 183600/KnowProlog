@@ -185,10 +185,7 @@ pub fn seed_corpus() -> &'static [LinkGoldScenario] {
                 ("无间道", Some("电影")),
             ],
             aliases: &[("华仔", "刘德华")],
-            triples: &[
-                ("刘德华", "出演", "无间道"),
-                ("张艺谋", "执导", "无间道"),
-            ],
+            triples: &[("刘德华", "出演", "无间道"), ("张艺谋", "执导", "无间道")],
             turns: &[
                 LinkGoldTurn {
                     input: "华仔是谁",
@@ -271,10 +268,8 @@ impl GoldSense {
             );
         }
         for (subject, predicate, object) in scenario.triples {
-            for (entity, other, incoming) in [
-                (*subject, *object, false),
-                (*object, *subject, true),
-            ] {
+            for (entity, other, incoming) in [(*subject, *object, false), (*object, *subject, true)]
+            {
                 let card = sense
                     .cards
                     .entry(entity.to_string())
@@ -571,7 +566,10 @@ fn ratio(numerator: u32, denominator: u32) -> f64 {
     }
 }
 
-fn lattice_for<'a>(mentions: &'a [LinkedMention], turn: &LinkGoldTurn) -> Option<&'a LinkedMention> {
+fn lattice_for<'a>(
+    mentions: &'a [LinkedMention],
+    turn: &LinkGoldTurn,
+) -> Option<&'a LinkedMention> {
     mentions.iter().find(|mention| {
         mention.start == turn.start
             && (mention.mention == turn.mention || mention.mention.contains(turn.mention))
@@ -662,11 +660,7 @@ pub fn evaluate(scenarios: &[LinkGoldScenario]) -> LinkEvalReport {
                             (entity == expected).then_some(entity)
                         }
                         Some(ClarifyAct::Correct { to, .. }) => {
-                            ledger.correct(
-                                &ask.key,
-                                &to,
-                                &format!("评测澄清纠正：{}", turn.input),
-                            );
+                            ledger.correct(&ask.key, &to, &format!("评测澄清纠正：{}", turn.input));
                             (to == expected).then_some(to)
                         }
                         Some(ClarifyAct::Unknown) | Some(ClarifyAct::Decline) | None => None,
@@ -682,14 +676,7 @@ pub fn evaluate(scenarios: &[LinkGoldScenario]) -> LinkEvalReport {
 
             mentions += 1;
             let hints: Vec<String> = turn.hints.iter().map(|hint| (*hint).to_string()).collect();
-            let outcome = resolver.resolve_text(
-                turn.input,
-                &linker,
-                &sense,
-                &ledger,
-                &hints,
-                None,
-            );
+            let outcome = resolver.resolve_text(turn.input, &linker, &sense, &ledger, &hints, None);
             let lattice = linker.link_lattice(turn.input, &hints);
             let receipt_list = linker.mention_receipts(turn.input, &hints, &[], None);
             let suspects = oov_suspects(turn.input, &receipt_list);
@@ -733,9 +720,9 @@ pub fn evaluate(scenarios: &[LinkGoldScenario]) -> LinkEvalReport {
                     actions_correct += 1;
                 }
                 (GoldAction::Clarify(options), Predicted::Clarify(actual))
-                    if options
-                        .iter()
-                        .all(|option| actual.iter().any(|candidate| candidate.as_str() == *option)) =>
+                    if options.iter().all(|option| {
+                        actual.iter().any(|candidate| candidate.as_str() == *option)
+                    }) =>
                 {
                     actions_correct += 1;
                 }
@@ -746,15 +733,14 @@ pub fn evaluate(scenarios: &[LinkGoldScenario]) -> LinkEvalReport {
             match turn.action {
                 GoldAction::Link(expected) => {
                     link_expected += 1;
-                    if matches!(predicted, Predicted::Link(ref actual) if actual.as_str() == expected) {
+                    if matches!(predicted, Predicted::Link(ref actual) if actual.as_str() == expected)
+                    {
                         links_correct += 1;
                     }
                     if matches!(predicted, Predicted::Clarify(_)) {
                         over_asks += 1;
                     }
-                    if let (Some(chain_id), Predicted::Link(actual)) =
-                        (turn.chain, &predicted)
-                    {
+                    if let (Some(chain_id), Predicted::Link(actual)) = (turn.chain, &predicted) {
                         if let Some(previous) = chain_entities.get(chain_id) {
                             if previous != actual {
                                 chain_flips += 1;
@@ -786,7 +772,9 @@ pub fn evaluate(scenarios: &[LinkGoldScenario]) -> LinkEvalReport {
                         clarify_options_hit += options
                             .iter()
                             .filter(|option| {
-                                actual.iter().any(|candidate| candidate.as_str() == **option)
+                                actual
+                                    .iter()
+                                    .any(|candidate| candidate.as_str() == **option)
                             })
                             .count() as u32;
                         let key = fold_surface(&ask.mention);
@@ -805,10 +793,7 @@ pub fn evaluate(scenarios: &[LinkGoldScenario]) -> LinkEvalReport {
                     }
                     if turn.oov_suspect {
                         oov_expected += 1;
-                        if suspects
-                            .iter()
-                            .any(|suspect| suspect.text == turn.mention)
-                        {
+                        if suspects.iter().any(|suspect| suspect.text == turn.mention) {
                             oov_nominated += 1;
                         }
                     }
@@ -869,7 +854,8 @@ mod tests {
         assert_eq!(report.link_accuracy, 1.0, "{}", report.render_text());
         assert_eq!(report.clarify_recall, 1.0, "{}", report.render_text());
         assert_eq!(
-            report.clarify_option_coverage, 1.0,
+            report.clarify_option_coverage,
+            1.0,
             "{}",
             report.render_text()
         );
@@ -878,7 +864,8 @@ mod tests {
         assert_eq!(report.oov_recall, 1.0, "{}", report.render_text());
         assert_eq!(report.binding_accuracy, 1.0, "{}", report.render_text());
         assert_eq!(
-            report.immediate_binding_rate, 1.0,
+            report.immediate_binding_rate,
+            1.0,
             "{}",
             report.render_text()
         );

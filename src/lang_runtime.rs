@@ -204,7 +204,9 @@ pub struct LangRollback {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LangReloadOutcome {
     Applied(LangApply),
-    Unchanged { epoch: u64 },
+    Unchanged {
+        epoch: u64,
+    },
     Rejected {
         reason: String,
         issues: Vec<ConfigIssue>,
@@ -313,9 +315,8 @@ impl LangRuntime {
     pub fn apply_source(&mut self, source: &str) -> Result<LangReloadOutcome, LangRuntimeError> {
         let (canonical, sections) =
             canonical_source(source).map_err(|error| LangRuntimeError::Parse(error.to_string()))?;
-        let config: SystemConfig = toml::from_str(source).map_err(|error| {
-            LangRuntimeError::Parse(format!("不是合法的配置结构：{}", error))
-        })?;
+        let config: SystemConfig = toml::from_str(source)
+            .map_err(|error| LangRuntimeError::Parse(format!("不是合法的配置结构：{}", error)))?;
         let issues = config_contract::lint(&config);
         if config_contract::has_errors(&issues) {
             return Ok(LangReloadOutcome::Rejected {
@@ -471,7 +472,10 @@ mod tests {
     fn mutate<T>(source: &str, edit: impl FnOnce(&mut toml::Value) -> T) -> (String, T) {
         let mut value: toml::Value = toml::from_str(source).expect("测试配置应可解析");
         let outcome = edit(&mut value);
-        (toml::to_string(&value).expect("测试配置应可序列化"), outcome)
+        (
+            toml::to_string(&value).expect("测试配置应可序列化"),
+            outcome,
+        )
     }
 
     fn runtime_with(source: &str) -> (tempfile::TempDir, LangRuntime) {
@@ -574,7 +578,10 @@ mod tests {
         assert_eq!(runtime.epoch(), 1);
         assert_eq!(runtime.history_len(), 0);
         let (canonical, _) = canonical_source(&source).unwrap();
-        assert_eq!(runtime.current().fingerprint, fnv1a_hex(canonical.as_bytes()));
+        assert_eq!(
+            runtime.current().fingerprint,
+            fnv1a_hex(canonical.as_bytes())
+        );
     }
 
     #[test]
@@ -655,10 +662,7 @@ mod tests {
             panic!("语义变化应形成新快照：{outcome:?}");
         };
         assert!(apply.diff.changed.contains(&"system".to_string()));
-        assert!(apply
-            .diff
-            .restart_required
-            .contains(&"system".to_string()));
+        assert!(apply.diff.restart_required.contains(&"system".to_string()));
         assert_eq!(
             runtime.current().language_config().system.default_language,
             config(&source).system.default_language,

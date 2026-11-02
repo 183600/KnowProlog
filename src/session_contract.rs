@@ -311,10 +311,7 @@ impl SessionReport {
                 }
             }
             if !receipt.missing_obligations.is_empty() {
-                output.push_str(&format!(
-                    " 欠 {}",
-                    receipt.missing_obligations.join("、")
-                ));
+                output.push_str(&format!(" 欠 {}", receipt.missing_obligations.join("、")));
             }
             if !receipt.gaps.is_empty() {
                 output.push_str(&format!(" 缺口 {}", receipt.gaps.join("、")));
@@ -452,9 +449,8 @@ fn capture_turn(
     let focus_before = manager.focus_entity().map(str::to_string);
     let frame = manager.analyze(input, knowledge);
     let turns_before = manager.turns().len();
-    let previous_episode = crate::answer_taxonomy::AnswerEpisode::from_turns(
-        &manager.turns()[..turns_before],
-    );
+    let previous_episode =
+        crate::answer_taxonomy::AnswerEpisode::from_turns(&manager.turns()[..turns_before]);
     let reply = manager
         .plan_pure_dialogue(input, knowledge)
         .or_else(|| manager.plan_reply(input, knowledge));
@@ -490,9 +486,7 @@ fn capture_turn(
         .cloned()
         .collect();
     let state_digest = canonical_digest(&manager.snapshot()).unwrap_or_default();
-    let last_turn = appended
-        .then(|| manager.turns().last())
-        .flatten();
+    let last_turn = appended.then(|| manager.turns().last()).flatten();
     let episode = reply.as_ref().map(|reply| {
         crate::answer_taxonomy::AnswerEpisode::observe_reply(
             previous_episode.as_ref(),

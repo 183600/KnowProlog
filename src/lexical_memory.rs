@@ -180,11 +180,7 @@ impl LexicalMemory {
     }
 
     /// 观察一段已经标注过的文本。轮次只增不减，保证跨会话的 last_turn 单调。
-    pub fn observe_annotated(
-        &mut self,
-        turn: u64,
-        words: &[AnnotatedWord],
-    ) -> ObservationSummary {
+    pub fn observe_annotated(&mut self, turn: u64, words: &[AnnotatedWord]) -> ObservationSummary {
         self.turn = self.turn.max(turn);
         let mut summary = ObservationSummary::default();
 
@@ -283,10 +279,7 @@ impl LexicalMemory {
                 last_turn: turn,
             });
         entry.last_turn = entry.last_turn.max(turn);
-        *entry
-            .counts
-            .entry(expected_type.to_string())
-            .or_insert(0) += 1;
+        *entry.counts.entry(expected_type.to_string()).or_insert(0) += 1;
     }
 
     /// 删去超出容量的词条：先保留最近使用、再保留高观察次数。
@@ -326,7 +319,11 @@ impl LexicalMemory {
             return None;
         }
         let mut counts: BTreeMap<String, u32> = BTreeMap::new();
-        for entry in self.tokens.values().filter(|entry| entry.surface == surface) {
+        for entry in self
+            .tokens
+            .values()
+            .filter(|entry| entry.surface == surface)
+        {
             for (expected, votes) in &entry.type_votes {
                 *counts.entry(expected.clone()).or_insert(0) += votes;
             }
@@ -531,10 +528,9 @@ impl LexicalMemory {
                 &entry.last_turn.to_string(),
                 &graph,
             )?);
-            if let Some(expectation) = expectation_from_counts(
-                &entry.type_votes,
-                entry.type_votes.values().copied().sum(),
-            ) {
+            if let Some(expectation) =
+                expectation_from_counts(&entry.type_votes, entry.type_votes.values().copied().sum())
+            {
                 quads.push(literal_quad(
                     &subject,
                     P_EXPECTED_TYPE,
@@ -544,7 +540,11 @@ impl LexicalMemory {
                 quads.push(literal_quad(
                     &subject,
                     P_CONFLICT,
-                    if expectation.conflict { "true" } else { "false" },
+                    if expectation.conflict {
+                        "true"
+                    } else {
+                        "false"
+                    },
                     &graph,
                 )?);
             }
@@ -596,7 +596,11 @@ impl LexicalMemory {
                 quads.push(literal_quad(
                     &subject,
                     P_CONFLICT,
-                    if expectation.conflict { "true" } else { "false" },
+                    if expectation.conflict {
+                        "true"
+                    } else {
+                        "false"
+                    },
                     &graph,
                 )?);
             }
@@ -697,7 +701,11 @@ impl LexicalMemory {
                     expectation.expected_type,
                     expectation.votes,
                     expectation.total,
-                    if expectation.conflict { " ⚠冲突" } else { "" }
+                    if expectation.conflict {
+                        " ⚠冲突"
+                    } else {
+                        ""
+                    }
                 )
             })
             .unwrap_or_else(|| "→ 无类型证据".to_string());
@@ -723,7 +731,11 @@ impl LexicalMemory {
                     expectation.expected_type,
                     expectation.votes,
                     expectation.total,
-                    if expectation.conflict { " ⚠冲突" } else { "" }
+                    if expectation.conflict {
+                        " ⚠冲突"
+                    } else {
+                        ""
+                    }
                 ));
             }
         }
@@ -731,10 +743,7 @@ impl LexicalMemory {
     }
 }
 
-fn expectation_from_counts(
-    counts: &BTreeMap<String, u32>,
-    total: u32,
-) -> Option<TypeExpectation> {
+fn expectation_from_counts(counts: &BTreeMap<String, u32>, total: u32) -> Option<TypeExpectation> {
     let mut ranked: Vec<(String, u32)> = counts
         .iter()
         .filter(|(_, votes)| **votes > 0)
@@ -1002,7 +1011,9 @@ mod tests {
         );
         let preferences = memory.classifiers_for_type("人物", 1);
         assert_eq!(preferences.len(), 2, "{:?}", preferences);
-        assert!(preferences.iter().all(|entry| entry.expected_type == "人物"));
+        assert!(preferences
+            .iter()
+            .all(|entry| entry.expected_type == "人物"));
         assert!(preferences.iter().all(|entry| !entry.conflict));
 
         memory.observe_annotated(
@@ -1096,7 +1107,9 @@ mod tests {
         assert_eq!(restored.len(), memory.len());
         assert_eq!(restored.fingerprint(), memory.fingerprint());
         assert_eq!(
-            restored.classifier_expectation("家").map(|e| e.expected_type),
+            restored
+                .classifier_expectation("家")
+                .map(|e| e.expected_type),
             Some("组织".to_string())
         );
     }

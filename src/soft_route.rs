@@ -354,10 +354,9 @@ impl SoftCandidate {
             .flatten()
             .fold(None::<Span>, |acc, span| {
                 Some(match acc {
-                    Some(existing) => Span::new(
-                        existing.start.min(span.start),
-                        existing.end.max(span.end),
-                    ),
+                    Some(existing) => {
+                        Span::new(existing.start.min(span.start), existing.end.max(span.end))
+                    }
                     None => *span,
                 })
             })
@@ -406,7 +405,10 @@ impl SoftRouteOutcome {
         if self.decision != SoftDecision::Clarify {
             return Vec::new();
         }
-        self.selected.iter().chain(self.alternatives.iter()).collect()
+        self.selected
+            .iter()
+            .chain(self.alternatives.iter())
+            .collect()
     }
 
     pub fn render_report(&self, input: &str) -> String {
@@ -473,7 +475,11 @@ impl SoftRouteOutcome {
                     candidate.query_type(),
                     candidate.confidence,
                     status,
-                    if candidate.entry.fallback { "回退层" } else { "配置层" }
+                    if candidate.entry.fallback {
+                        "回退层"
+                    } else {
+                        "配置层"
+                    }
                 );
                 let _ = writeln!(
                     out,
@@ -547,9 +553,9 @@ pub fn route_tokens(
         }
         let alignment = align(entry, tokens, config);
         let mut evidence = Vec::new();
-        let priority_norm =
-            (entry.priority - min_priority) as f64 / priority_span;
-        let prior = 0.45 + config.priority_gain * (priority_norm - 0.5)
+        let priority_norm = (entry.priority - min_priority) as f64 / priority_span;
+        let prior = 0.45
+            + config.priority_gain * (priority_norm - 0.5)
             + config.specificity_gain * (entry.specificity() - 0.5);
         let prior = prior.clamp(0.05, 0.95);
         let prior_logit = logit(prior);
@@ -610,14 +616,13 @@ pub fn route_tokens(
         .filter(|candidate| candidate.eligible() && candidate.entry.fallback)
         .collect();
     let route_decision = decide(&route_eligible, config);
-    let (eligible, decision) = if route_decision == SoftDecision::Reject
-        && !fallback_eligible.is_empty()
-    {
-        let fallback_decision = decide(&fallback_eligible, config);
-        (fallback_eligible, fallback_decision)
-    } else {
-        (route_eligible, route_decision)
-    };
+    let (eligible, decision) =
+        if route_decision == SoftDecision::Reject && !fallback_eligible.is_empty() {
+            let fallback_decision = decide(&fallback_eligible, config);
+            (fallback_eligible, fallback_decision)
+        } else {
+            (route_eligible, route_decision)
+        };
     let selected = match decision {
         SoftDecision::Accept | SoftDecision::Clarify => eligible.first().map(|c| (*c).clone()),
         SoftDecision::Reject => None,
@@ -762,11 +767,18 @@ fn sigmoid(value: f64) -> f64 {
 /// 对一条模式做软对齐。精确匹配优先，失败后走动态规划。
 pub fn align(entry: &PatternEntry, tokens: &[TaggedWord], config: &SoftRouteConfig) -> Alignment {
     if let Ok(matched) = match_entry_detailed(entry, tokens) {
-        let non_skippable = tokens.iter().filter(|token| !is_skippable(&token.text)).count();
+        let non_skippable = tokens
+            .iter()
+            .filter(|token| !is_skippable(&token.text))
+            .count();
         let matched_tokens = non_skippable;
         return Alignment {
             total_elems: entry.elems.len(),
-            matched_elems: matched.elem_spans.iter().filter(|span| span.is_some()).count(),
+            matched_elems: matched
+                .elem_spans
+                .iter()
+                .filter(|span| span.is_some())
+                .count(),
             partial_elems: 0,
             matched_tokens,
             total_tokens: non_skippable,
@@ -814,7 +826,10 @@ struct ElemHit {
 
 fn align_soft(entry: &PatternEntry, tokens: &[TaggedWord], config: &SoftRouteConfig) -> Alignment {
     let elems = &entry.elems;
-    let total_tokens = tokens.iter().filter(|token| !is_skippable(&token.text)).count();
+    let total_tokens = tokens
+        .iter()
+        .filter(|token| !is_skippable(&token.text))
+        .count();
     let total_elems = elems.len();
     let weights: Vec<f64> = elems.iter().map(elem_weight).collect();
     let total_weight: f64 = weights.iter().sum();
@@ -909,12 +924,15 @@ fn align_soft(entry: &PatternEntry, tokens: &[TaggedWord], config: &SoftRouteCon
         }
     }
 
-    let (end_j, best) = best.unwrap_or((0, State {
-        score: 0.0,
-        matched_elems: 0,
-        matched_tokens: 0,
-        action: Action::Start,
-    }));
+    let (end_j, best) = best.unwrap_or((
+        0,
+        State {
+            score: 0.0,
+            matched_elems: 0,
+            matched_tokens: 0,
+            action: Action::Start,
+        },
+    ));
     let mut elem_spans: Vec<Option<Span>> = vec![None; total_elems];
     let mut entities = Vec::new();
     let mut entity_spans = Vec::new();
@@ -1148,12 +1166,7 @@ fn pos_match(expected: &str, token: &TaggedWord) -> Option<ElemHit> {
     })
 }
 
-fn slot_match(
-    name: &str,
-    sort: &str,
-    hints: &[String],
-    token: &TaggedWord,
-) -> Option<ElemHit> {
+fn slot_match(name: &str, sort: &str, hints: &[String], token: &TaggedWord) -> Option<ElemHit> {
     if hints.iter().any(|hint| {
         !hint.is_empty() && (token.text.contains(hint.as_str()) || hint.contains(&token.text))
     }) {
@@ -1168,7 +1181,9 @@ fn slot_match(
         "城市" | "地点" => {
             if crate::pos_ontology::tag_matches("ns", &token.pos) || is_city_literal(&token.text) {
                 1.0
-            } else if crate::pos_ontology::profile(&token.pos).has_sort(crate::pos_ontology::Sort::Place) {
+            } else if crate::pos_ontology::profile(&token.pos)
+                .has_sort(crate::pos_ontology::Sort::Place)
+            {
                 0.9
             } else if token.pos == "n" {
                 0.85
@@ -1186,7 +1201,9 @@ fn slot_match(
                 1.0
             } else if crate::pos_ontology::tag_matches("m", &token.pos) {
                 0.8
-            } else if crate::pos_ontology::profile(&token.pos).has_sort(crate::pos_ontology::Sort::Time) {
+            } else if crate::pos_ontology::profile(&token.pos)
+                .has_sort(crate::pos_ontology::Sort::Time)
+            {
                 0.9
             } else {
                 return None;
@@ -1224,7 +1241,9 @@ fn slot_match(
         "属性" => {
             if matches!(token.pos.as_str(), "n" | "nz" | "vn") {
                 1.0
-            } else if crate::pos_ontology::profile(&token.pos).has_sort(crate::pos_ontology::Sort::Attribute) {
+            } else if crate::pos_ontology::profile(&token.pos)
+                .has_sort(crate::pos_ontology::Sort::Attribute)
+            {
                 0.8
             } else if crate::pos_ontology::tag_matches("v", &token.pos) {
                 0.7
@@ -1666,7 +1685,10 @@ mod tests {
             text: "某地".to_string(),
             pos: "s".to_string(),
         };
-        assert_eq!(slot_match("城市", "地点", &[], &place).map(|hit| hit.quality), Some(0.9));
+        assert_eq!(
+            slot_match("城市", "地点", &[], &place).map(|hit| hit.quality),
+            Some(0.9)
+        );
         let time = TaggedWord {
             text: "今天".to_string(),
             pos: "t".to_string(),
@@ -1685,7 +1707,13 @@ mod tests {
             ("哪里", "r"),
         ]);
         let config = SoftRouteConfig::default();
-        let outcome = route_tokens("法国的首都是哪里", &library, &words, &PatternContext::default(), &config);
+        let outcome = route_tokens(
+            "法国的首都是哪里",
+            &library,
+            &words,
+            &PatternContext::default(),
+            &config,
+        );
         assert_eq!(outcome.decision, SoftDecision::Accept);
         let selected = outcome.selected.expect("应接受精确候选");
         assert!(selected.alignment.exact);
@@ -1707,15 +1735,21 @@ mod tests {
                 Elem::word("哪里"),
             ],
         )]);
-        let words = tokens(&[
-            ("法国", "ns"),
-            ("首都", "n"),
-            ("是", "v"),
-            ("哪里", "r"),
-        ]);
+        let words = tokens(&[("法国", "ns"), ("首都", "n"), ("是", "v"), ("哪里", "r")]);
         let config = SoftRouteConfig::default();
-        let outcome = route_tokens("法国首都是哪里", &library, &words, &PatternContext::default(), &config);
-        assert_eq!(outcome.decision, SoftDecision::Accept, "{}", outcome.render_report("法国首都是哪里"));
+        let outcome = route_tokens(
+            "法国首都是哪里",
+            &library,
+            &words,
+            &PatternContext::default(),
+            &config,
+        );
+        assert_eq!(
+            outcome.decision,
+            SoftDecision::Accept,
+            "{}",
+            outcome.render_report("法国首都是哪里")
+        );
         let selected = outcome.selected.expect("应接受近失候选");
         assert!(!selected.alignment.exact);
         assert_eq!(selected.query_type(), "capital_query");
@@ -1728,7 +1762,13 @@ mod tests {
         let library = capital_library();
         let words = tokens(&[("法国", "ns")]);
         let config = SoftRouteConfig::default();
-        let outcome = route_tokens("法国", &library, &words, &PatternContext::default(), &config);
+        let outcome = route_tokens(
+            "法国",
+            &library,
+            &words,
+            &PatternContext::default(),
+            &config,
+        );
         assert_eq!(outcome.decision, SoftDecision::Reject);
         assert!(outcome.selected.is_none());
     }
@@ -1754,7 +1794,13 @@ mod tests {
         ]);
         let words = tokens(&[("北京", "ns"), ("哪里", "r")]);
         let config = SoftRouteConfig::default();
-        let outcome = route_tokens("北京哪里", &library, &words, &PatternContext::default(), &config);
+        let outcome = route_tokens(
+            "北京哪里",
+            &library,
+            &words,
+            &PatternContext::default(),
+            &config,
+        );
         assert_eq!(outcome.decision, SoftDecision::Clarify);
         assert!(outcome.clarification_options().len() >= 2);
     }
@@ -1775,13 +1821,24 @@ mod tests {
         );
         let words = tokens(&[("首都", "n"), ("哪里", "r")]);
         let config = SoftRouteConfig::default();
-        let empty = route_tokens("首都哪里", &library, &words, &PatternContext::default(), &config);
+        let empty = route_tokens(
+            "首都哪里",
+            &library,
+            &words,
+            &PatternContext::default(),
+            &config,
+        );
         assert_eq!(empty.decision, SoftDecision::Reject);
         let mut context = PatternContext::default();
         context.focus = Some("北京".to_string());
         let with_focus = route_tokens("首都哪里", &library, &words, &context, &config);
         assert_eq!(with_focus.decision, SoftDecision::Accept);
-        assert!(with_focus.selected.unwrap().evidence.iter().any(|term| term.name == "上下文"));
+        assert!(with_focus
+            .selected
+            .unwrap()
+            .evidence
+            .iter()
+            .any(|term| term.name == "上下文"));
     }
 
     #[test]
@@ -1807,7 +1864,13 @@ mod tests {
         library.add(fallback);
         let words = tokens(&[("法国", "ns"), ("首都", "n")]);
         let config = SoftRouteConfig::default();
-        let outcome = route_tokens("法国首都", &library, &words, &PatternContext::default(), &config);
+        let outcome = route_tokens(
+            "法国首都",
+            &library,
+            &words,
+            &PatternContext::default(),
+            &config,
+        );
         assert_eq!(outcome.decision, SoftDecision::Accept);
         assert_eq!(outcome.selected.unwrap().entry.source, "config#capital");
     }
@@ -1821,11 +1884,7 @@ mod tests {
             "altitude_query",
             10,
             true,
-            vec![
-                Elem::pos("ns"),
-                Elem::word("海拔"),
-                Elem::word("多少"),
-            ],
+            vec![Elem::pos("ns"), Elem::word("海拔"), Elem::word("多少")],
         ));
         let mut fallback = PatternEntry::new(
             "泛化属性回退",
@@ -1837,12 +1896,7 @@ mod tests {
         );
         fallback.fallback = true;
         library.add(fallback);
-        let words = tokens(&[
-            ("北京", "ns"),
-            ("海拔", "n"),
-            ("高度", "n"),
-            ("多少", "r"),
-        ]);
+        let words = tokens(&[("北京", "ns"), ("海拔", "n"), ("高度", "n"), ("多少", "r")]);
         let context = PatternContext::default();
         assert!(library.match_route_with_context(&words, &context).is_none());
         assert_eq!(
@@ -1881,14 +1935,15 @@ mod tests {
     #[test]
     fn report_is_readable_and_auditable() {
         let library = capital_library();
-        let words = tokens(&[
-            ("法国", "ns"),
-            ("首都", "n"),
-            ("是", "v"),
-            ("哪里", "r"),
-        ]);
+        let words = tokens(&[("法国", "ns"), ("首都", "n"), ("是", "v"), ("哪里", "r")]);
         let config = SoftRouteConfig::default();
-        let outcome = route_tokens("法国首都是哪里", &library, &words, &PatternContext::default(), &config);
+        let outcome = route_tokens(
+            "法国首都是哪里",
+            &library,
+            &words,
+            &PatternContext::default(),
+            &config,
+        );
         let report = outcome.render_report("法国首都是哪里");
         assert!(report.contains("软路由"), "{}", report);
         assert!(report.contains("判定：接受"), "{}", report);
@@ -1907,9 +1962,7 @@ mod tests {
         assert_eq!(report.correct, report.exact_correct + report.soft_recovered);
         assert_eq!(
             report.cases,
-            report.exact_correct
-                + report.exact_wrong
-                + report.exact_unanswered
+            report.exact_correct + report.exact_wrong + report.exact_unanswered
         );
         assert_eq!(
             report.exact_unanswered,

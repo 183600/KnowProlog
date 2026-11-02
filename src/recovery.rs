@@ -331,21 +331,16 @@ impl RecoveryState {
     }
 
     /// 记录一条会话层否定证据（同一候选只保留一条）。
-    pub fn record_refuted(
-        &mut self,
-        entity: &str,
-        attribute: &str,
-        value: &str,
-        receipt_id: &str,
-    ) {
+    pub fn record_refuted(&mut self, entity: &str, attribute: &str, value: &str, receipt_id: &str) {
         let entity = entity.trim();
         let attribute = attribute.trim();
         let value = value.trim();
         if entity.is_empty() || attribute.is_empty() || value.is_empty() {
             return;
         }
-        self.confirmed
-            .retain(|fact| !(fact.entity == entity && fact.attribute == attribute && fact.value == value));
+        self.confirmed.retain(|fact| {
+            !(fact.entity == entity && fact.attribute == attribute && fact.value == value)
+        });
         self.refuted.retain(|candidate| {
             !(candidate.entity == entity
                 && candidate.attribute == attribute
@@ -866,10 +861,9 @@ pub fn resolve_clarification(state: &mut RecoveryState, answer: &str) -> Option<
         .resolve(&followup.receipt_id, ReceiptResolution::Acknowledged);
     let answer = answer.trim();
     let value = extract_correction_value(answer).unwrap_or_else(|| answer.to_string());
-    if let (Some(entity), Some(attribute)) = (
-        followup.entity.as_deref(),
-        followup.attribute.as_deref(),
-    ) {
+    if let (Some(entity), Some(attribute)) =
+        (followup.entity.as_deref(), followup.attribute.as_deref())
+    {
         state.record_confirmed(
             entity,
             attribute,
@@ -898,10 +892,9 @@ pub fn resolve_by_correction(state: &mut RecoveryState, correction: &str) -> Opt
         .ledger
         .resolve(&followup.receipt_id, ReceiptResolution::Refuted);
     let value = extract_correction_value(correction)?;
-    let (Some(entity), Some(attribute)) = (
-        followup.entity.as_deref(),
-        followup.attribute.as_deref(),
-    ) else {
+    let (Some(entity), Some(attribute)) =
+        (followup.entity.as_deref(), followup.attribute.as_deref())
+    else {
         return Some("明白，这条推测作废，我不会再拿它当依据。".to_string());
     };
     if let Some(original) = followup.value.as_deref() {
@@ -921,9 +914,20 @@ pub fn resolve_by_correction(state: &mut RecoveryState, correction: &str) -> Opt
 }
 
 fn extract_correction_value(correction: &str) -> Option<String> {
-    let mut body = correction.trim().trim_matches(['，', ',', '：', ':']).trim();
+    let mut body = correction
+        .trim()
+        .trim_matches(['，', ',', '：', ':'])
+        .trim();
     for prefix in [
-        "不是", "不对", "错了", "不", "更正：", "更正:", "应该是", "而是", "是",
+        "不是",
+        "不对",
+        "错了",
+        "不",
+        "更正：",
+        "更正:",
+        "应该是",
+        "而是",
+        "是",
     ] {
         if let Some(rest) = body.strip_prefix(prefix) {
             body = rest.trim().trim_matches(['，', ',', '：', ':']).trim();
@@ -1280,7 +1284,9 @@ mod tests {
             &knowledge,
         );
         assert_eq!(
-            state.latest_pending().and_then(|pending| pending.value.as_deref()),
+            state
+                .latest_pending()
+                .and_then(|pending| pending.value.as_deref()),
             Some("90"),
             "推测值必须随挂账保存，确认后才能落地"
         );
@@ -1313,7 +1319,11 @@ mod tests {
             &knowledge,
         );
         let reply = resolve_by_correction(&mut state, "不对，张三的师祖是孙八").unwrap();
-        assert!(reply.contains("作废") && reply.contains("孙八"), "{}", reply);
+        assert!(
+            reply.contains("作废") && reply.contains("孙八"),
+            "{}",
+            reply
+        );
         let fact = state
             .confirmed_value("张三", "师祖")
             .expect("更正必须进入会话事实层");
@@ -1321,10 +1331,7 @@ mod tests {
         assert_eq!(fact.source, ConfirmationSource::Correction);
         assert_eq!(state.ledger.open_count(), 0);
         assert!(
-            !state
-                .confirmed
-                .iter()
-                .any(|fact| fact.value == "赵六"),
+            !state.confirmed.iter().any(|fact| fact.value == "赵六"),
             "被否认的推测不得进入会话事实"
         );
     }
@@ -1398,7 +1405,9 @@ mod tests {
         assert_eq!(state.confirmed.len(), MAX_CONFIRMED_FACTS);
         assert!(state.confirmed_value("姚明", "属性0").is_none());
         assert_eq!(
-            state.confirmed_value("姚明", "属性3").map(|fact| fact.value.as_str()),
+            state
+                .confirmed_value("姚明", "属性3")
+                .map(|fact| fact.value.as_str()),
             Some("值3")
         );
         let encoded = serde_json::to_string(&state).unwrap();

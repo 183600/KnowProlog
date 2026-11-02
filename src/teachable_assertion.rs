@@ -178,8 +178,12 @@ impl AssertionReading {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TarResponse {
     None,
-    Confirm { claim_id: String },
-    Deny { claim_id: String },
+    Confirm {
+        claim_id: String,
+    },
+    Deny {
+        claim_id: String,
+    },
     TypeResolved {
         frame: AssertionFrame,
         mention: String,
@@ -424,7 +428,12 @@ impl TeachableAssertionReader {
         if !object_types.is_empty() {
             notes.push(format!("宾语类型：{}", object_types.join(" / ")));
         }
-        self.note_mention(&subject, &subject_types, &raw.evidence, !subject_types.is_empty());
+        self.note_mention(
+            &subject,
+            &subject_types,
+            &raw.evidence,
+            !subject_types.is_empty(),
+        );
         if !literal {
             self.note_mention(
                 &object,
@@ -450,9 +459,7 @@ impl TeachableAssertionReader {
             source_text: cleaned.clone(),
         };
 
-        if !literal
-            && type_evidence != TypeEvidence::Known
-            && type_evidence != TypeEvidence::Suffix
+        if !literal && type_evidence != TypeEvidence::Known && type_evidence != TypeEvidence::Suffix
         {
             let question = format!(
                 "我还不确定「{}」是哪类实体：{}。\n如果你确认它是{}，我就按「{}」记下。",
@@ -556,7 +563,11 @@ impl TeachableAssertionReader {
             TAR_DIALECT.trim_start_matches("knowprolog-tar/"),
             self.turn,
             self.mentions.len(),
-            if self.pending.is_some() { "1 条" } else { "无" }
+            if self.pending.is_some() {
+                "1 条"
+            } else {
+                "无"
+            }
         )];
         if let Some(pending) = &self.pending {
             match &pending.stage {
@@ -586,13 +597,7 @@ impl TeachableAssertionReader {
         lines.join("\n")
     }
 
-    fn note_mention(
-        &mut self,
-        surface: &str,
-        types: &[String],
-        evidence: &str,
-        confirmed: bool,
-    ) {
+    fn note_mention(&mut self, surface: &str, types: &[String], evidence: &str, confirmed: bool) {
         let surface = surface.trim();
         if surface.is_empty() {
             return;
@@ -738,7 +743,8 @@ fn split_type_assertion(text: &str, types: &TypeSystem) -> Option<(String, Strin
     let (subject, object) = text.split_once('是')?;
     let subject = subject.trim();
     let object = object.trim();
-    if subject.is_empty() || object.is_empty() || subject.contains('的') || object.contains('的') {
+    if subject.is_empty() || object.is_empty() || subject.contains('的') || object.contains('的')
+    {
         return None;
     }
     let type_name = parse_type_word(object, types)?;
@@ -831,18 +837,44 @@ fn surface_type(surface: &str) -> Option<&'static str> {
         return Some("人物");
     }
     const ORG_SUFFIXES: &[&str] = &[
-        "公司", "集团", "大学", "学院", "学校", "中学", "小学", "医院", "银行", "研究所",
-        "研究院", "机构", "组织", "企业", "单位", "工作室", "协会", "委员会", "基金会", "政府",
-        "法院", "出版社", "报社", "电视台", "机场", "车站",
+        "公司",
+        "集团",
+        "大学",
+        "学院",
+        "学校",
+        "中学",
+        "小学",
+        "医院",
+        "银行",
+        "研究所",
+        "研究院",
+        "机构",
+        "组织",
+        "企业",
+        "单位",
+        "工作室",
+        "协会",
+        "委员会",
+        "基金会",
+        "政府",
+        "法院",
+        "出版社",
+        "报社",
+        "电视台",
+        "机场",
+        "车站",
     ];
     if ORG_SUFFIXES.iter().any(|suffix| text.ends_with(suffix)) {
         return Some("机构");
     }
     const LOCATION_SUFFIXES: &[&str] = &[
-        "省", "市", "县", "区", "镇", "村", "乡", "街道", "路", "街", "山", "河", "湖", "海",
-        "岛", "湾", "广场", "公园", "国家",
+        "省", "市", "县", "区", "镇", "村", "乡", "街道", "路", "街", "山", "河", "湖", "海", "岛",
+        "湾", "广场", "公园", "国家",
     ];
-    if LOCATION_SUFFIXES.iter().any(|suffix| text.ends_with(suffix)) {
+    if LOCATION_SUFFIXES
+        .iter()
+        .any(|suffix| text.ends_with(suffix))
+    {
         return Some("地点");
     }
     None
@@ -870,7 +902,10 @@ fn known_types(facts: &[PrologFact], surface: &str, types: &TypeSystem) -> Vec<S
             }
         }
     }
-    found.into_iter().filter(|value| !value.is_empty()).collect()
+    found
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect()
 }
 
 fn expectation_types(
@@ -882,7 +917,11 @@ fn expectation_types(
     let Some(profile) = registry.profile(canonical) else {
         return Vec::new();
     };
-    let source = if inverted { &profile.domain } else { &profile.range };
+    let source = if inverted {
+        &profile.domain
+    } else {
+        &profile.range
+    };
     source
         .iter()
         .map(|value| types.canonical(value))
@@ -941,9 +980,13 @@ fn looks_like_literal(value: &str) -> bool {
         return true;
     }
     let first = text.chars().next().unwrap_or(' ');
-    let numeric_prefix = first.is_ascii_digit()
-        || "零〇一二两三四五六七八九十百千万亿".contains(first);
-    if numeric_prefix && text.chars().any(|ch| "岁年月日号元块个次分秒%％".contains(ch)) {
+    let numeric_prefix =
+        first.is_ascii_digit() || "零〇一二两三四五六七八九十百千万亿".contains(first);
+    if numeric_prefix
+        && text
+            .chars()
+            .any(|ch| "岁年月日号元块个次分秒%％".contains(ch))
+    {
         return true;
     }
     matches!(text, "是" | "否" | "true" | "false" | "yes" | "no")
@@ -956,11 +999,15 @@ fn guard_reason(text: &str) -> Option<&'static str> {
     if crate::function_words::contains_question_marker(text) {
         return Some("疑问");
     }
-    const NEGATIONS: &[&str] = &["不是", "不在", "没有", "没在", "并非", "从未", "不曾", "未必"];
+    const NEGATIONS: &[&str] = &[
+        "不是", "不在", "没有", "没在", "并非", "从未", "不曾", "未必",
+    ];
     if NEGATIONS.iter().any(|word| text.contains(word)) {
         return Some("否定");
     }
-    const CONDITIONALS: &[&str] = &["如果", "假如", "假设", "要是", "若是", "只要", "除非", "一旦", "那么", "则"];
+    const CONDITIONALS: &[&str] = &[
+        "如果", "假如", "假设", "要是", "若是", "只要", "除非", "一旦", "那么", "则",
+    ];
     if CONDITIONALS.iter().any(|word| text.contains(word)) {
         return Some("条件");
     }
@@ -1147,13 +1194,7 @@ mod tests {
         let registry = registry();
         let types = types();
         let mut reader = TeachableAssertionReader::new();
-        let reading = reader.read_statement(
-            "张三在清华大学工作。",
-            &[],
-            &[],
-            &registry,
-            &types,
-        );
+        let reading = reader.read_statement("张三在清华大学工作。", &[], &[], &registry, &types);
         let TarDecision::Propose { frame } = reading.decision else {
             panic!("应提议确认：{:?}", reading);
         };
@@ -1170,13 +1211,7 @@ mod tests {
         let registry = registry();
         let types = types();
         let mut reader = TeachableAssertionReader::new();
-        let reading = reader.read_statement(
-            "李四在字节跳动工作。",
-            &[],
-            &[],
-            &registry,
-            &types,
-        );
+        let reading = reader.read_statement("李四在字节跳动工作。", &[], &[], &registry, &types);
         let TarDecision::ClarifyType { mention, .. } = reading.decision else {
             panic!("应追问类型：{:?}", reading);
         };
@@ -1184,12 +1219,18 @@ mod tests {
         assert!(reader.has_pending());
 
         let response = reader.respond("机构", &types);
-        let TarResponse::TypeResolved { frame, type_name, .. } = response else {
+        let TarResponse::TypeResolved {
+            frame, type_name, ..
+        } = response
+        else {
             panic!("应接受类型回答：{:?}", response);
         };
         assert_eq!(type_name, "机构");
         assert_eq!(frame.object_types, vec!["机构".to_string()]);
-        assert_eq!(reader.mention("字节跳动").unwrap().status, MentionStatus::Confirmed);
+        assert_eq!(
+            reader.mention("字节跳动").unwrap().status,
+            MentionStatus::Confirmed
+        );
     }
 
     #[test]
@@ -1213,13 +1254,7 @@ mod tests {
         let registry = registry();
         let types = types();
         let mut reader = TeachableAssertionReader::new();
-        let reading = reader.read_statement(
-            "张三是李四的老师。",
-            &[],
-            &[],
-            &registry,
-            &types,
-        );
+        let reading = reader.read_statement("张三是李四的老师。", &[], &[], &registry, &types);
         let TarDecision::Propose { frame } = reading.decision else {
             panic!("应提议确认：{:?}", reading);
         };
@@ -1239,7 +1274,10 @@ mod tests {
         };
         assert_eq!(mention, "字节跳动");
         assert_eq!(type_name, "机构");
-        assert_eq!(reader.mention("字节跳动").unwrap().status, MentionStatus::Confirmed);
+        assert_eq!(
+            reader.mention("字节跳动").unwrap().status,
+            MentionStatus::Confirmed
+        );
     }
 
     #[test]
@@ -1247,13 +1285,7 @@ mod tests {
         let registry = registry();
         let types = types();
         let mut reader = TeachableAssertionReader::new();
-        let reading = reader.read_statement(
-            "李四在字节跳动工作。",
-            &[],
-            &[],
-            &registry,
-            &types,
-        );
+        let reading = reader.read_statement("李四在字节跳动工作。", &[], &[], &registry, &types);
         assert!(matches!(reading.decision, TarDecision::ClarifyType { .. }));
         let snapshot = reader.snapshot();
         let mut restored = TeachableAssertionReader::new();
@@ -1273,13 +1305,7 @@ mod tests {
             rel_type: "工作于".to_string(),
             to: "清华大学".to_string(),
         }];
-        let reading = reader.read_statement(
-            "张三在清华大学工作。",
-            &[],
-            &facts,
-            &registry,
-            &types,
-        );
+        let reading = reader.read_statement("张三在清华大学工作。", &[], &facts, &registry, &types);
         assert!(matches!(reading.decision, TarDecision::AlreadyKnown { .. }));
     }
 
@@ -1293,13 +1319,8 @@ mod tests {
             subject: "王五".to_string(),
             object: "赵六".to_string(),
         };
-        let reading = reader.read_statement(
-            "王五与赵六有师徒关系。",
-            &[triple],
-            &[],
-            &registry,
-            &types,
-        );
+        let reading =
+            reader.read_statement("王五与赵六有师徒关系。", &[triple], &[], &registry, &types);
         let TarDecision::Propose { frame } = reading.decision else {
             panic!("应使用文法三元组：{:?}", reading);
         };
@@ -1314,13 +1335,7 @@ mod tests {
         let types = types();
         let mut reader = TeachableAssertionReader::new();
         let facts = vec![entity("张三", "Person")];
-        let reading = reader.read_statement(
-            "张三在清华大学工作。",
-            &[],
-            &facts,
-            &registry,
-            &types,
-        );
+        let reading = reader.read_statement("张三在清华大学工作。", &[], &facts, &registry, &types);
         let TarDecision::Propose { frame } = reading.decision else {
             panic!("应提议确认：{:?}", reading);
         };

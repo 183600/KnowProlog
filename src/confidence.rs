@@ -484,13 +484,15 @@ impl DecisionRecord {
             .fused
             .contributions
             .iter()
-            .map(|contribution| match (contribution.raw, contribution.calibrated) {
-                (Some(raw), Some(calibrated)) => format!(
-                    "{} {:.2}→{:.2}×{:.2}",
-                    contribution.name, raw, calibrated, contribution.gamma
-                ),
-                _ => format!("{} 未提供×{:.2}", contribution.name, contribution.gamma),
-            })
+            .map(
+                |contribution| match (contribution.raw, contribution.calibrated) {
+                    (Some(raw), Some(calibrated)) => format!(
+                        "{} {:.2}→{:.2}×{:.2}",
+                        contribution.name, raw, calibrated, contribution.gamma
+                    ),
+                    _ => format!("{} 未提供×{:.2}", contribution.name, contribution.gamma),
+                },
+            )
             .collect::<Vec<_>>()
             .join("；");
         let mut line = format!(
@@ -530,7 +532,11 @@ impl CertificateStatus {
             self.upper_bound,
             self.max_error_rate,
             self.alpha,
-            if self.verified { "（已验证）" } else { "（未通过）" }
+            if self.verified {
+                "（已验证）"
+            } else {
+                "（未通过）"
+            }
         )
     }
 }
@@ -641,11 +647,10 @@ impl ConfidenceConfig {
             understanding,
             near_boundary,
             fused,
-            certificate: self.certificate.as_ref().and_then(|certificate| {
-                certificate
-                    .verify()
-                    .ok()
-            }),
+            certificate: self
+                .certificate
+                .as_ref()
+                .and_then(|certificate| certificate.verify().ok()),
         }
     }
 
@@ -775,9 +780,7 @@ impl ConfidenceConfig {
                         format!("校准原始分 {} 不在 [0,1]", point.score),
                     ));
                 }
-                if !point.probability.is_finite()
-                    || !(0.0..=1.0).contains(&point.probability)
-                {
+                if !point.probability.is_finite() || !(0.0..=1.0).contains(&point.probability) {
                     issues.push(ConfidenceIssue::error(
                         "confidence_calibration_probability_out_of_range",
                         format!("{}.probability", point_path),
@@ -843,15 +846,10 @@ impl ConfidenceConfig {
                     issues.push(ConfidenceIssue::error(
                         "confidence_certificate_errors_exceed_n",
                         "reasoning.confidence.certificate.errors",
-                        format!(
-                            "错误数 {} 大于样本数 {}",
-                            certificate.errors, certificate.n
-                        ),
+                        format!("错误数 {} 大于样本数 {}", certificate.errors, certificate.n),
                     ));
                 }
-                if !certificate.alpha.is_finite()
-                    || !(0.0..1.0).contains(&certificate.alpha)
-                {
+                if !certificate.alpha.is_finite() || !(0.0..1.0).contains(&certificate.alpha) {
                     issues.push(ConfidenceIssue::error(
                         "confidence_certificate_alpha_out_of_range",
                         "reasoning.confidence.certificate.alpha",
@@ -871,16 +869,12 @@ impl ConfidenceConfig {
                     issues.push(ConfidenceIssue::error(
                         "confidence_certificate_error_rate_out_of_range",
                         "reasoning.confidence.certificate.max_error_rate",
-                        format!(
-                            "max_error_rate={} 不在 (0,1)",
-                            certificate.max_error_rate
-                        ),
+                        format!("max_error_rate={} 不在 (0,1)", certificate.max_error_rate),
                     ));
                 }
                 match certificate.verify() {
                     Ok(status) => {
-                        if status.upper_bound
-                            > certificate.claimed_upper_bound + certificate.delta
+                        if status.upper_bound > certificate.claimed_upper_bound + certificate.delta
                         {
                             issues.push(ConfidenceIssue::error(
                                 "confidence_certificate_stale",
@@ -921,16 +915,10 @@ impl RiskCertificate {
         if !self.delta.is_finite() || self.delta < 0.0 {
             return Err(format!("delta={} 必须为非负有限数", self.delta));
         }
-        if !self.max_error_rate.is_finite()
-            || !(0.0..1.0).contains(&self.max_error_rate)
-        {
-            return Err(format!(
-                "max_error_rate={} 不在 (0,1)",
-                self.max_error_rate
-            ));
+        if !self.max_error_rate.is_finite() || !(0.0..1.0).contains(&self.max_error_rate) {
+            return Err(format!("max_error_rate={} 不在 (0,1)", self.max_error_rate));
         }
-        if !self.claimed_upper_bound.is_finite()
-            || !(0.0..=1.0).contains(&self.claimed_upper_bound)
+        if !self.claimed_upper_bound.is_finite() || !(0.0..=1.0).contains(&self.claimed_upper_bound)
         {
             return Err(format!(
                 "claimed_upper_bound={} 不在 [0,1]",
@@ -1036,12 +1024,7 @@ pub fn fit_isotonic(samples: &[(f64, bool)]) -> Vec<CalibrationPoint> {
                 break;
             }
             blocks.pop();
-            let merged = (
-                previous.0,
-                last.1,
-                previous.2 + last.2,
-                previous.3 + last.3,
-            );
+            let merged = (previous.0, last.1, previous.2 + last.2, previous.3 + last.3);
             *blocks.last_mut().expect("刚弹出的是最后一块") = merged;
         }
     }
@@ -1408,7 +1391,10 @@ mod tests {
         assert_eq!(graph.deliberation_priority(8_600, 6_200), 0);
 
         let conflicted = ClaimEnvelope::from_grade(EnvelopeGrade::Graph, 0, 1);
-        assert_eq!((conflicted.lower_bps(), conflicted.upper_bps()), (6_300, 7_000));
+        assert_eq!(
+            (conflicted.lower_bps(), conflicted.upper_bps()),
+            (6_300, 7_000)
+        );
         assert_eq!(conflicted.verdict(8_600, 6_200), EnvelopeVerdict::Qualify);
         assert!(conflicted.deliberation_priority(8_600, 6_200) > 0);
 
@@ -1455,14 +1441,14 @@ mod tests {
         let ok: ClaimEnvelope =
             serde_json::from_str(r#"{"lower_bps":6000,"upper_bps":9000}"#).unwrap();
         assert_eq!((ok.lower_bps(), ok.upper_bps()), (6_000, 9_000));
-        assert!(serde_json::from_str::<ClaimEnvelope>(
-            r#"{"lower_bps":9000,"upper_bps":6000}"#
-        )
-        .is_err());
-        assert!(serde_json::from_str::<ClaimEnvelope>(
-            r#"{"lower_bps":1000,"upper_bps":10001}"#
-        )
-        .is_err());
+        assert!(
+            serde_json::from_str::<ClaimEnvelope>(r#"{"lower_bps":9000,"upper_bps":6000}"#)
+                .is_err()
+        );
+        assert!(
+            serde_json::from_str::<ClaimEnvelope>(r#"{"lower_bps":1000,"upper_bps":10001}"#)
+                .is_err()
+        );
     }
 
     #[test]

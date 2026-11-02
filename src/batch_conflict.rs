@@ -16,9 +16,34 @@ use crate::slot_ledger::{AssertionStrength, SlotKey};
 
 /// 明确的更正提示词。出现在句子任意位置都视为「这次是在改口」。
 pub const CORRECTION_CUES: &[&str] = &[
-    "更准确地说", "准确地说", "准确说", "实际上", "更正为", "更正成", "纠正为", "纠正成",
-    "修正为", "修正成", "应该是", "应当为", "应当是", "应该为", "应改为", "应为", "其实",
-    "实际", "不过", "更正", "纠正", "修正", "改口", "不对", "应该说", "改为", "改成", "而是",
+    "更准确地说",
+    "准确地说",
+    "准确说",
+    "实际上",
+    "更正为",
+    "更正成",
+    "纠正为",
+    "纠正成",
+    "修正为",
+    "修正成",
+    "应该是",
+    "应当为",
+    "应当是",
+    "应该为",
+    "应改为",
+    "应为",
+    "其实",
+    "实际",
+    "不过",
+    "更正",
+    "纠正",
+    "修正",
+    "改口",
+    "不对",
+    "应该说",
+    "改为",
+    "改成",
+    "而是",
 ];
 
 /// 批处理提交模式。
@@ -162,13 +187,12 @@ impl BatchQuestion {
     pub fn render_zh(&self, number: usize) -> String {
         let mut lines = vec![format!("{}. {}", number, self.prompt)];
         for option in &self.options {
-            let suggestion = if self.options.iter().position(|item| item == option)
-                == self.default_option
-            {
-                "（建议）"
-            } else {
-                ""
-            };
+            let suggestion =
+                if self.options.iter().position(|item| item == option) == self.default_option {
+                    "（建议）"
+                } else {
+                    ""
+                };
             lines.push(format!(
                 "   {} {}{}",
                 option.label, option.description, suggestion
@@ -382,7 +406,10 @@ fn strong_segments(text: &str) -> Vec<(String, usize, usize)> {
     let mut segments = Vec::new();
     let mut start = 0usize;
     for (index, ch) in text.char_indices() {
-        if matches!(ch, '。' | '！' | '!' | '？' | '?' | ';' | '；' | '\n' | '\r') {
+        if matches!(
+            ch,
+            '。' | '！' | '!' | '？' | '?' | ';' | '；' | '\n' | '\r'
+        ) {
             flush_segment(text, start, index, &mut segments);
             start = index + ch.len_utf8();
         }
@@ -405,10 +432,7 @@ fn flush_segment(text: &str, start: usize, end: usize, segments: &mut Vec<(Strin
     ));
 }
 
-fn split_commas_if_all_parse(
-    segment: &str,
-    previous: Option<&BatchClaim>,
-) -> Vec<String> {
+fn split_commas_if_all_parse(segment: &str, previous: Option<&BatchClaim>) -> Vec<String> {
     if contains_conditional_marker(segment) {
         return vec![segment.trim().to_string()];
     }
@@ -431,9 +455,11 @@ fn split_commas_if_all_parse(
 }
 
 fn contains_conditional_marker(text: &str) -> bool {
-    ["如果", "假如", "只要", "一旦", "若", "因为", "由于", "既然", "那么", "则", "所以"]
-        .iter()
-        .any(|marker| text.contains(marker))
+    [
+        "如果", "假如", "只要", "一旦", "若", "因为", "由于", "既然", "那么", "则", "所以",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
 }
 
 fn parse_segment(
@@ -580,7 +606,11 @@ fn parse_not_but_correction(
         .iter()
         .find_map(|marker| raw.find(marker).map(|position| (position, *marker)))?;
     let after_not = not_position + not_marker.len();
-    let prefix = if not_marker == "不是" { "不是" } else { "并非" };
+    let prefix = if not_marker == "不是" {
+        "不是"
+    } else {
+        "并非"
+    };
     let (old_end, new_raw, cue) = if let Some(offset) = raw[after_not..].find("而是") {
         let position = after_not + offset;
         (
@@ -687,10 +717,7 @@ fn strip_correction_cue(text: &str) -> (Option<String>, String) {
 }
 
 fn parse_age_claim(text: &str) -> Option<(String, String)> {
-    let text = text
-        .trim()
-        .trim_end_matches(['了', '。', '！', '!'])
-        .trim();
+    let text = text.trim().trim_end_matches(['了', '。', '！', '!']).trim();
     let body = text
         .strip_suffix("周岁")
         .or_else(|| text.strip_suffix('岁'))?;
@@ -795,11 +822,7 @@ pub fn plan_batch(claims: Vec<BatchClaim>, options: &BatchOptions) -> BatchPlan 
 
     for (key, indices) in by_slot {
         let functional = options.functional_predicates.contains(&key.predicate);
-        let base_values = options
-            .base_values
-            .get(&key)
-            .cloned()
-            .unwrap_or_default();
+        let base_values = options.base_values.get(&key).cloned().unwrap_or_default();
         let hearsay: Vec<usize> = indices
             .iter()
             .copied()
@@ -854,8 +877,8 @@ pub fn plan_batch(claims: Vec<BatchClaim>, options: &BatchOptions) -> BatchPlan 
 
         if by_value.len() == 1 {
             let (value, value_indices) = by_value.iter().next().expect("非空");
-            let base_differs = !base_values.is_empty()
-                && !(base_values.len() == 1 && base_values[0] == *value);
+            let base_differs =
+                !base_values.is_empty() && !(base_values.len() == 1 && base_values[0] == *value);
             if base_differs && !has_correction {
                 let conflict_index = conflicts.len();
                 let conflict = BatchConflict {
@@ -868,7 +891,10 @@ pub fn plan_batch(claims: Vec<BatchClaim>, options: &BatchOptions) -> BatchPlan 
                 let question = build_question(&claims, conflict_index, &conflict);
                 isolated.extend(factual.iter().map(|index| BatchIsolation {
                     claim: *index,
-                    reason: format!("{}：需先裁决", BatchConflictKind::GraphBaseConflict.label_zh()),
+                    reason: format!(
+                        "{}：需先裁决",
+                        BatchConflictKind::GraphBaseConflict.label_zh()
+                    ),
                     question: Some(conflict_index),
                 }));
                 conflicts.push(conflict);
@@ -983,7 +1009,11 @@ fn build_question(
                 .map(|index| {
                     let claim = &claims[*index];
                     if claim.correction_cue.is_some() {
-                        format!("{}，{}更正", claim.source, claim.correction_cue.as_deref().unwrap_or(""))
+                        format!(
+                            "{}，{}更正",
+                            claim.source,
+                            claim.correction_cue.as_deref().unwrap_or("")
+                        )
                     } else {
                         format!("{}，{}", claim.source, claim.strength.label_zh())
                     }
@@ -1010,10 +1040,11 @@ fn build_question(
         });
     }
     let default_option = if conflict.base_values.len() == 1 {
-        conflict
-            .base_values
-            .first()
-            .and_then(|base| options.iter().position(|option| option.value.as_deref() == Some(base.as_str())))
+        conflict.base_values.first().and_then(|base| {
+            options
+                .iter()
+                .position(|option| option.value.as_deref() == Some(base.as_str()))
+        })
     } else {
         let mut counts: BTreeMap<String, usize> = BTreeMap::new();
         for index in &conflict.claims {
@@ -1138,16 +1169,26 @@ pub fn parse_batch_answer(answer: &str, questions: &[BatchQuestion]) -> BatchAns
         outcome.notes.push("没有收到裁决内容。".to_string());
         return outcome;
     }
-    if ["取消", "放弃", "不裁决", "cancel"].iter().any(|cue| normalized.contains(cue)) {
+    if ["取消", "放弃", "不裁决", "cancel"]
+        .iter()
+        .any(|cue| normalized.contains(cue))
+    {
         outcome.cancelled = true;
         return outcome;
     }
     let has_rest = normalized.contains("其余");
     let global_defaults = !has_rest
         && (normalized == "同意"
-            || ["全部同意", "都同意", "全同意", "同意全部", "按建议", "都按建议"]
-                .iter()
-                .any(|cue| normalized.contains(cue)));
+            || [
+                "全部同意",
+                "都同意",
+                "全同意",
+                "同意全部",
+                "按建议",
+                "都按建议",
+            ]
+            .iter()
+            .any(|cue| normalized.contains(cue)));
     let global_last = !has_rest
         && ["都按后者", "全部按后者", "按后者", "都选后者"]
             .iter()
@@ -1217,11 +1258,18 @@ fn is_global_cue(token: &str) -> bool {
     if token.starts_with(|ch: char| ch.is_ascii_digit()) {
         return false;
     }
-    ["全部同意", "都同意", "全同意", "同意全部", "按建议", "都按建议"]
-        .iter()
-        .chain(["都按后者", "全部按后者", "按后者", "都选后者"].iter())
-        .chain(["都按前者", "全部按前者", "按前者", "都选前者"].iter())
-        .any(|cue| token.contains(cue))
+    [
+        "全部同意",
+        "都同意",
+        "全同意",
+        "同意全部",
+        "按建议",
+        "都按建议",
+    ]
+    .iter()
+    .chain(["都按后者", "全部按后者", "按后者", "都选后者"].iter())
+    .chain(["都按前者", "全部按前者", "按前者", "都选前者"].iter())
+    .any(|cue| token.contains(cue))
 }
 
 fn apply_defaults(
@@ -1239,10 +1287,7 @@ fn apply_defaults(
     }
 }
 
-fn parse_answer_token(
-    token: &str,
-    questions: &[BatchQuestion],
-) -> Result<(usize, usize), String> {
+fn parse_answer_token(token: &str, questions: &[BatchQuestion]) -> Result<(usize, usize), String> {
     let token = token.trim();
     if token.is_empty() {
         return Err("空裁决项。".to_string());
@@ -1272,8 +1317,7 @@ fn parse_answer_token(
         return Err(format!("题号 {} 超出范围。", number));
     }
     let question_index = number - 1;
-    let rest = token[digits_end..]
-        .trim_start_matches([':', '.', '、', ')', '）', '-']);
+    let rest = token[digits_end..].trim_start_matches([':', '.', '、', ')', '）', '-']);
     let mut rest = rest;
     for prefix in ["第", "题", "选", "取", "按", "保留", ":"] {
         if let Some(stripped) = rest.strip_prefix(prefix) {
@@ -1303,10 +1347,7 @@ fn parse_answer_token(
             if let Some(option) = question.option_by_label(label) {
                 return Ok((question_index, option));
             }
-            return Err(format!(
-                "第 {} 处没有选项 {}。",
-                number, label
-            ));
+            return Err(format!("第 {} 处没有选项 {}。", number, label));
         }
     }
     let value = rest.trim_start_matches([':', ' ']);
@@ -1375,7 +1416,12 @@ fn normalize_answer(answer: &str) -> String {
 mod tests {
     use super::*;
 
-    fn claim(subject: &str, predicate: &str, object: &str, strength: AssertionStrength) -> BatchClaim {
+    fn claim(
+        subject: &str,
+        predicate: &str,
+        object: &str,
+        strength: AssertionStrength,
+    ) -> BatchClaim {
         BatchClaim {
             subject: subject.to_string(),
             predicate: predicate.to_string(),
@@ -1427,10 +1473,7 @@ mod tests {
         let outcome = parse_batch_claims("张三的年龄不是30，是31");
         assert_eq!(outcome.claims.len(), 1, "{:?}", outcome);
         assert_eq!(outcome.claims[0].object, "31");
-        assert_eq!(
-            outcome.claims[0].correction_cue.as_deref(),
-            Some("不是…是")
-        );
+        assert_eq!(outcome.claims[0].correction_cue.as_deref(), Some("不是…是"));
 
         let outcome = parse_batch_claims("李四并非30岁，而是31岁");
         assert_eq!(outcome.claims.len(), 1, "{:?}", outcome);
@@ -1447,10 +1490,7 @@ mod tests {
         let outcome = parse_batch_claims("张三的年龄是30；更正为31");
         assert_eq!(outcome.claims.len(), 2, "{:?}", outcome);
         assert_eq!(outcome.claims[1].object, "31");
-        assert_eq!(
-            outcome.claims[1].strength,
-            AssertionStrength::Correction
-        );
+        assert_eq!(outcome.claims[1].strength, AssertionStrength::Correction);
         let plan = plan_batch(outcome.claims, &functional_options());
         assert_eq!(plan.accepted.len(), 1, "{:?}", plan);
         assert_eq!(plan.claims[plan.accepted[0]].object, "31");
@@ -1491,7 +1531,10 @@ mod tests {
         ];
         let plan = plan_batch(claims, &functional_options());
         assert_eq!(plan.questions.len(), 1);
-        assert_eq!(plan.conflicts[0].kind, BatchConflictKind::FunctionalMultiValue);
+        assert_eq!(
+            plan.conflicts[0].kind,
+            BatchConflictKind::FunctionalMultiValue
+        );
         assert_eq!(plan.accepted.len(), 1, "无冲突槽应被接受");
         assert!(plan.claims[plan.accepted[0]].subject == "李四");
         assert_eq!(plan.isolated.len(), 2);
@@ -1519,7 +1562,11 @@ mod tests {
         let plan = plan_batch(claims, &options);
         assert_eq!(plan.questions.len(), 1);
         assert_eq!(plan.conflicts[0].kind, BatchConflictKind::GraphBaseConflict);
-        assert_eq!(plan.questions[0].default_option, Some(0), "默认应保留图谱基值");
+        assert_eq!(
+            plan.questions[0].default_option,
+            Some(0),
+            "默认应保留图谱基值"
+        );
         assert!(plan.questions[0].options.iter().any(|option| option.base));
     }
 
@@ -1600,7 +1647,9 @@ mod tests {
         assert_eq!(last.selections[0], Some(1));
         assert_eq!(last.selections[1], Some(1));
         assert_eq!(
-            plan.questions[0].options[last.selections[0].unwrap()].value.as_deref(),
+            plan.questions[0].options[last.selections[0].unwrap()]
+                .value
+                .as_deref(),
             Some("31")
         );
 
@@ -1643,9 +1692,7 @@ mod tests {
 
     #[test]
     fn answer_parser_accepts_ordinal_prefix_space_and_keep_base() {
-        let claims = vec![
-            claim("张三", "年龄", "31", AssertionStrength::Direct),
-        ];
+        let claims = vec![claim("张三", "年龄", "31", AssertionStrength::Direct)];
         let options = functional_options()
             .with_base_values(SlotKey::new("张三", "年龄"), vec!["30".to_string()]);
         let plan = plan_batch(claims, &options);

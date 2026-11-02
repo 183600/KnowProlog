@@ -6,11 +6,9 @@ use serde::{Deserialize, Serialize};
 use crate::mention_lexicon::{LexiconStatus, MentionLexicon};
 use crate::nlp::TaggedWord;
 use crate::synonym_graph::{
-    SynonymContext, SynonymGraph, SynonymKind, SynonymSense, SurfaceChoice,
+    SurfaceChoice, SynonymContext, SynonymGraph, SynonymKind, SynonymSense,
 };
-use crate::text_anchor::{
-    AnchoredSpan, CharSpan, ProjectionReceipt, TextProjection,
-};
+use crate::text_anchor::{AnchoredSpan, CharSpan, ProjectionReceipt, TextProjection};
 
 pub const LEXICAL_TRANSDUCER_VERSION: u32 = 1;
 pub const DEFAULT_MIN_SURFACE_CHARS: usize = 2;
@@ -233,14 +231,14 @@ impl Transduction {
                     );
                 }
                 TransductionDecision::Ambiguous { candidates } => {
-                    let _ = write!(
-                        output,
-                        " 保留原词面｜歧义：{}",
-                        candidates.join(" / ")
-                    );
+                    let _ = write!(output, " 保留原词面｜歧义：{}", candidates.join(" / "));
                 }
                 TransductionDecision::ProtectedMention { delimiter } => {
-                    let _ = write!(output, " 保留原词面｜位于 {}…{} 引号内", delimiter, delimiter);
+                    let _ = write!(
+                        output,
+                        " 保留原词面｜位于 {}…{} 引号内",
+                        delimiter, delimiter
+                    );
                 }
                 TransductionDecision::ContextMismatch { candidates } => {
                     let _ = write!(
@@ -326,11 +324,7 @@ impl LexicalTransducer {
             if entry.is_self_entry() {
                 continue;
             }
-            let key = (
-                entry.surface.clone(),
-                entry.canonical.clone(),
-                entry.kind,
-            );
+            let key = (entry.surface.clone(), entry.canonical.clone(), entry.kind);
             let pos = match entry.kind {
                 SynonymKind::Predicate => "v",
                 SynonymKind::Entity | SynonymKind::Type => "n",
@@ -392,19 +386,10 @@ impl LexicalTransducer {
                 continue;
             }
             merged.insert(
-                (
-                    surface.clone(),
-                    canonical.clone(),
-                    SynonymKind::Entity,
-                ),
-                TransducerRule::new(
-                    surface.clone(),
-                    canonical.clone(),
-                    SynonymKind::Entity,
-                    "n",
-                )
-                .with_origin("config_flat")
-                .with_evidence(1),
+                (surface.clone(), canonical.clone(), SynonymKind::Entity),
+                TransducerRule::new(surface.clone(), canonical.clone(), SynonymKind::Entity, "n")
+                    .with_origin("config_flat")
+                    .with_evidence(1),
             );
         }
         let mut rules: Vec<TransducerRule> = merged.into_values().collect();
@@ -600,10 +585,7 @@ impl LexicalTransducer {
             context_mismatches: tokens
                 .iter()
                 .filter(|token| {
-                    matches!(
-                        token.decision,
-                        TransductionDecision::ContextMismatch { .. }
-                    )
+                    matches!(token.decision, TransductionDecision::ContextMismatch { .. })
                 })
                 .count(),
             projection: projection.receipt(),
@@ -739,8 +721,7 @@ impl EchoLedger {
         if canonical.trim().is_empty() || surface.trim().is_empty() {
             return;
         }
-        self.recent
-            .insert((kind, canonical), (surface, self.turn));
+        self.recent.insert((kind, canonical), (surface, self.turn));
     }
 
     pub fn forget(&mut self, kind: SynonymKind, canonical: &str) -> bool {
@@ -854,9 +835,13 @@ where
     let mut rewrite_index = 0;
     while piece_index < pieces.len() || rewrite_index < rewrites.len() {
         let piece = pieces.get(piece_index);
-        let rewrite = rewrites.get(rewrite_index).map(|token| token.anchor.raw_chars);
+        let rewrite = rewrites
+            .get(rewrite_index)
+            .map(|token| token.anchor.raw_chars);
         match (rewrite, piece) {
-            (Some(raw), Some((Some(span), _))) if span.start >= raw.start && span.start < raw.end => {
+            (Some(raw), Some((Some(span), _)))
+                if span.start >= raw.start && span.start < raw.end =>
+            {
                 let token = rewrites[rewrite_index];
                 output.push(TaggedWord {
                     text: token.sense.clone(),
@@ -874,21 +859,11 @@ where
                 }
             }
             (Some(_), Some((Some(span), _))) if span.end <= rewrite.expect("rewrite").start => {
-                emit_piece(
-                    &pieces[piece_index],
-                    &guards,
-                    &normalize,
-                    &mut output,
-                );
+                emit_piece(&pieces[piece_index], &guards, &normalize, &mut output);
                 piece_index += 1;
             }
             (Some(_), Some((None, _))) => {
-                emit_piece(
-                    &pieces[piece_index],
-                    &guards,
-                    &normalize,
-                    &mut output,
-                );
+                emit_piece(&pieces[piece_index], &guards, &normalize, &mut output);
                 piece_index += 1;
             }
             (Some(_), _) => {
@@ -900,12 +875,7 @@ where
                 rewrite_index += 1;
             }
             (None, Some(_)) => {
-                emit_piece(
-                    &pieces[piece_index],
-                    &guards,
-                    &normalize,
-                    &mut output,
-                );
+                emit_piece(&pieces[piece_index], &guards, &normalize, &mut output);
                 piece_index += 1;
             }
             (None, None) => break,
@@ -1013,7 +983,11 @@ where
         context.domain.as_deref(),
         rule.sense.domain.as_deref(),
         compat,
-    ) && compatible_slot(context.range.as_deref(), rule.sense.range.as_deref(), compat)
+    ) && compatible_slot(
+        context.range.as_deref(),
+        rule.sense.range.as_deref(),
+        compat,
+    )
 }
 
 fn compatible_slot<F>(expected: Option<&str>, actual: Option<&str>, compat: &F) -> bool
@@ -1034,12 +1008,7 @@ struct QuoteRange {
 }
 
 fn quote_ranges(chars: &[char]) -> Vec<QuoteRange> {
-    const PAIRS: [(char, char); 4] = [
-        ('“', '”'),
-        ('「', '」'),
-        ('『', '』'),
-        ('‘', '’'),
-    ];
+    const PAIRS: [(char, char); 4] = [('“', '”'), ('「', '」'), ('『', '』'), ('‘', '’')];
     let mut ranges = Vec::new();
     let mut index = 0;
     while index < chars.len() {
@@ -1107,18 +1076,8 @@ mod tests {
     fn graph_with(entries: &[(&str, &str, SynonymKind, Option<&str>)]) -> SynonymGraph {
         let mut graph = SynonymGraph::new(64);
         for (surface, canonical, kind, type_name) in entries {
-            let sense = type_name
-                .map(SynonymSense::type_only)
-                .unwrap_or_default();
-            let outcome = graph.observe(
-                1,
-                surface,
-                canonical,
-                *kind,
-                sense,
-                "test",
-                1.0,
-            );
+            let sense = type_name.map(SynonymSense::type_only).unwrap_or_default();
+            let outcome = graph.observe(1, surface, canonical, *kind, sense, "test", 1.0);
             let id = match outcome {
                 ObserveOutcome::Added { id } | ObserveOutcome::Reinforced { id } => id,
                 other => panic!("unexpected observation: {other:?}"),
@@ -1156,13 +1115,11 @@ mod tests {
     #[test]
     fn multiple_canonicals_stay_ambiguous_and_keep_the_surface() {
         let transducer = LexicalTransducer::new(
-            vec![
-                rule("苹果", "苹果公司"),
-                rule("苹果", "苹果树"),
-            ],
+            vec![rule("苹果", "苹果公司"), rule("苹果", "苹果树")],
             TransducerOptions::default(),
         );
-        let transduction = transducer.transduce("苹果很甜", &SynonymContext::new(), |l, r| l == r);
+        let transduction =
+            transducer.transduce("苹果很甜", &SynonymContext::new(), |l, r| l == r);
         assert_eq!(transduction.normalized, "苹果很甜");
         assert_eq!(transduction.receipt.ambiguous, 1);
         match &transduction.tokens[0].decision {
@@ -1199,16 +1156,22 @@ mod tests {
             TransducerOptions::default(),
         );
         let context = SynonymContext::new().with_expected_type("Organization");
-        let transduction = transducer.transduce("苹果发布了新品", &context, |left, right| {
-            left.eq_ignore_ascii_case(right)
-        });
+        let transduction =
+            transducer.transduce("苹果发布了新品", &context, |left, right| {
+                left.eq_ignore_ascii_case(right)
+            });
         assert_eq!(transduction.normalized, "苹果公司发布了新品");
         assert_eq!(transduction.receipt.context_mismatches, 0);
     }
 
     #[test]
     fn incompatible_context_keeps_the_surface() {
-        let graph = graph_with(&[("苹果", "苹果公司", SynonymKind::Entity, Some("Organization"))]);
+        let graph = graph_with(&[(
+            "苹果",
+            "苹果公司",
+            SynonymKind::Entity,
+            Some("Organization"),
+        )]);
         let transducer = LexicalTransducer::compile(
             &graph,
             &MentionLexicon::new(),
@@ -1216,7 +1179,8 @@ mod tests {
             TransducerOptions::default(),
         );
         let context = SynonymContext::new().with_expected_type("Person");
-        let transduction = transducer.transduce("苹果很甜", &context, |left, right| left == right);
+        let transduction =
+            transducer.transduce("苹果很甜", &context, |left, right| left == right);
         assert_eq!(transduction.normalized, "苹果很甜");
         assert_eq!(transduction.receipt.context_mismatches, 1);
         assert!(matches!(
@@ -1250,10 +1214,7 @@ mod tests {
     fn orthographic_noise_still_projects_back_to_the_raw_span() {
         let transduction = transduce("老\u{200b}婆是老师");
         assert_eq!(transduction.normalized, "妻子是老师");
-        assert_eq!(
-            transduction.tokens[0].anchor.raw_chars,
-            CharSpan::new(0, 3)
-        );
+        assert_eq!(transduction.tokens[0].anchor.raw_chars, CharSpan::new(0, 3));
         assert_eq!(transduction.tokens[0].surface, "老婆");
     }
 
@@ -1369,11 +1330,15 @@ mod tests {
 
     #[test]
     fn tagged_words_keep_protected_mentions_verbatim() {
-        let transducer = LexicalTransducer::new(
-            vec![rule("老婆", "妻子")],
-            TransducerOptions::default(),
-        );
-        let words = tagged(&[("“", "x"), ("老婆", "n"), ("”", "x"), ("是", "v"), ("谁", "r")]);
+        let transducer =
+            LexicalTransducer::new(vec![rule("老婆", "妻子")], TransducerOptions::default());
+        let words = tagged(&[
+            ("“", "x"),
+            ("老婆", "n"),
+            ("”", "x"),
+            ("是", "v"),
+            ("谁", "r"),
+        ]);
         let (output, transduction) = transduce_tagged_words(
             "“老婆”是谁",
             &words,
@@ -1428,10 +1393,8 @@ mod tests {
 
     #[test]
     fn tagged_words_fall_back_on_unaligned_tokens() {
-        let transducer = LexicalTransducer::new(
-            vec![rule("老大", "长者")],
-            TransducerOptions::default(),
-        );
+        let transducer =
+            LexicalTransducer::new(vec![rule("老大", "长者")], TransducerOptions::default());
         let words = tagged(&[("xyz", "n"), ("老大", "n")]);
         let (output, _) = transduce_tagged_words(
             "abc老大",

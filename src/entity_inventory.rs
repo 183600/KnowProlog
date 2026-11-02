@@ -97,7 +97,10 @@ fn normalize(question: &str) -> String {
 fn trim_particles(mut text: &str) -> &str {
     loop {
         let trimmed = text.trim_end_matches(|c: char| {
-            matches!(c, '呢' | '啊' | '呀' | '吧' | '吗' | '。' | '？' | '?' | '！' | '!')
+            matches!(
+                c,
+                '呢' | '啊' | '呀' | '吧' | '吗' | '。' | '？' | '?' | '！' | '!'
+            )
         });
         if trimmed == text {
             return text;
@@ -149,10 +152,16 @@ fn render(generator: &SymbolicGenerator, question: &InventoryQuestion) -> String
         .map(|etype| format!("（{}）", localized_type_label(etype)))
         .unwrap_or_default();
     let mut sections = Vec::new();
-    if matches!(question.scope, InventoryScope::Attributes | InventoryScope::Both) {
+    if matches!(
+        question.scope,
+        InventoryScope::Attributes | InventoryScope::Both
+    ) {
         sections.push(render_attributes(generator, entity));
     }
-    if matches!(question.scope, InventoryScope::Relations | InventoryScope::Both) {
+    if matches!(
+        question.scope,
+        InventoryScope::Relations | InventoryScope::Both
+    ) {
         sections.push(render_relations(generator, entity));
     }
     format!(
@@ -176,7 +185,10 @@ fn render_attributes(generator: &SymbolicGenerator, entity: &str) -> String {
         output.push_str(&format!("    - {}：{}\n", label, value));
     }
     if pairs.len() > MAX_ROWS {
-        output.push_str(&format!("    （其余 {} 项未展开）\n", pairs.len() - MAX_ROWS));
+        output.push_str(&format!(
+            "    （其余 {} 项未展开）\n",
+            pairs.len() - MAX_ROWS
+        ));
     }
     output.trim_end().to_string()
 }
@@ -290,7 +302,11 @@ mod tests {
         assert!(attributes.contains("姓名：李四"), "{}", attributes);
 
         let relations = answer(&generator, "李四有哪些关系").unwrap();
-        assert!(relations.contains("张三 师傅 李四（入向）"), "{}", relations);
+        assert!(
+            relations.contains("张三 师傅 李四（入向）"),
+            "{}",
+            relations
+        );
 
         let both = answer(&generator, "李四有哪些信息").unwrap();
         assert!(both.contains("属性（2 项）"), "{}", both);

@@ -129,7 +129,9 @@ impl RepairOp {
                     TermPosition::Object => &mut pattern_edge.object,
                 };
                 match term {
-                    PatternTerm::Const(existing) if existing != value && !value.trim().is_empty() => {
+                    PatternTerm::Const(existing)
+                        if existing != value && !value.trim().is_empty() =>
+                    {
                         *existing = value.clone();
                     }
                     _ => return None,
@@ -276,12 +278,7 @@ impl RepairLedger {
             .iter()
             .enumerate()
             .map(|(index, step)| {
-                format!(
-                    "第 {} 步：{}（{}）",
-                    index + 1,
-                    step.label,
-                    step.rationale
-                )
+                format!("第 {} 步：{}（{}）", index + 1, step.label, step.rationale)
             })
             .collect();
         Some(format!(
@@ -572,14 +569,7 @@ mod tests {
         let pattern = failing_pattern();
         let options = MatchOptions::default();
         let diagnosis = diagnose_failure(&pattern, &facts(), options).unwrap();
-        let repairs = suggest_repairs(
-            &pattern,
-            &facts(),
-            options,
-            &diagnosis,
-            &NoRepairHints,
-            5,
-        );
+        let repairs = suggest_repairs(&pattern, &facts(), options, &diagnosis, &NoRepairHints, 5);
         let drop = repairs
             .iter()
             .find(|repair| matches!(repair.op, RepairOp::DropEdge { edge: 0 }))
@@ -593,14 +583,7 @@ mod tests {
         let pattern = failing_pattern();
         let options = MatchOptions::default();
         let diagnosis = diagnose_failure(&pattern, &facts(), options).unwrap();
-        let repairs = suggest_repairs(
-            &pattern,
-            &facts(),
-            options,
-            &diagnosis,
-            &NoRepairHints,
-            5,
-        );
+        let repairs = suggest_repairs(&pattern, &facts(), options, &diagnosis, &NoRepairHints, 5);
         assert!(!repairs.is_empty());
         for repair in repairs {
             assert!(repair.total > 0);
@@ -656,14 +639,7 @@ mod tests {
         let options = MatchOptions::default();
         let diagnosis = diagnose_failure(&pattern, &facts(), options).unwrap();
         assert_eq!(diagnosis.kind, DiagnosisKind::ConstraintConflict);
-        let repairs = suggest_repairs(
-            &pattern,
-            &facts(),
-            options,
-            &diagnosis,
-            &NoRepairHints,
-            5,
-        );
+        let repairs = suggest_repairs(&pattern, &facts(), options, &diagnosis, &NoRepairHints, 5);
         assert!(repairs
             .iter()
             .any(|repair| matches!(repair.op, RepairOp::DropConstraint { .. })));
@@ -671,10 +647,7 @@ mod tests {
 
     #[test]
     fn confirmation_phrases_are_narrow_and_ordinal() {
-        assert_eq!(
-            parse_repair_intent("放宽 2"),
-            Some(RepairIntent::Adopt(1))
-        );
+        assert_eq!(parse_repair_intent("放宽 2"), Some(RepairIntent::Adopt(1)));
         assert_eq!(
             parse_repair_intent("采用第二条"),
             Some(RepairIntent::Adopt(1))
@@ -776,7 +749,10 @@ mod tests {
             .find(|repair| matches!(repair.op, RepairOp::ReplaceEntity { .. }))
             .expect("结构近邻应产生实体替换候选");
         assert!(entity.label().contains("仅建议"), "{}", entity.label());
-        assert!(entity.sample_rows.is_empty(), "模式没有投影时不应伪造结果行");
+        assert!(
+            entity.sample_rows.is_empty(),
+            "模式没有投影时不应伪造结果行"
+        );
         let relaxed = entity.op.apply(&pattern).unwrap();
         assert_eq!(
             relaxed.edges[0].subject,

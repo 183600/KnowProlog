@@ -54,9 +54,8 @@ impl LocalSemanticAdapter {
     }
 
     fn advanced_nlu(&self) -> &AdvancedNLU {
-        self.advanced_nlu_cell.get_or_init(|| {
-            AdvancedNLU::new().with_context_window_size(self.context_window_size)
-        })
+        self.advanced_nlu_cell
+            .get_or_init(|| AdvancedNLU::new().with_context_window_size(self.context_window_size))
     }
 
     fn entity_extractor(&self) -> &EntityRelationExtractor {

@@ -32,11 +32,31 @@ struct Triple {
 }
 
 const FACTS: &[Triple] = &[
-    Triple { subject: "张三", predicate: "师傅", object: "李四" },
-    Triple { subject: "李四", predicate: "师傅", object: "王五" },
-    Triple { subject: "张三", predicate: "朋友", object: "王五" },
-    Triple { subject: "张三", predicate: "出生地", object: "北京" },
-    Triple { subject: "李四", predicate: "出生地", object: "上海" },
+    Triple {
+        subject: "张三",
+        predicate: "师傅",
+        object: "李四",
+    },
+    Triple {
+        subject: "李四",
+        predicate: "师傅",
+        object: "王五",
+    },
+    Triple {
+        subject: "张三",
+        predicate: "朋友",
+        object: "王五",
+    },
+    Triple {
+        subject: "张三",
+        predicate: "出生地",
+        object: "北京",
+    },
+    Triple {
+        subject: "李四",
+        predicate: "出生地",
+        object: "上海",
+    },
 ];
 
 struct Fixture {
@@ -153,26 +173,106 @@ struct GoldenCase {
 }
 
 const GOLDEN: &[GoldenCase] = &[
-    GoldenCase { text: "张三的师傅是李四。", expected: Verdict::Entailed, tag: "direct" },
-    GoldenCase { text: "李四是张三的师傅。", expected: Verdict::Entailed, tag: "inverse" },
-    GoldenCase { text: "李四的师傅是王五。", expected: Verdict::Entailed, tag: "direct" },
-    GoldenCase { text: "王五的师傅是赵六。", expected: Verdict::Unknown, tag: "missing" },
-    GoldenCase { text: "张三的师傅是王五。", expected: Verdict::Unknown, tag: "multi_value" },
-    GoldenCase { text: "张三的师傅不是王五。", expected: Verdict::Unknown, tag: "multi_value" },
-    GoldenCase { text: "张三的朋友是王五。", expected: Verdict::Entailed, tag: "direct" },
-    GoldenCase { text: "张三的朋友是李四。", expected: Verdict::Unknown, tag: "multi_value" },
-    GoldenCase { text: "张三的出生地是北京。", expected: Verdict::Entailed, tag: "direct" },
-    GoldenCase { text: "张三的出生地是上海。", expected: Verdict::Contradicted, tag: "functional" },
-    GoldenCase { text: "张三的出生地不是上海。", expected: Verdict::Entailed, tag: "closed_world" },
-    GoldenCase { text: "张三的年龄是30。", expected: Verdict::Entailed, tag: "attribute" },
-    GoldenCase { text: "张三的年龄是31。", expected: Verdict::Contradicted, tag: "functional" },
-    GoldenCase { text: "张三的年龄不是31。", expected: Verdict::Entailed, tag: "closed_world" },
-    GoldenCase { text: "张三是人物。", expected: Verdict::Entailed, tag: "type" },
-    GoldenCase { text: "张三是地点。", expected: Verdict::Contradicted, tag: "type" },
-    GoldenCase { text: "赵六的师傅是李四。", expected: Verdict::Unknown, tag: "unknown_entity" },
-    GoldenCase { text: "张山的师傅是李四。", expected: Verdict::Entailed, tag: "fuzzy_link" },
-    GoldenCase { text: "张三的老师是李四。", expected: Verdict::Entailed, tag: "synonym" },
-    GoldenCase { text: "张三的岁数是30。", expected: Verdict::Entailed, tag: "synonym" },
+    GoldenCase {
+        text: "张三的师傅是李四。",
+        expected: Verdict::Entailed,
+        tag: "direct",
+    },
+    GoldenCase {
+        text: "李四是张三的师傅。",
+        expected: Verdict::Entailed,
+        tag: "inverse",
+    },
+    GoldenCase {
+        text: "李四的师傅是王五。",
+        expected: Verdict::Entailed,
+        tag: "direct",
+    },
+    GoldenCase {
+        text: "王五的师傅是赵六。",
+        expected: Verdict::Unknown,
+        tag: "missing",
+    },
+    GoldenCase {
+        text: "张三的师傅是王五。",
+        expected: Verdict::Unknown,
+        tag: "multi_value",
+    },
+    GoldenCase {
+        text: "张三的师傅不是王五。",
+        expected: Verdict::Unknown,
+        tag: "multi_value",
+    },
+    GoldenCase {
+        text: "张三的朋友是王五。",
+        expected: Verdict::Entailed,
+        tag: "direct",
+    },
+    GoldenCase {
+        text: "张三的朋友是李四。",
+        expected: Verdict::Unknown,
+        tag: "multi_value",
+    },
+    GoldenCase {
+        text: "张三的出生地是北京。",
+        expected: Verdict::Entailed,
+        tag: "direct",
+    },
+    GoldenCase {
+        text: "张三的出生地是上海。",
+        expected: Verdict::Contradicted,
+        tag: "functional",
+    },
+    GoldenCase {
+        text: "张三的出生地不是上海。",
+        expected: Verdict::Entailed,
+        tag: "closed_world",
+    },
+    GoldenCase {
+        text: "张三的年龄是30。",
+        expected: Verdict::Entailed,
+        tag: "attribute",
+    },
+    GoldenCase {
+        text: "张三的年龄是31。",
+        expected: Verdict::Contradicted,
+        tag: "functional",
+    },
+    GoldenCase {
+        text: "张三的年龄不是31。",
+        expected: Verdict::Entailed,
+        tag: "closed_world",
+    },
+    GoldenCase {
+        text: "张三是人物。",
+        expected: Verdict::Entailed,
+        tag: "type",
+    },
+    GoldenCase {
+        text: "张三是地点。",
+        expected: Verdict::Contradicted,
+        tag: "type",
+    },
+    GoldenCase {
+        text: "赵六的师傅是李四。",
+        expected: Verdict::Unknown,
+        tag: "unknown_entity",
+    },
+    GoldenCase {
+        text: "张山的师傅是李四。",
+        expected: Verdict::Entailed,
+        tag: "fuzzy_link",
+    },
+    GoldenCase {
+        text: "张三的老师是李四。",
+        expected: Verdict::Entailed,
+        tag: "synonym",
+    },
+    GoldenCase {
+        text: "张三的岁数是30。",
+        expected: Verdict::Entailed,
+        tag: "synonym",
+    },
 ];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -205,12 +305,18 @@ impl EntailmentEvalReport {
     pub fn metrics(&self) -> BTreeMap<String, f64> {
         let mut metrics = BTreeMap::new();
         metrics.insert("gold.accuracy".to_string(), self.gold_accuracy());
-        metrics.insert("gold.entailed_rate".to_string(), ratio(self.entailed_cases, self.cases));
+        metrics.insert(
+            "gold.entailed_rate".to_string(),
+            ratio(self.entailed_cases, self.cases),
+        );
         metrics.insert(
             "gold.contradicted_rate".to_string(),
             ratio(self.contradicted_cases, self.cases),
         );
-        metrics.insert("gold.unknown_rate".to_string(), ratio(self.unknown_cases, self.cases));
+        metrics.insert(
+            "gold.unknown_rate".to_string(),
+            ratio(self.unknown_cases, self.cases),
+        );
         metrics.insert(
             "metamorphic.pass_rate".to_string(),
             self.metamorphic_pass_rate(),
@@ -223,10 +329,7 @@ impl EntailmentEvalReport {
         values.insert("version".to_string(), serde_json::json!(self.version));
         values.insert("corpus".to_string(), serde_json::json!(self.corpus_digest));
         values.insert("cases".to_string(), serde_json::json!(self.cases));
-        values.insert(
-            "passed".to_string(),
-            serde_json::json!(self.passed_cases),
-        );
+        values.insert("passed".to_string(), serde_json::json!(self.passed_cases));
         values.insert(
             "metamorphic".to_string(),
             serde_json::json!(self.metamorphic_passed),
@@ -331,14 +434,13 @@ fn check_determinism(fixture: &Fixture) -> Result<(), String> {
 }
 
 fn check_monotonicity(fixture: &Fixture) -> Result<(), String> {
-    let before: Vec<Verdict> = GOLDEN.iter().map(|case| fixture.verdict(case.text)).collect();
+    let before: Vec<Verdict> = GOLDEN
+        .iter()
+        .map(|case| fixture.verdict(case.text))
+        .collect();
     let mut grown = Fixture::new();
-    grown
-        .predictor
-        .add_triple("王五", "出生地", "北京");
-    grown
-        .generator
-        .observe_triple("王五", "出生地", "北京");
+    grown.predictor.add_triple("王五", "出生地", "北京");
+    grown.generator.observe_triple("王五", "出生地", "北京");
     let after: Vec<Verdict> = GOLDEN.iter().map(|case| grown.verdict(case.text)).collect();
     for (case, (old, new)) in GOLDEN.iter().zip(before.iter().zip(after.iter())) {
         let allowed = *old == *new

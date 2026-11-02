@@ -406,10 +406,7 @@ fn split_numeral_measure(
             continue;
         }
         let rest: String = chars[cut..].iter().collect();
-        if NUMERAL_UNITS
-            .iter()
-            .any(|unit| rest.starts_with(unit))
-        {
+        if NUMERAL_UNITS.iter().any(|unit| rest.starts_with(unit)) {
             return Some(vec![AnnotatedWord {
                 text: word.to_string(),
                 pos: "m".to_string(),
@@ -444,21 +441,37 @@ fn annotated_word(
 
 /// 中文数字里常见、但作为词时并非数字的写法（「万一」「十分」等）。
 /// 仅靠字形无法区分，必须显式排除，避免把副词当数量。
-const NUMERAL_WORD_BLOCKLIST: &[&str] =
-    &["万一", "千万", "万万", "亿万", "十分", "万分", "百分", "千分"];
+const NUMERAL_WORD_BLOCKLIST: &[&str] = &[
+    "万一", "千万", "万万", "亿万", "十分", "万分", "百分", "千分",
+];
 
 /// 可以跟数词构成「数量短语」的量词；结巴常把「十八岁」粘成一个 m token，
 /// 拆开后才能命中提取规则里的 nr + m + q。
 const COUNT_MEASURES: &[&str] = &[
-    "岁", "年", "月", "日", "天", "个", "人", "次", "元", "块", "只", "头", "名", "位", "件",
-    "条", "张", "本", "辆", "架", "门", "间", "层", "页", "篇",
+    "岁", "年", "月", "日", "天", "个", "人", "次", "元", "块", "只", "头", "名", "位", "件", "条",
+    "张", "本", "辆", "架", "门", "间", "层", "页", "篇",
 ];
 
 /// 计量单位：数词与单位粘在一起时保留为整体数字 token（如「一米」），
 /// 不拆成 m + q，避免破坏身高/体重等「数值可带单位」的槽位。
 const NUMERAL_UNITS: &[&str] = &[
-    "公斤", "公里", "厘米", "毫米", "平方米", "立方米", "小时", "分钟", "米", "斤", "克", "吨",
-    "度", "分", "秒", "升", "毫升",
+    "公斤",
+    "公里",
+    "厘米",
+    "毫米",
+    "平方米",
+    "立方米",
+    "小时",
+    "分钟",
+    "米",
+    "斤",
+    "克",
+    "吨",
+    "度",
+    "分",
+    "秒",
+    "升",
+    "毫升",
 ];
 
 fn is_chinese_numeral_word(word: &str) -> bool {
@@ -751,10 +764,7 @@ fn match_pattern_for_prolog(
                         return None; // 不是人名
                     }
                 } else if pos < tagged_words.len()
-                    && crate::pos_ontology::tag_matches(
-                        expected_pos,
-                        &tagged_words[pos].pos,
-                    )
+                    && crate::pos_ontology::tag_matches(expected_pos, &tagged_words[pos].pos)
                 {
                     // 如果是名词性成分，提取为实体（含 nt/nz/vn 等后代）
                     if crate::pos_ontology::captures_entity(expected_pos) {
@@ -901,9 +911,7 @@ mod tests {
 
     #[test]
     fn sense_aware_normalization_keeps_ambiguous_surface() {
-        use crate::synonym_graph::{
-            SynonymContext, SynonymGraph, SynonymKind, SynonymSense,
-        };
+        use crate::synonym_graph::{SynonymContext, SynonymGraph, SynonymKind, SynonymSense};
 
         let mut graph = SynonymGraph::new(16);
         for (canonical, type_name) in [("苹果公司", "组织"), ("苹果", "水果")] {
@@ -923,12 +931,8 @@ mod tests {
         fallback.insert("苹果".to_string(), "苹果公司".to_string());
 
         let words = tagged(&[("苹果", "n"), ("的", "u"), ("颜色", "n")]);
-        let kept = normalize_words_sense_aware(
-            words.clone(),
-            &graph,
-            &SynonymContext::new(),
-            &fallback,
-        );
+        let kept =
+            normalize_words_sense_aware(words.clone(), &graph, &SynonymContext::new(), &fallback);
         assert_eq!(kept[0].text, "苹果", "歧义词面不得硬选");
 
         let typed = normalize_words_sense_aware(
@@ -945,16 +949,21 @@ mod tests {
         assert_eq!(normalized[0].text, "创建", "图里无证据时保留原词面");
         let mut flat = HashMap::new();
         flat.insert("创建".to_string(), "成立".to_string());
-        let normalized =
-            normalize_words_sense_aware(tagged(&[("创建", "v")]), &graph, &SynonymContext::new(), &flat);
-        assert_eq!(normalized[0].text, "成立", "未进入词义图的旧映射仍回退扁平表");
+        let normalized = normalize_words_sense_aware(
+            tagged(&[("创建", "v")]),
+            &graph,
+            &SynonymContext::new(),
+            &flat,
+        );
+        assert_eq!(
+            normalized[0].text, "成立",
+            "未进入词义图的旧映射仍回退扁平表"
+        );
     }
 
     #[test]
     fn sense_aware_normalization_accepts_type_alias_closure() {
-        use crate::synonym_graph::{
-            SynonymContext, SynonymGraph, SynonymKind, SynonymSense,
-        };
+        use crate::synonym_graph::{SynonymContext, SynonymGraph, SynonymKind, SynonymSense};
 
         let mut graph = SynonymGraph::new(16);
         let outcome = graph.observe(
@@ -1055,10 +1064,7 @@ mod tests {
                 tag
             );
         }
-        let pattern = pattern_from_strings(vec![
-            "nr".to_string(),
-            "多大".to_string(),
-        ]);
+        let pattern = pattern_from_strings(vec!["nr".to_string(), "多大".to_string()]);
         let words = tagged(&[("李明", "nrfg"), ("多大", "r")]);
         assert!(match_pattern_for_prolog(&words, &pattern).is_some());
     }
@@ -1066,13 +1072,19 @@ mod tests {
     #[test]
     fn pos_or_word_matches_either_evidence_source() {
         let words = tagged(&[("研究", "vn")]);
-        let by_pos = vec![PatternElement::PosOrWord("v".to_string(), "学习".to_string())];
+        let by_pos = vec![PatternElement::PosOrWord(
+            "v".to_string(),
+            "学习".to_string(),
+        )];
         assert_eq!(
             match_pattern_for_prolog(&words, &by_pos),
             Some(Vec::<String>::new()),
             "谓词性不捕获实体"
         );
-        let by_word = vec![PatternElement::PosOrWord("n".to_string(), "研究".to_string())];
+        let by_word = vec![PatternElement::PosOrWord(
+            "n".to_string(),
+            "研究".to_string(),
+        )];
         let words = tagged(&[("研究", "vn")]);
         assert_eq!(
             match_pattern_for_prolog(&words, &by_word),
@@ -1233,17 +1245,9 @@ mod tests {
     fn confirmed_long_entity_becomes_one_lexicon_token() {
         let config = test_config();
         let mut lexicon = crate::mention_lexicon::MentionLexicon::new();
-        lexicon.confirm(
-            "未名科技公司",
-            "未名科技公司",
-            Some("Organization"),
-            "test",
-        );
-        let words = preprocess_annotated_with_lexicon(
-            "未名科技公司发布了新芯片",
-            &config,
-            &lexicon,
-        );
+        lexicon.confirm("未名科技公司", "未名科技公司", Some("Organization"), "test");
+        let words =
+            preprocess_annotated_with_lexicon("未名科技公司发布了新芯片", &config, &lexicon);
         let entity = words
             .iter()
             .find(|word| word.text == "未名科技公司")

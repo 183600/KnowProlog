@@ -497,8 +497,10 @@ impl PatternLexicon {
     }
 
     fn compile_equality(&self, question: &str) -> Option<CompiledGraphQuestion> {
-        let (position, marker) =
-            find_position(question, &["同一个", "同一", "共同", "相同", "一样", "一致"])?;
+        let (position, marker) = find_position(
+            question,
+            &["同一个", "同一", "共同", "相同", "一样", "一致"],
+        )?;
         let left = &question[..position];
         let right = &question[position + marker.len()..];
         let mentions = self.entity_mentions(left);
@@ -514,8 +516,8 @@ impl PatternLexicon {
                 mention.canonical(self, surface).to_string()
             })
             .collect();
-        let asks_for_other = mentions.len() == 1
-            && contains_question_word(&left[mentions[0].end()..]);
+        let asks_for_other =
+            mentions.len() == 1 && contains_question_word(&left[mentions[0].end()..]);
         if mentions.len() == 1 && !asks_for_other {
             return None;
         }
@@ -595,8 +597,7 @@ impl PatternLexicon {
         {
             return false;
         }
-        contains_question_word(clause)
-            || ["那", "那么", "呢", "吧", "的"].contains(&clause.trim())
+        contains_question_word(clause) || ["那", "那么", "呢", "吧", "的"].contains(&clause.trim())
     }
 
     fn finish_pattern(&self, edges: Vec<EdgePattern>, select: Vec<String>) -> Option<GraphPattern> {

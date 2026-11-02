@@ -29,9 +29,7 @@ use crate::dialogue_manager::{DialogueTurn, MoveKind};
 pub const ANSWER_TAXONOMY_VERSION: u32 = 1;
 
 /// 回答图式：决定一段回答要按什么结构组织。
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnswerSchema {
     /// 实体身份：这是谁 / 是什么。
@@ -122,9 +120,7 @@ impl AnswerSchema {
 }
 
 /// 话语角色：一句话在回答结构中承担什么功能。
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiscourseRole {
     /// 定义或上位归属。
@@ -170,9 +166,7 @@ impl DiscourseRole {
 }
 
 /// 回答回合需要填的槽位。
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Obligation {
     /// 主体实体。
@@ -243,9 +237,7 @@ impl Obligation {
 }
 
 /// 追问类型：对当前回答回合的合法操作。
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FollowUpKind {
     /// 继续展开同一回答。
@@ -291,9 +283,9 @@ impl FollowUpKind {
 
     /// 从字面识别追问意图；识别不到时返回 `None`（按新问题处理）。
     pub fn from_input(input: &str) -> Option<Self> {
-        let text = input.trim().trim_end_matches([
-            '？', '?', '。', '.', '！', '!', '，', ',', ' ', '呢',
-        ]);
+        let text = input
+            .trim()
+            .trim_end_matches(['？', '?', '。', '.', '！', '!', '，', ',', ' ', '呢']);
         if text.is_empty() {
             return None;
         }
@@ -316,14 +308,7 @@ impl FollowUpKind {
             "重说",
         ];
         const MORE: [&str; 8] = [
-            "还有",
-            "继续",
-            "展开",
-            "详细",
-            "多说",
-            "然后",
-            "补充",
-            "讲完",
+            "还有", "继续", "展开", "详细", "多说", "然后", "补充", "讲完",
         ];
         const NEXT: [&str; 5] = ["下一步", "下一点", "下一个", "第几", "第二步"];
         const COMPARE: [&str; 5] = ["对比", "比较", "区别", "差异", "哪个更"];
@@ -420,21 +405,33 @@ pub const TAXONOMY: &[SchemaSpec] = &[
     SchemaSpec {
         schema: AnswerSchema::Identity,
         query_types: &[],
-        required: &[Obligation::Subject, Obligation::Answer, Obligation::Evidence],
+        required: &[
+            Obligation::Subject,
+            Obligation::Answer,
+            Obligation::Evidence,
+        ],
         optional: &[Obligation::Boundary],
         followups: ALL_FOLLOWUPS,
     },
     SchemaSpec {
         schema: AnswerSchema::Attribute,
         query_types: ATTRIBUTE_QUERY_TYPES,
-        required: &[Obligation::Subject, Obligation::Answer, Obligation::Evidence],
+        required: &[
+            Obligation::Subject,
+            Obligation::Answer,
+            Obligation::Evidence,
+        ],
         optional: &[Obligation::Predicate, Obligation::Boundary],
         followups: ALL_FOLLOWUPS,
     },
     SchemaSpec {
         schema: AnswerSchema::Relation,
         query_types: RELATION_QUERY_TYPES,
-        required: &[Obligation::Subject, Obligation::Answer, Obligation::Evidence],
+        required: &[
+            Obligation::Subject,
+            Obligation::Answer,
+            Obligation::Evidence,
+        ],
         optional: &[Obligation::Predicate, Obligation::Boundary],
         followups: ALL_FOLLOWUPS,
     },
@@ -453,14 +450,22 @@ pub const TAXONOMY: &[SchemaSpec] = &[
     SchemaSpec {
         schema: AnswerSchema::Definition,
         query_types: DEFINITION_QUERY_TYPES,
-        required: &[Obligation::Subject, Obligation::Answer, Obligation::Evidence],
+        required: &[
+            Obligation::Subject,
+            Obligation::Answer,
+            Obligation::Evidence,
+        ],
         optional: &[Obligation::Boundary],
         followups: ALL_FOLLOWUPS,
     },
     SchemaSpec {
         schema: AnswerSchema::Explanation,
         query_types: EXPLANATION_QUERY_TYPES,
-        required: &[Obligation::Subject, Obligation::Answer, Obligation::Evidence],
+        required: &[
+            Obligation::Subject,
+            Obligation::Answer,
+            Obligation::Evidence,
+        ],
         optional: &[Obligation::Boundary],
         followups: ALL_FOLLOWUPS,
     },
@@ -474,21 +479,33 @@ pub const TAXONOMY: &[SchemaSpec] = &[
     SchemaSpec {
         schema: AnswerSchema::Enumeration,
         query_types: &[],
-        required: &[Obligation::Subject, Obligation::Answer, Obligation::Evidence],
+        required: &[
+            Obligation::Subject,
+            Obligation::Answer,
+            Obligation::Evidence,
+        ],
         optional: &[Obligation::Boundary],
         followups: ALL_FOLLOWUPS,
     },
     SchemaSpec {
         schema: AnswerSchema::Count,
         query_types: COUNT_QUERY_TYPES,
-        required: &[Obligation::Subject, Obligation::Answer, Obligation::Evidence],
+        required: &[
+            Obligation::Subject,
+            Obligation::Answer,
+            Obligation::Evidence,
+        ],
         optional: &[Obligation::Boundary],
         followups: ALL_FOLLOWUPS,
     },
     SchemaSpec {
         schema: AnswerSchema::Truth,
         query_types: &[],
-        required: &[Obligation::Subject, Obligation::Answer, Obligation::Evidence],
+        required: &[
+            Obligation::Subject,
+            Obligation::Answer,
+            Obligation::Evidence,
+        ],
         optional: &[Obligation::Boundary],
         followups: ALL_FOLLOWUPS,
     },
@@ -497,7 +514,11 @@ pub const TAXONOMY: &[SchemaSpec] = &[
         query_types: &[],
         required: &[],
         optional: &[Obligation::Answer],
-        followups: &[FollowUpKind::More, FollowUpKind::Paraphrase, FollowUpKind::Switch],
+        followups: &[
+            FollowUpKind::More,
+            FollowUpKind::Paraphrase,
+            FollowUpKind::Switch,
+        ],
     },
     SchemaSpec {
         schema: AnswerSchema::Review,
@@ -606,7 +627,11 @@ pub fn classify_lexical(input: &str) -> Option<AnswerSchema> {
 /// 同一回答回合内的短追问（继续 / 依据 / 换说法 / 对比 / 澄清）继承上一
 /// 图式；完整问句先看显式线索（对比、步骤、列举、定义、解释、是非），
 /// 再回落到话语动作。没有线索时保持 `Unknown`，把澄清义务显式留下。
-pub fn classify_input(input: &str, kind: &MoveKind, previous: Option<AnswerSchema>) -> AnswerSchema {
+pub fn classify_input(
+    input: &str,
+    kind: &MoveKind,
+    previous: Option<AnswerSchema>,
+) -> AnswerSchema {
     let text = input.trim();
     let short_followup = text.chars().count() <= FOLLOWUP_CHAR_LIMIT;
     let lexical = classify_lexical(input);
@@ -777,18 +802,15 @@ impl AnswerEpisode {
         let previous_schema = previous.map(|episode| episode.schema);
         let followup = FollowUpKind::from_input(observation.question);
         let schema = classify_input(observation.question, observation.kind, previous_schema);
-        let subject = observation
-            .subject
-            .map(str::to_string)
-            .or_else(|| {
-                previous.and_then(|episode| {
-                    followup
-                        .map(FollowUpKind::stays_in_episode)
-                        .unwrap_or(false)
-                        .then(|| episode.subject.clone())
-                        .flatten()
-                })
-            });
+        let subject = observation.subject.map(str::to_string).or_else(|| {
+            previous.and_then(|episode| {
+                followup
+                    .map(FollowUpKind::stays_in_episode)
+                    .unwrap_or(false)
+                    .then(|| episode.subject.clone())
+                    .flatten()
+            })
+        });
         let predicate = observation.predicate.map(str::to_string).or_else(|| {
             previous.and_then(|episode| {
                 followup
@@ -804,16 +826,16 @@ impl AnswerEpisode {
                 && followup
                     .map(FollowUpKind::stays_in_episode)
                     .unwrap_or(false)
-                && (subject.is_none()
-                    || episode.subject.is_none()
-                    || episode.subject == subject)
+                && (subject.is_none() || episode.subject.is_none() || episode.subject == subject)
                 && (predicate.is_none()
                     || episode.predicate.is_none()
                     || episode.predicate == predicate)
         });
 
         let mut extra = if continues {
-            previous.map(|episode| episode.extra.clone()).unwrap_or_default()
+            previous
+                .map(|episode| episode.extra.clone())
+                .unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -823,9 +845,7 @@ impl AnswerEpisode {
                     extra.push(Obligation::Answer);
                     extra.push(Obligation::Evidence);
                 }
-                FollowUpKind::Next | FollowUpKind::Paraphrase => {
-                    extra.push(Obligation::Answer)
-                }
+                FollowUpKind::Next | FollowUpKind::Paraphrase => extra.push(Obligation::Answer),
                 FollowUpKind::Why => extra.push(Obligation::Evidence),
                 FollowUpKind::Compare => {
                     extra.push(Obligation::Contrast);
@@ -893,12 +913,16 @@ impl AnswerEpisode {
             .collect();
 
         let turns = if continues {
-            previous.map(|episode| episode.turns.saturating_add(1)).unwrap_or(1)
+            previous
+                .map(|episode| episode.turns.saturating_add(1))
+                .unwrap_or(1)
         } else {
             1
         };
         let mut followups = if continues {
-            previous.map(|episode| episode.followups.clone()).unwrap_or_default()
+            previous
+                .map(|episode| episode.followups.clone())
+                .unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -1000,7 +1024,11 @@ impl AnswerEpisode {
             self.schema.label_zh(),
             subject,
             self.turns,
-            if self.is_closed() { "已闭合" } else { "未闭合" },
+            if self.is_closed() {
+                "已闭合"
+            } else {
+                "未闭合"
+            },
             missing
         )
     }
@@ -1099,7 +1127,10 @@ mod tests {
         assert_eq!(second.schema, AnswerSchema::Attribute);
         assert_eq!(second.subject.as_deref(), Some("姚明"));
         assert_eq!(second.turns, 2);
-        assert_eq!(second.missing, vec![Obligation::Answer, Obligation::Evidence]);
+        assert_eq!(
+            second.missing,
+            vec![Obligation::Answer, Obligation::Evidence]
+        );
     }
 
     #[test]
@@ -1204,7 +1235,14 @@ mod tests {
         );
         let why = MoveKind::MetaWhy;
         let second = AnswerEpisode::observe(
-            &observation("为什么？", &why, Some("姚明"), Some("依据是登记事实"), &[], &plan),
+            &observation(
+                "为什么？",
+                &why,
+                Some("姚明"),
+                Some("依据是登记事实"),
+                &[],
+                &plan,
+            ),
             Some(&first),
         );
         assert_eq!(second.schema, AnswerSchema::Attribute);
@@ -1215,10 +1253,8 @@ mod tests {
     #[test]
     fn unknown_questions_owe_a_clarification() {
         let other = MoveKind::Other;
-        let episode = AnswerEpisode::observe(
-            &observation("嗯嗯", &other, None, None, &[], &[]),
-            None,
-        );
+        let episode =
+            AnswerEpisode::observe(&observation("嗯嗯", &other, None, None, &[], &[]), None);
         assert_eq!(episode.schema, AnswerSchema::Unknown);
         assert_eq!(episode.missing, vec![Obligation::Clarification]);
         assert!(!episode.is_closed());

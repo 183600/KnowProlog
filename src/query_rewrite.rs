@@ -87,9 +87,26 @@ impl RelationRewrite {
     }
 }
 
-const WH_PREFIXES: [&str; 8] = ["什么人", "哪些人", "哪位", "哪个", "谁", "何人", "什么", "啥"];
+const WH_PREFIXES: [&str; 8] = [
+    "什么人",
+    "哪些人",
+    "哪位",
+    "哪个",
+    "谁",
+    "何人",
+    "什么",
+    "啥",
+];
 const WH_SUFFIXES: [&str; 9] = [
-    "什么人", "哪些人", "哪位", "哪个", "谁", "何人", "什么", "啥", "哪些",
+    "什么人",
+    "哪些人",
+    "哪位",
+    "哪个",
+    "谁",
+    "何人",
+    "什么",
+    "啥",
+    "哪些",
 ];
 /// 疑问词后还可以带类型名词：「哪些学生」「哪位老师」「什么书」。
 /// 这类名词只约束答案类型，不参与谓词词表校验。
@@ -193,9 +210,33 @@ fn valid_type_noun(text: &str) -> bool {
         && !text.chars().any(|c| {
             matches!(
                 c,
-                '的' | '是' | '被' | '把' | '将' | '吗' | '呢' | '吧' | '啊' | '过' | '了'
-                    | '着' | '不' | '没' | '和' | '跟' | '与' | '还' | '也' | '都' | '，'
-                    | ',' | '？' | '?' | '。' | '！' | '!' | ' '
+                '的' | '是'
+                    | '被'
+                    | '把'
+                    | '将'
+                    | '吗'
+                    | '呢'
+                    | '吧'
+                    | '啊'
+                    | '过'
+                    | '了'
+                    | '着'
+                    | '不'
+                    | '没'
+                    | '和'
+                    | '跟'
+                    | '与'
+                    | '还'
+                    | '也'
+                    | '都'
+                    | '，'
+                    | ','
+                    | '？'
+                    | '?'
+                    | '。'
+                    | '！'
+                    | '!'
+                    | ' '
             )
         })
         && !is_wh(text)
@@ -286,10 +327,7 @@ fn split_wh_np_prefix_candidates<'a>(text: &'a str) -> Vec<(&'a str, &'a str)> {
     candidates
 }
 
-fn split_wh_np_prefix_object<'a>(
-    text: &'a str,
-    lexicon: &dyn RelationLexicon,
-) -> Option<&'a str> {
+fn split_wh_np_prefix_object<'a>(text: &'a str, lexicon: &dyn RelationLexicon) -> Option<&'a str> {
     split_wh_np_prefix_candidates(text)
         .into_iter()
         .find_map(|(_, tail)| split_predicate_object(tail, lexicon).map(|_| tail))
@@ -307,10 +345,7 @@ fn split_wh_np_prefix_predicate<'a>(
 /// 集合差问句：「除了李四，张三还认识谁」「除了张三，还有谁认识李四」。
 /// 排除项必须是词表登记过的实体；内层问句仍交给同一个重写器编译，
 /// 只接受可反向包裹的主体/客体关系计划，其余一律弃权。
-fn parse_excluded_list(
-    raw: &str,
-    lexicon: &dyn RelationLexicon,
-) -> Option<Vec<String>> {
+fn parse_excluded_list(raw: &str, lexicon: &dyn RelationLexicon) -> Option<Vec<String>> {
     let raw = raw.trim().trim_end_matches('等').trim();
     if raw.is_empty() {
         return None;
@@ -345,8 +380,7 @@ fn split_exclusion_tail(text: &str) -> Option<(&str, &str)> {
             }
             let candidate = (position, marker.len());
             if best.is_none_or(|current| {
-                candidate.0 < current.0
-                    || (candidate.0 == current.0 && candidate.1 > current.1)
+                candidate.0 < current.0 || (candidate.0 == current.0 && candidate.1 > current.1)
             }) {
                 best = Some(candidate);
             }
@@ -401,10 +435,7 @@ fn wrap_except_plan(inner: RelationRewrite, excluded: Vec<String>) -> Option<Rel
     }
 }
 
-fn parse_except_question(
-    text: &str,
-    lexicon: &dyn RelationLexicon,
-) -> Option<RelationRewrite> {
+fn parse_except_question(text: &str, lexicon: &dyn RelationLexicon) -> Option<RelationRewrite> {
     if let Some(after) = text.strip_prefix("除了") {
         let (excluded_text, rest) = split_exclusion_tail(after)?;
         let excluded = parse_excluded_list(excluded_text, lexicon)?;
@@ -449,10 +480,7 @@ fn parse_except_question(
 /// 关系计数：「张三教过多少个学生」「张三教过几个」。
 /// 量词后的类型名词只用于说明问的是一类对象，计数仍按关系命中执行；
 /// 谓词必须是关系词表登记过的实义关系，避免把「有几个师傅」误当计数。
-fn parse_relation_count(
-    text: &str,
-    lexicon: &dyn RelationLexicon,
-) -> Option<RelationRewrite> {
+fn parse_relation_count(text: &str, lexicon: &dyn RelationLexicon) -> Option<RelationRewrite> {
     const MEASURES: [&str; 14] = [
         "个", "位", "名", "本", "部", "家", "门", "只", "种", "条", "张", "所", "件", "次",
     ];
@@ -478,8 +506,7 @@ fn parse_relation_count(
         if !after.is_empty() && !valid_type_noun(after) {
             continue;
         }
-        if let Some((subject, surface, predicate, negated)) =
-            split_entity_predicate(head, lexicon)
+        if let Some((subject, surface, predicate, negated)) = split_entity_predicate(head, lexicon)
         {
             if !negated && !matches!(predicate.as_str(), "有" | "是") {
                 return Some(build(
@@ -528,18 +555,14 @@ fn parse_relation_count(
 
 /// 「张三教过的学生是谁」「教过张三的老师有哪些」：
 /// 关系从句先压成关系查找，再由现成的关系回答器执行。
-fn parse_relative_wh(
-    text: &str,
-    lexicon: &dyn RelationLexicon,
-) -> Option<RelationRewrite> {
+fn parse_relative_wh(text: &str, lexicon: &dyn RelationLexicon) -> Option<RelationRewrite> {
     let core = RELATIVE_WH_TAILS
         .iter()
         .find_map(|tail| text.strip_suffix(tail))?;
     let (head, _noun) = split_relative_clause(core)?;
 
     if let Some(inner) = head.strip_prefix('被') {
-        let (agent, surface, predicate, negated) =
-            split_relative_entity_predicate(inner, lexicon)?;
+        let (agent, surface, predicate, negated) = split_relative_entity_predicate(inner, lexicon)?;
         if negated {
             return None;
         }
@@ -641,10 +664,7 @@ fn strip_negation_suffix(text: &str) -> (&str, bool) {
     (text, false)
 }
 
-fn entity(
-    raw: &str,
-    lexicon: &dyn RelationLexicon,
-) -> Option<String> {
+fn entity(raw: &str, lexicon: &dyn RelationLexicon) -> Option<String> {
     let raw = raw.trim();
     if raw.is_empty() || is_wh(raw) {
         return None;
@@ -659,10 +679,7 @@ fn entity(
     None
 }
 
-fn predicate(
-    raw: &str,
-    lexicon: &dyn RelationLexicon,
-) -> Option<(String, String, bool)> {
+fn predicate(raw: &str, lexicon: &dyn RelationLexicon) -> Option<(String, String, bool)> {
     let raw = raw.trim();
     if raw.is_empty() {
         return None;
@@ -853,10 +870,7 @@ fn build(
     }
 }
 
-pub fn rewrite(
-    question: &str,
-    lexicon: &dyn RelationLexicon,
-) -> Option<RelationRewrite> {
+pub fn rewrite(question: &str, lexicon: &dyn RelationLexicon) -> Option<RelationRewrite> {
     let text = clean_question(question)?;
     if text.chars().count() > 80 {
         return None;
@@ -949,8 +963,8 @@ pub fn rewrite(
             ));
         }
         let patient = entity(patient_text, lexicon)?;
-        if let Some(rest) = split_wh_np_prefix_predicate(right, lexicon)
-            .or_else(|| right.strip_prefix_wh())
+        if let Some(rest) =
+            split_wh_np_prefix_predicate(right, lexicon).or_else(|| right.strip_prefix_wh())
         {
             if marker_negated {
                 return None;
@@ -1015,8 +1029,8 @@ pub fn rewrite(
             ));
         }
         let subject = entity(subject_text, lexicon)?;
-        if let Some(rest) = split_wh_np_prefix_predicate(right, lexicon)
-            .or_else(|| right.strip_prefix_wh())
+        if let Some(rest) =
+            split_wh_np_prefix_predicate(right, lexicon).or_else(|| right.strip_prefix_wh())
         {
             if marker_negated {
                 return None;
@@ -1091,8 +1105,7 @@ pub fn rewrite(
     }
 
     if let Some((head, _np)) = split_wh_np_suffix(&text) {
-        if let Some((subject, surface, predicate, negated)) =
-            split_entity_predicate(head, lexicon)
+        if let Some((subject, surface, predicate, negated)) = split_entity_predicate(head, lexicon)
         {
             if !negated {
                 return Some(build(
@@ -1154,9 +1167,7 @@ trait StripWhPrefix {
 
 impl StripWhPrefix for str {
     fn strip_prefix_wh(&self) -> Option<&str> {
-        WH_PREFIXES
-            .iter()
-            .find_map(|word| self.strip_prefix(*word))
+        WH_PREFIXES.iter().find_map(|word| self.strip_prefix(*word))
     }
 }
 
@@ -1316,7 +1327,10 @@ mod tests {
                 negated: false
             }
         );
-        assert_eq!(parse("张三教不教李四").expect("单字 A 不 A").predicate, "教");
+        assert_eq!(
+            parse("张三教不教李四").expect("单字 A 不 A").predicate,
+            "教"
+        );
     }
 
     #[test]
@@ -1500,7 +1514,8 @@ mod tests {
 
     #[test]
     fn relation_counts_use_the_count_plan() {
-        for question in ["张三教过多少个学生", "张三教过几个学生", "张三教过多少"] {
+        for question in ["张三教过多少个学生", "张三教过几个学生", "张三教过多少"]
+        {
             let rewrite = parse(question).expect(question);
             assert_eq!(rewrite.rule, "relation-count");
             assert_eq!(rewrite.predicate, "教");
@@ -1526,7 +1541,9 @@ mod tests {
             }
         );
         assert_eq!(
-            parse("被张三教过的学生有几个").expect("被字关系从句计数").rule,
+            parse("被张三教过的学生有几个")
+                .expect("被字关系从句计数")
+                .rule,
             "relative-count"
         );
         assert!(parse("教过张三的老师有多少").is_none());

@@ -1239,9 +1239,9 @@ impl DialogueArtifactIndex {
                 digest: digest.clone(),
                 text: text.to_string(),
             });
-        self.evidences
-            .entry(digest)
-            .or_insert_with(|| text.to_string());
+            self.evidences
+                .entry(digest)
+                .or_insert_with(|| text.to_string());
         }
         let corrects = payload_strings(entry, "corrects");
         self.replies.insert(
@@ -1537,8 +1537,7 @@ mod tests {
             "{{\n  \"session_version\": {},\n  \"session_id\": \"s-1\"\n}}\n",
             DIALOGUE_SESSION_VERSION
         );
-        let (canonical, is_canonical) =
-            DialogueSession::verify_bytes(pretty.as_bytes()).unwrap();
+        let (canonical, is_canonical) = DialogueSession::verify_bytes(pretty.as_bytes()).unwrap();
         assert!(!is_canonical, "空白排布应被识别为非规范");
         assert_eq!(canonical, "{\"session_id\":\"s-1\",\"session_version\":1}");
 
@@ -1798,10 +1797,7 @@ mod tests {
         };
         second.hash = second.compute_hash();
         let index = DialogueArtifactIndex::build("s", &[first, second]);
-        assert_eq!(
-            index.reply(2).unwrap().corrects,
-            vec![corrected_uri]
-        );
+        assert_eq!(index.reply(2).unwrap().corrects, vec![corrected_uri]);
         assert!(index.reply(3).unwrap().corrects.is_empty());
     }
 }

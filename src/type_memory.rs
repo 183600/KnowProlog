@@ -15,12 +15,23 @@ const TYPE_FOCUS_TTL: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeQuestion {
-    Profile { etype: String },
-    Members { etype: String },
-    Count { etype: String },
-    Compare { left: String, right: String },
+    Profile {
+        etype: String,
+    },
+    Members {
+        etype: String,
+    },
+    Count {
+        etype: String,
+    },
+    Compare {
+        left: String,
+        right: String,
+    },
     /// 查某个已知实体的显式类型：`李四是什么类型`。
-    EntityType { entity: String },
+    EntityType {
+        entity: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,7 +187,10 @@ pub fn answer_in_context(
         if let Some(target) = target {
             let text = render_gap(generator, &target);
             if mentioned.is_some() || memory.focus().is_none() {
-                memory.set_focus(TypeFocus::new(target.key.clone(), TypeQuestionKind::Profile));
+                memory.set_focus(TypeFocus::new(
+                    target.key.clone(),
+                    TypeQuestionKind::Profile,
+                ));
             } else {
                 memory.current_mut();
             }
@@ -339,11 +353,7 @@ fn answer_parsed(
     }
 }
 
-fn render_entity_type(
-    schema: Option<&SchemaView>,
-    entity: &str,
-    canonical: &str,
-) -> String {
+fn render_entity_type(schema: Option<&SchemaView>, entity: &str, canonical: &str) -> String {
     let label = localized_type_label(canonical);
     let mut text = if label != canonical {
         format!("「{}」的类型是「{}」（{}）。", entity, canonical, label)
@@ -517,7 +527,10 @@ fn parse_details(
     }
 
     if let Some(entity) = entity_type_subject(generator, &question) {
-        return Some((TypeQuestion::EntityType { entity }, TypeQuestionKind::Profile));
+        return Some((
+            TypeQuestion::EntityType { entity },
+            TypeQuestionKind::Profile,
+        ));
     }
 
     if question.contains("类型画像") || question.contains("类型概览") {
@@ -595,8 +608,8 @@ fn parse_details(
             // （「有多少个人物」）才是类型计数；「人物有多少属性」问的是
             // 属性个数，不能被劫持成成员计数。
             let bare = stripped.is_empty();
-            let typed = !stripped.is_empty()
-                && resolve_target(generator, schema, stripped).is_some();
+            let typed =
+                !stripped.is_empty() && resolve_target(generator, schema, stripped).is_some();
             if bare || typed {
                 let etype = if typed {
                     resolve_target(generator, schema, stripped)
@@ -605,10 +618,7 @@ fn parse_details(
                 } else {
                     chosen.etype.clone()
                 };
-                return Some((
-                    TypeQuestion::Count { etype },
-                    TypeQuestionKind::Members,
-                ));
+                return Some((TypeQuestion::Count { etype }, TypeQuestionKind::Members));
             }
         }
     }
@@ -687,7 +697,10 @@ fn entity_type_subject(generator: &SymbolicGenerator, question: &str) -> Option<
             let suffix = question[start + entity.len()..]
                 .trim_start_matches(|c: char| matches!(c, '」' | '”' | '"' | '\'' | ' '));
             let suffix = suffix.trim_end_matches(|c: char| {
-                matches!(c, '呢' | '啊' | '呀' | '吧' | '吗' | '。' | '？' | '?' | '！' | '!')
+                matches!(
+                    c,
+                    '呢' | '啊' | '呀' | '吧' | '吗' | '。' | '？' | '?' | '！' | '!'
+                )
             });
             if ENTITY_TYPE_TAILS.contains(&suffix) {
                 return Some(entity.to_string());
@@ -788,8 +801,22 @@ fn leading_single_char_type(
     question: &str,
 ) -> Option<String> {
     const PROFILE_TAILS: &[&str] = &[
-        "一般", "通常", "常见", "有哪些", "有什么", "的属性", "的关系", "属性", "关系",
-        "画像", "概览", "概况", "特征", "特点", "长什么样", "怎么样",
+        "一般",
+        "通常",
+        "常见",
+        "有哪些",
+        "有什么",
+        "的属性",
+        "的关系",
+        "属性",
+        "关系",
+        "画像",
+        "概览",
+        "概况",
+        "特征",
+        "特点",
+        "长什么样",
+        "怎么样",
     ];
     let first = question.chars().next()?;
     let rest = &question[first.len_utf8()..];
@@ -993,21 +1020,23 @@ fn known_type_mentions(
 ) -> Vec<TypeMention> {
     let haystack = text.to_ascii_lowercase();
     let mut surfaces: BTreeMap<String, (u8, String)> = BTreeMap::new();
-    let register =
-        |surface: &str, etype: &str, priority: u8, surfaces: &mut BTreeMap<String, (u8, String)>| {
-            let surface = surface.trim();
-            if surface.chars().count() < 2 {
-                return;
+    let register = |surface: &str,
+                    etype: &str,
+                    priority: u8,
+                    surfaces: &mut BTreeMap<String, (u8, String)>| {
+        let surface = surface.trim();
+        if surface.chars().count() < 2 {
+            return;
+        }
+        if let Some(target) = resolve_target(generator, schema, etype) {
+            let entry = surfaces
+                .entry(surface.to_string())
+                .or_insert_with(|| (priority, target.key.clone()));
+            if priority < entry.0 {
+                *entry = (priority, target.key);
             }
-            if let Some(target) = resolve_target(generator, schema, etype) {
-                let entry = surfaces
-                    .entry(surface.to_string())
-                    .or_insert_with(|| (priority, target.key.clone()));
-                if priority < entry.0 {
-                    *entry = (priority, target.key);
-                }
-            }
-        };
+        }
+    };
     for etype in generator.all_types() {
         register(&etype, &etype, 0, &mut surfaces);
     }
@@ -1098,12 +1127,8 @@ fn resolve_target(
         }
     }
     if base_types.is_empty() {
-        let declared = schema.is_some_and(|schema| {
-            schema
-                .declared_classes()
-                .iter()
-                .any(|class| class == &key)
-        });
+        let declared = schema
+            .is_some_and(|schema| schema.declared_classes().iter().any(|class| class == &key));
         if !declared {
             return None;
         }
@@ -1250,11 +1275,7 @@ fn render_comparison(
     text
 }
 
-fn schema_relation_note(
-    schema: Option<&SchemaView>,
-    left: &str,
-    right: &str,
-) -> Option<String> {
+fn schema_relation_note(schema: Option<&SchemaView>, left: &str, right: &str) -> Option<String> {
     let schema = schema?;
     if schema.is_subclass(left, right) {
         return Some(format!("模式关系：{} ⊑ {}。", left, right));
@@ -1395,7 +1416,10 @@ fn render_gap(generator: &SymbolicGenerator, target: &TypeTarget) -> String {
         output.push('\n');
     }
     if gaps.len() > 8 {
-        output.push_str(&format!("  （其余 {} 种低覆盖谓词未展开。）\n", gaps.len() - 8));
+        output.push_str(&format!(
+            "  （其余 {} 种低覆盖谓词未展开。）\n",
+            gaps.len() - 8
+        ));
     }
     output.trim_end().to_string()
 }
@@ -1525,7 +1549,11 @@ mod tests {
             answer_with_schema(&generator, Some(&schema), "学生有多少个").unwrap_or_else(|| {
                 panic!("已声明的空类型也应诚实回答");
             });
-        assert!(empty.text.contains("0") || empty.text.contains("没有"), "{}", empty.text);
+        assert!(
+            empty.text.contains("0") || empty.text.contains("没有"),
+            "{}",
+            empty.text
+        );
 
         let counted_with_measure =
             answer(&generator, "一共有多少位人物？").expect("带量词的类型计数应可回答");
@@ -1664,15 +1692,27 @@ mod tests {
 
         let switched = answer_in_context(&generator, Some(&schema), &mut memory, "那机构呢")
             .expect("应切换类型焦点");
-        assert!(switched.text.contains("类型「机构」的成员"), "{}", switched.text);
+        assert!(
+            switched.text.contains("类型「机构」的成员"),
+            "{}",
+            switched.text
+        );
         assert_eq!(switched.focus.as_deref(), Some("机构"));
 
         let profile = answer_in_context(&generator, Some(&schema), &mut memory, "机构有哪些属性")
             .expect("应可回答机构画像");
-        assert!(profile.text.contains("类型画像「机构」"), "{}", profile.text);
+        assert!(
+            profile.text.contains("类型画像「机构」"),
+            "{}",
+            profile.text
+        );
         let switched = answer_in_context(&generator, Some(&schema), &mut memory, "那人物呢")
             .expect("应沿画像意图切换焦点");
-        assert!(switched.text.contains("类型画像「人物」"), "{}", switched.text);
+        assert!(
+            switched.text.contains("类型画像「人物」"),
+            "{}",
+            switched.text
+        );
         assert_eq!(switched.focus.as_deref(), Some("人物"));
     }
 
@@ -1718,21 +1758,13 @@ mod tests {
         let mut generator = generator();
         generator.observe_entity("北京", "地点", &[]);
         let schema = schema();
-        let disjoint = answer_with_schema(
-            &generator,
-            Some(&schema),
-            "比较人物和地点的区别",
-        )
-        .expect("对比应可回答");
+        let disjoint = answer_with_schema(&generator, Some(&schema), "比较人物和地点的区别")
+            .expect("对比应可回答");
         assert!(disjoint.text.contains("⊥"), "{}", disjoint.text);
         assert!(disjoint.text.contains("互斥"), "{}", disjoint.text);
 
-        let subclass = answer_with_schema(
-            &generator,
-            Some(&schema),
-            "比较学生和人物的区别",
-        )
-        .expect("子类对比应可回答");
+        let subclass = answer_with_schema(&generator, Some(&schema), "比较学生和人物的区别")
+            .expect("子类对比应可回答");
         assert!(subclass.text.contains("学生 ⊑ 人物"), "{}", subclass.text);
     }
 
@@ -1742,8 +1774,8 @@ mod tests {
         let mut memory = TypeDialogueMemory::new();
         answer_in_context(&generator, None, &mut memory, "人物一般有哪些属性")
             .expect("画像应可回答");
-        let gap = answer_in_context(&generator, None, &mut memory, "还缺什么")
-            .expect("缺口问题应可回答");
+        let gap =
+            answer_in_context(&generator, None, &mut memory, "还缺什么").expect("缺口问题应可回答");
         assert!(gap.text.contains("覆盖缺口"), "{}", gap.text);
         assert!(gap.text.contains("师傅"), "{}", gap.text);
         assert!(gap.text.contains("李四"), "{}", gap.text);
@@ -1823,7 +1855,11 @@ mod tests {
         let switched = manager
             .plan_pure_dialogue("那机构呢", &reasoner)
             .expect("追问应切换类型焦点");
-        assert!(switched.text.contains("类型「机构」的成员"), "{}", switched.text);
+        assert!(
+            switched.text.contains("类型「机构」的成员"),
+            "{}",
+            switched.text
+        );
 
         let snapshot = manager.snapshot();
         assert!(!snapshot.type_memory.is_empty());
@@ -1856,7 +1892,11 @@ mod tests {
         }
         let answer = answer_with_schema(&generator, Some(&schema), "张三是什么类型？")
             .expect("实体类型应可回答");
-        assert!(answer.text.contains("「张三」的类型是「人物」"), "{}", answer.text);
+        assert!(
+            answer.text.contains("「张三」的类型是「人物」"),
+            "{}",
+            answer.text
+        );
         assert!(answer.text.contains("上位类型：实体"), "{}", answer.text);
         assert_eq!(answer.focus.as_deref(), Some("人物"));
     }
@@ -1873,8 +1913,11 @@ mod tests {
         let mut generator = generator();
         generator.observe_entity("王五", "", &[]);
         let answer = answer(&generator, "王五是什么类型？").expect("问句本身合法");
-        assert!(answer.text.contains("「王五」尚未登记显式类型"), "{}", answer.text);
+        assert!(
+            answer.text.contains("「王五」尚未登记显式类型"),
+            "{}",
+            answer.text
+        );
         assert_eq!(answer.focus, None);
     }
-
 }

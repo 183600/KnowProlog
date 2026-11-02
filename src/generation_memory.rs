@@ -1049,10 +1049,7 @@ mod tests {
         // P_JSON 载荷随 corrects 一并保留，圆满往返不丢更正关系。
         let loaded = GenerationMemory::from_quads(quads).unwrap();
         assert_eq!(loaded, memory);
-        assert_eq!(
-            loaded.latest_reply().unwrap().corrects,
-            vec![corrected]
-        );
+        assert_eq!(loaded.latest_reply().unwrap().corrects, vec![corrected]);
     }
 
     #[test]

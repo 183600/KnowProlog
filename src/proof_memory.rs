@@ -166,13 +166,9 @@ impl ProofFootprint {
         {
             return true;
         }
-        if delta
-            .aliases
-            .iter()
-            .any(|(surface, canonical)| {
-                self.entities.contains(surface) || self.entities.contains(canonical)
-            })
-        {
+        if delta.aliases.iter().any(|(surface, canonical)| {
+            self.entities.contains(surface) || self.entities.contains(canonical)
+        }) {
             return true;
         }
         delta.facts.iter().any(|fact| {
@@ -310,8 +306,7 @@ impl<T> ProofMemoryEntry<T> {
     }
 
     fn utility_numerator(&self) -> u128 {
-        (u128::from(self.hits) + 1)
-            .saturating_mul(u128::from(self.cost.steps().max(1)))
+        (u128::from(self.hits) + 1).saturating_mul(u128::from(self.cost.steps().max(1)))
     }
 
     fn utility_denominator(&self) -> u128 {
@@ -430,10 +425,7 @@ impl ProofMemoryAccess {
         } else if self.stored {
             format!("证明记忆：未命中（已写入 {} 字节）", self.payload_bytes)
         } else if !self.evicted.is_empty() {
-            format!(
-                "证明记忆：未命中（写入时淘汰 {} 条）",
-                self.evicted.len()
-            )
+            format!("证明记忆：未命中（写入时淘汰 {} 条）", self.evicted.len())
         } else if self.status == ProofStatus::MayBeIncomplete {
             "证明记忆：未命中（搜索被截断，不缓存最终答案）".to_string()
         } else {
@@ -519,9 +511,9 @@ impl<T: Clone> ProofMemory<T> {
     }
 
     pub fn estimated_bytes(&self) -> usize {
-        self.entries
-            .values()
-            .fold(0usize, |sum, entry| sum.saturating_add(entry.estimated_bytes()))
+        self.entries.values().fold(0usize, |sum, entry| {
+            sum.saturating_add(entry.estimated_bytes())
+        })
     }
 
     pub fn keys(&self) -> impl Iterator<Item = &str> {
@@ -811,7 +803,10 @@ mod tests {
         let bounded = canonical_key(&long);
         assert!(bounded.starts_with(&"字".repeat(MAX_KEY_CHARS)));
         assert!(bounded.contains('#'));
-        assert_ne!(canonical_key(&format!("{}甲", long)), canonical_key(&format!("{}乙", long)));
+        assert_ne!(
+            canonical_key(&format!("{}甲", long)),
+            canonical_key(&format!("{}乙", long))
+        );
     }
 
     #[test]
@@ -856,7 +851,9 @@ mod tests {
         let receipt = memory.store(record("新条目(张三, 李四)", "新", 120, 50));
         assert!(receipt.stored);
         assert!(
-            receipt.evicted_keys().contains(&"低密度(张三, 李四)".to_string()),
+            receipt
+                .evicted_keys()
+                .contains(&"低密度(张三, 李四)".to_string()),
             "evicted: {:?}",
             receipt.evicted_keys()
         );
@@ -879,9 +876,8 @@ mod tests {
         let mut memory = ProofMemory::new(ProofMemoryConfig::new(64 * 1024, 8));
         memory.store(record("张三的师傅(张三, ?X)", "李四", 16, 20));
         memory.store(
-            record("王五的身高(王五, ?X)", "190", 16, 20).with_footprint(
-                ProofFootprint::from_canonical_atom("身高(王五, ?X)").unwrap(),
-            ),
+            record("王五的身高(王五, ?X)", "190", 16, 20)
+                .with_footprint(ProofFootprint::from_canonical_atom("身高(王五, ?X)").unwrap()),
         );
 
         let mut delta = DeltaFootprint::new(1);

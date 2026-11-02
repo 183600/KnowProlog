@@ -121,8 +121,16 @@ impl ConstructionEvalReport {
                 case.seed,
                 case.predicate,
                 case.expected,
-                if case.baseline_recovered { "命中" } else { "未命中" },
-                if case.constructive_recovered { "命中" } else { "未命中" },
+                if case.baseline_recovered {
+                    "命中"
+                } else {
+                    "未命中"
+                },
+                if case.constructive_recovered {
+                    "命中"
+                } else {
+                    "未命中"
+                },
                 case.constructive_status,
                 case.derived_target_facts,
                 case.wrong_target_facts
@@ -158,12 +166,7 @@ pub fn evaluate() -> ConstructionEvalReport {
         ..ConstructionConfig::default()
     };
     let rules = baseline.rules().to_vec();
-    let mut engine = ConstructiveReasoner::from_predictor(
-        config,
-        1,
-        &evaluation,
-        &rules,
-    );
+    let mut engine = ConstructiveReasoner::from_predictor(config, 1, &evaluation, &rules);
 
     let mut cases = Vec::new();
     let mut baseline_recovered = 0usize;
@@ -171,10 +174,8 @@ pub fn evaluate() -> ConstructionEvalReport {
     let mut derived_total = 0usize;
     let mut wrong_total = 0usize;
     let mut truncated_cases = 0usize;
-    for (seed, predicate, expected) in [
-        ("评测甲", "祖传", "评测丁"),
-        ("评测戊", "祖传", "评测辛"),
-    ] {
+    for (seed, predicate, expected) in [("评测甲", "祖传", "评测丁"), ("评测戊", "祖传", "评测辛")]
+    {
         let predictions = baseline.predict_for_entity(seed, Some(predicate), 16);
         let baseline_hit = predictions
             .iter()
@@ -186,7 +187,10 @@ pub fn evaluate() -> ConstructionEvalReport {
             .map(|fact| fact.key.object.clone())
             .collect();
         let constructive_hit = derived.iter().any(|value| value == expected);
-        let wrong = derived.iter().filter(|value| value.as_str() != expected).count();
+        let wrong = derived
+            .iter()
+            .filter(|value| value.as_str() != expected)
+            .count();
         if baseline_hit {
             baseline_recovered += 1;
         }
@@ -299,8 +303,7 @@ mod tests {
 
     #[test]
     fn evaluation_cases_are_not_part_of_training() {
-        let training: std::collections::HashSet<Triple> =
-            training_triples().into_iter().collect();
+        let training: std::collections::HashSet<Triple> = training_triples().into_iter().collect();
         for triple in evaluation_triples() {
             assert!(!training.contains(&triple));
         }

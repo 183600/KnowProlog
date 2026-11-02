@@ -25,8 +25,7 @@ use crate::conversational_graph::{
     EdgePattern, GraphFact, GraphPattern, MatchOptions, PatternConstraint, PatternTerm,
 };
 use crate::query_canonical::{
-    enumerate_choices, mapping_from_choice, permutations_of, refine_colors,
-    MAX_CANONICAL_LABELINGS,
+    enumerate_choices, mapping_from_choice, permutations_of, refine_colors, MAX_CANONICAL_LABELINGS,
 };
 
 /// KGP-IR 版本；语义或指纹算法不兼容变更时递增。
@@ -204,7 +203,10 @@ impl KgFilter {
         };
         let var = normalize_variable(var)?;
         if !variables.contains(&var) {
-            return Err(format!("{} 过滤器引用了未在原子中出现的变量「{}」", kind, var));
+            return Err(format!(
+                "{} 过滤器引用了未在原子中出现的变量「{}」",
+                kind, var
+            ));
         }
         if value.trim().is_empty() {
             return Err(format!("{} 过滤器的取值不能为空", kind));
@@ -299,9 +301,10 @@ impl KgPattern {
     /// 避免把模板误当成已归一的问题身份。
     pub fn relation_core(
         &self,
-    ) -> Result<crate::query_canonical::RelationCore, crate::query_canonical::CanonicalError>
-    {
-        use crate::query_canonical::{CanonicalError, CoreAtom, CoreFilter, CoreTerm, RelationCore};
+    ) -> Result<crate::query_canonical::RelationCore, crate::query_canonical::CanonicalError> {
+        use crate::query_canonical::{
+            CanonicalError, CoreAtom, CoreFilter, CoreTerm, RelationCore,
+        };
         let term = |term: &KgTerm| match term {
             KgTerm::Var(name) => CoreTerm::Var(name.clone()),
             KgTerm::Const(value) => CoreTerm::Const(value.clone()),
@@ -317,7 +320,11 @@ impl KgPattern {
                     )))
                 }
             };
-            atoms.push(CoreAtom::new(term(&atom.subject), predicate, term(&atom.object)));
+            atoms.push(CoreAtom::new(
+                term(&atom.subject),
+                predicate,
+                term(&atom.object),
+            ));
         }
         let filters = self
             .filters
@@ -364,14 +371,10 @@ impl KgPattern {
         let render = |mapping: &BTreeMap<String, String>| {
             render_pattern_material(&atoms, &filters, &self.select, self.count_only, mapping)
         };
-        let (mapping, complete) = canonical_variable_mapping(&atoms, &filters, &self.select, render);
-        let canonical = render_pattern_material(
-            &atoms,
-            &filters,
-            &self.select,
-            self.count_only,
-            &mapping,
-        );
+        let (mapping, complete) =
+            canonical_variable_mapping(&atoms, &filters, &self.select, render);
+        let canonical =
+            render_pattern_material(&atoms, &filters, &self.select, self.count_only, &mapping);
         KgPatternIdentity {
             fingerprint: fnv1a_hex(canonical.as_bytes()),
             canonical,
@@ -743,11 +746,7 @@ fn post_filter_accepts(
     }
 }
 
-fn validate_filter_consistency(
-    filters: &[KgFilter],
-    path: &str,
-    errors: &mut Vec<KgCompileError>,
-) {
+fn validate_filter_consistency(filters: &[KgFilter], path: &str, errors: &mut Vec<KgCompileError>) {
     let mut equal: BTreeMap<&str, &str> = BTreeMap::new();
     let mut not_equal: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     let mut positive_types: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
@@ -804,7 +803,7 @@ fn validate_filter_consistency(
                             var, negative, negative
                         ),
                     });
-                        }
+                }
             }
         }
     }
@@ -909,7 +908,11 @@ fn build_label_graph(
     atoms: &[KgAtom],
     filters: &[KgFilter],
     select: &[String],
-) -> (Vec<String>, Vec<(usize, &'static str, usize)>, Vec<(String, usize)>) {
+) -> (
+    Vec<String>,
+    Vec<(usize, &'static str, usize)>,
+    Vec<(String, usize)>,
+) {
     let mut names: BTreeSet<String> = BTreeSet::new();
     for atom in atoms {
         for term in [&atom.subject, &atom.predicate, &atom.object] {
@@ -1296,7 +1299,9 @@ impl KgPatternRegistry {
     }
 
     pub fn get(&self, id: &str) -> Option<&KgPattern> {
-        self.by_id.get(id).and_then(|index| self.patterns.get(*index))
+        self.by_id
+            .get(id)
+            .and_then(|index| self.patterns.get(*index))
     }
 
     pub fn ids(&self) -> Vec<&str> {
@@ -1316,7 +1321,10 @@ impl KgPatternRegistry {
     ///
     /// 没有声明的律时行为与 [`Self::lint`] 完全一致；有律时只有规范键
     /// 相同、但结构指纹不同的模式才会额外报告 `kg_pattern_schema_duplicate`。
-    pub fn lint_with_schema(&self, schema: &crate::query_canonical::CanonicalSchema) -> Vec<KgLint> {
+    pub fn lint_with_schema(
+        &self,
+        schema: &crate::query_canonical::CanonicalSchema,
+    ) -> Vec<KgLint> {
         let mut lints = Vec::new();
         let mut fingerprints: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for pattern in &self.patterns {
@@ -1524,15 +1532,19 @@ select = ["person"]
 "#,
         ))
         .expect("应可编译");
-        let person = registry
-            .get("person_masters")
-            .unwrap()
-            .execute(&facts(), &BTreeMap::new(), true, MatchOptions::default());
+        let person = registry.get("person_masters").unwrap().execute(
+            &facts(),
+            &BTreeMap::new(),
+            true,
+            MatchOptions::default(),
+        );
         assert_eq!(person.answer_values(), vec!["李四"]);
-        let not_person = registry
-            .get("not_person")
-            .unwrap()
-            .execute(&facts(), &BTreeMap::new(), true, MatchOptions::default());
+        let not_person = registry.get("not_person").unwrap().execute(
+            &facts(),
+            &BTreeMap::new(),
+            true,
+            MatchOptions::default(),
+        );
         assert_eq!(not_person.answer_values(), vec!["张三"]);
     }
 
@@ -1584,7 +1596,10 @@ select = ["value"]
         let registry = KgPatternRegistry::compile(&config).expect("应可编译");
         let a = registry.get("capital_a").unwrap().semantic_fingerprint();
         let b = registry.get("capital_b").unwrap().semantic_fingerprint();
-        let c = registry.get("capital_other").unwrap().semantic_fingerprint();
+        let c = registry
+            .get("capital_other")
+            .unwrap()
+            .semantic_fingerprint();
         assert_eq!(a, b);
         assert_ne!(a, c);
         let lints = registry.lint();

@@ -151,7 +151,10 @@ impl LexAdmission {
 }
 
 /// 从文件加载并验证定义；解析失败返回错误，语义拒绝进入报告。
-pub fn load_file(path: impl AsRef<Path>, inventory: &LexiconInventory) -> Result<LexAdmission, String> {
+pub fn load_file(
+    path: impl AsRef<Path>,
+    inventory: &LexiconInventory,
+) -> Result<LexAdmission, String> {
     let path = path.as_ref();
     let text = std::fs::read_to_string(path)
         .map_err(|error| format!("读取定义文件失败（{}）：{}", path.display(), error))?;
@@ -281,10 +284,7 @@ fn validate_compose(
         let mut part = flatten(step, inventory, expansions)?;
         expansion.append(&mut part);
         if expansion.len() > MAX_COMPOSE_STEPS {
-            return Err(format!(
-                "compose 展开后超过 {} 步上限",
-                MAX_COMPOSE_STEPS
-            ));
+            return Err(format!("compose 展开后超过 {} 步上限", MAX_COMPOSE_STEPS));
         }
     }
     if expansion.len() < 2 {

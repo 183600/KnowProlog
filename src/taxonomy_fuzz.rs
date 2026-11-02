@@ -31,9 +31,7 @@ pub const TAXONOMY_FUZZ_VERSION: u32 = 1;
 pub const TAXONOMY_FUZZ_SEED: u64 = 20261031;
 
 /// 知识世界变异。
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorldVariant {
     /// 实体与所问属性都存在。
@@ -100,9 +98,7 @@ impl WorldVariant {
 }
 
 /// 追问计划：从同一个直接问句出发的受控转移。
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FollowUpPlan {
     /// 只问一次。
@@ -639,7 +635,9 @@ mod tests {
             }
         }
         assert_eq!(request.len(), WORLDS.len() * PLANS.len());
-        assert!(request.iter().all(|(entities, turns)| *entities == 2 && *turns >= 1));
+        assert!(request
+            .iter()
+            .all(|(entities, turns)| *entities == 2 && *turns >= 1));
         let report = run(TAXONOMY_FUZZ_SEED);
         assert!(report.minimal_failures().is_empty());
     }

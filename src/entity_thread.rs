@@ -503,7 +503,11 @@ impl EntityThreadDigest {
         }
         // 焦点只在本轮确实像「接着聊」时才作为词面证据：代词/继续/呢等。
         // 换了新话题的轮次不应污染上一焦点实体的足迹。
-        if question.as_deref().map(looks_like_follow_up).unwrap_or(false) {
+        if question
+            .as_deref()
+            .map(looks_like_follow_up)
+            .unwrap_or(false)
+        {
             if let Some(focus) = focus.as_deref() {
                 raw.push(RawMention {
                     surface: focus.to_string(),
@@ -771,12 +775,20 @@ impl EntityThreadDigest {
             } else {
                 "（均已在对话文本中出现）".to_string()
             };
-            lines.push(format!("  图谱现状：{} 条相关事实{}。", related.len(), note));
+            lines.push(format!(
+                "  图谱现状：{} 条相关事实{}。",
+                related.len(),
+                note
+            ));
             for (fact, surfaced) in related.iter().take(6) {
                 lines.push(format!(
                     "    {}{}",
                     fact,
-                    if *surfaced { "" } else { "（对话未提及）" }
+                    if *surfaced {
+                        ""
+                    } else {
+                        "（对话未提及）"
+                    }
                 ));
             }
             if related.len() > 6 {
@@ -859,7 +871,10 @@ fn looks_like_follow_up(text: &str) -> bool {
     if text.is_empty() {
         return false;
     }
-    let cleaned = text.replace("其他", "").replace("其它", "").replace("吉他", "");
+    let cleaned = text
+        .replace("其他", "")
+        .replace("其它", "")
+        .replace("吉他", "");
     if cleaned
         .chars()
         .any(|character| matches!(character, '他' | '她' | '它'))
@@ -867,7 +882,17 @@ fn looks_like_follow_up(text: &str) -> bool {
         return true;
     }
     const MARKERS: &[&str] = &[
-        "继续", "接着", "然后", "还有", "上述", "刚才", "之前", "上面", "该实体", "此人", "这位",
+        "继续",
+        "接着",
+        "然后",
+        "还有",
+        "上述",
+        "刚才",
+        "之前",
+        "上面",
+        "该实体",
+        "此人",
+        "这位",
         "那位",
     ];
     if MARKERS.iter().any(|marker| text.contains(marker)) {
@@ -1301,15 +1326,19 @@ mod tests {
         let digest = EntityThreadDigest::build(&chronicle, &registry);
         let thread = digest.thread("姚明").unwrap();
         assert_eq!(
-            thread.events.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            thread
+                .events
+                .iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>(),
             vec![1, 3],
             "{:?}",
             thread.events
         );
-        assert!(thread
-            .events
+        assert!(thread.events.iter().any(|event| event
+            .mentions
             .iter()
-            .any(|event| event.mentions.iter().any(|mention| mention.sources.contains("focus"))));
+            .any(|mention| mention.sources.contains("focus"))));
     }
 
     #[test]
