@@ -302,6 +302,32 @@ fn log_chronicle_reply(
     }
 }
 
+/// 打印回答并写入编年史；若该回答文本已作为某条回答说过（按 `already_replied`），
+/// 则改打印重复提示并不再重复落图，避免同一答案在同一轮内被连续输出。
+fn emit_reply(
+    chronicle: &mut Option<Chronicle>,
+    session: &Option<DialogueSession>,
+    answer: impl AsRef<str>,
+    plan: &[String],
+    provenance: &[String],
+) {
+    let answer_str = answer.as_ref();
+    let is_repeat = chronicle
+        .as_ref()
+        .and_then(|c| session.as_ref().map(|s| (c, s)))
+        .map(|(chronicle, session)| {
+            let memory = generation_memory::GenerationMemory::from_chronicle(session, chronicle, 0);
+            memory.already_replied(answer_str)
+        })
+        .unwrap_or(false);
+    if is_repeat {
+        println!("（这点我之前已经说过过了。）");
+        return;
+    }
+    println!("{}", answer_str);
+    log_chronicle_reply(chronicle, answer_str, plan, provenance);
+}
+
 /// 编年史轨迹归档：把对话管理器最近一轮的分层追踪写入 `kind="trace"`，
 /// 重启后可据此回放问据栈/指代轨迹（不重放决策）。
 fn log_chronicle_trace(chronicle: &mut Option<Chronicle>, manager: &DialogueManager) {
