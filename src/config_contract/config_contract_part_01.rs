@@ -179,6 +179,7 @@ pub fn lint(config: &SystemConfig) -> Vec<ConfigIssue> {
     check_soft_route(&mut c, config);
     check_trace_graph(&mut c, config);
     check_dialogue_frames(&mut c, config);
+    check_generation_memory(&mut c, config);
     c.issues
 }
 /// 解析并校验 TOML 文本；语法错误以 `Err` 返回（调用方决定如何呈现）。

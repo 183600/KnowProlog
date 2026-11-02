@@ -440,6 +440,16 @@ fn check_dialogue_frames(c: &mut Collector, config: &SystemConfig) {
         }
     }
 }
+fn check_generation_memory(c: &mut Collector, config: &SystemConfig) {
+    let g = &config.generation_memory;
+    if g.enabled && g.max_turns == 0 {
+        c.warn(
+            "generation_memory_unbounded_turns",
+            "generation_memory.max_turns",
+            "enabled=true 且 max_turns=0：每次投影保留全部轮次，命名图可能随会话无限增长，建议设置有限上限",
+        );
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -621,6 +631,39 @@ process_error = "处理出错"
         assert_code(&issues, "zero_trace_turns");
         assert_code(&issues, "zero_trace_nodes");
         assert_code(&issues, "zero_trace_events");
+    }
+
+    #[test]
+    fn generation_memory_unbounded_turns_is_warning() {
+        let source = format!(
+            "{}\n[generation_memory]\nenabled = true\nmax_turns = 0\n",
+            base()
+        );
+        let issues = lint_source(&source);
+        assert_code(&issues, "generation_memory_unbounded_turns");
+        assert!(has_errors(&issues) == false, "应为警告而非错误：{}", render_text(&issues));
+    }
+
+    #[test]
+    fn generation_memory_bounded_turns_is_clean() {
+        let source = format!(
+            "{}\n[generation_memory]\nenabled = true\nmax_turns = 8\n",
+            base()
+        );
+        let issues = lint_source(&source);
+        let gen_issues: Vec<_> = issues.iter().filter(|i| i.code.starts_with("generation_memory")).collect();
+        assert!(gen_issues.is_empty(), "max_turns 设为有限值时不应报生成记忆问题：{}", render_text(&issues));
+    }
+
+    #[test]
+    fn generation_memory_disabled_is_clean() {
+        let source = format!(
+            "{}\n[generation_memory]\nenabled = false\nmax_turns = 0\n",
+            base()
+        );
+        let issues = lint_source(&source);
+        let gen_issues: Vec<_> = issues.iter().filter(|i| i.code.starts_with("generation_memory")).collect();
+        assert!(gen_issues.is_empty(), "未启用时 max_turns=0 不应报警告：{}", render_text(&issues));
     }
 
     #[test]
