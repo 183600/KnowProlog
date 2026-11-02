@@ -84,6 +84,10 @@ const SAID_SUFFIXES: &[&str] = &[
     "讲过没有",
     "讲过没",
 ];
+/// 更正/冲突意图的核心词（必须同时出现上下文词才归入召回，避免误伤）。
+const CORRECTION_WORDS: &[&str] = &["更正", "冲突", "矛盾", "不一致"];
+/// 更正意图的上下文词（把「和上次/之前/先前冲突」区别成更正而非回顾）。
+const CORRECTION_CONTEXTS: &[&str] = &["上次", "之前", "先前", "上一轮", "刚才", "上一条"];
 /// 待查文本本身是疑问词时不构成「说过吗」（「你刚才说过什么」是回顾）。
 const INTERROGATIVES: &[&str] = &[
     "什么",
@@ -124,6 +128,8 @@ pub enum RecallIntent {
     PlanStep(usize),
     /// 当前实体焦点。
     Focus,
+    /// 本会话记录的更正关系（回答 → 其更正的先前命题）。
+    Corrections,
 }
 
 impl RecallIntent {
@@ -134,6 +140,7 @@ impl RecallIntent {
             RecallIntent::AlreadySaid(_) => "already_said",
             RecallIntent::PlanStep(_) => "plan_step",
             RecallIntent::Focus => "focus",
+            RecallIntent::Corrections => "corrections",
         }
     }
 }
@@ -167,6 +174,15 @@ pub fn classify(input: &str) -> Option<RecallIntent> {
     if let Some(target) = parse_said_target(stripped) {
         return Some(RecallIntent::AlreadySaid(target));
     }
+    if CORRECTION_WORDS
+        .iter()
+        .any(|word| stripped.contains(word))
+        && CORRECTION_CONTEXTS
+            .iter()
+            .any(|context| stripped.contains(context))
+    {
+        return Some(RecallIntent::Corrections);
+    }
     if RECAP_PATTERNS
         .iter()
         .any(|pattern| stripped.contains(pattern))
@@ -195,6 +211,7 @@ pub fn recall_intent(memory: &GenerationMemory, intent: RecallIntent) -> RecallR
         RecallIntent::AlreadySaid(target) => render_said(memory, target.as_deref()),
         RecallIntent::PlanStep(index) => render_plan_step(memory, *index),
         RecallIntent::Focus => render_focus(memory),
+        RecallIntent::Corrections => render_corrections(memory),
     };
     let plan = vec!["generation_recall".to_string(), intent.tag().to_string()];
     RecallReply { intent, text, plan }
@@ -315,6 +332,37 @@ fn render_focus(memory: &GenerationMemory) -> String {
         ),
         None => "本会话还没有记录实体焦点。".to_string(),
     }
+}
+
+/// 「更正/冲突」：列出本会话记录的更正关系（更正回答 → 被更正命题），
+/// 空记忆或无更正时诚实说明。
+fn render_corrections(memory: &GenerationMemory) -> String {
+    let mut corrections: Vec<(String, String)> = Vec::new();
+    for reply in memory.reply_iter() {
+        for corrected_uri in &reply.corrects {
+            let corrected_text = memory
+                .reply_iter()
+                .flat_map(|r| r.claims.iter())
+                .find(|claim| claim.uri == *corrected_uri)
+                .map(|claim| claim.text.clone());
+            if let Some(text) = corrected_text {
+                corrections.push((excerpt(&reply.answer, 40), text));
+            }
+        }
+    }
+    if corrections.is_empty() {
+        return "本会话还没有记录更正关系；回答未标记更正任何先前命题。".to_string();
+    }
+    let mut out = format!("本会话共记录 {} 条更正关系。\n", corrections.len());
+    for (position, (reply_excerpt, corrected)) in corrections.into_iter().enumerate() {
+        out.push_str(&format!(
+            "  {}. 更正回答「{}」撤回了先前命题「{}」。\n",
+            position + 1,
+            reply_excerpt,
+            corrected
+        ));
+    }
+    out
 }
 
 /// 定位命题所属的回答（用于把「第几点」讲清是哪条回答的）。
@@ -824,5 +872,50 @@ mod tests {
         assert!(memory.already_said("姚明是篮球运动员。"));
         assert!(recall(&memory, "说过吗：姚明是篮球运动员！").is_some());
         assert!(!memory.already_said("姚明是足球运动员"));
+    }
+
+    #[test]
+    fn classify_detects_corrections_only_with_context() {
+        assert_eq!(
+            classify("上次说的和这次冲突吗"),
+            Some(RecallIntent::Corrections)
+        );
+        assert_eq!(
+            classify("之前和上一轮矛盾"),
+            Some(RecallIntent::Corrections)
+        );
+        assert_eq!(
+            classify("上一条和刚才不一致"),
+            Some(RecallIntent::Corrections)
+        );
+        // 单纯回顾不应被当成更正。
+        assert_eq!(classify("刚才聊了什么"), Some(RecallIntent::Recap));
+        // 无上下文的冲突词不归入更正，交给常规管线。
+        assert_eq!(classify("这两个说法冲突"), None);
+        assert_eq!(classify("姚明是不是篮球运动员"), None);
+    }
+
+    #[test]
+    fn corrections_recall_lists_relations_and_honest_empty() {
+        let empty = GenerationMemory::empty("s");
+        let r = recall(&empty, "上次和这次冲突吗").unwrap();
+        assert_eq!(r.intent.tag(), "corrections");
+        assert!(r.text.contains("还没有记录更正关系"));
+
+        let dir = TempDir::new().unwrap();
+        let mut memory = sample_memory(&dir);
+        let corrected = memory.reply_iter().next().unwrap().claims[0].uri.clone();
+        let latest_seq = memory.latest_reply().unwrap().seq;
+        for stored in memory.turns.values_mut() {
+            for reply in stored.replies.iter_mut() {
+                if reply.seq == latest_seq {
+                    reply.corrects = vec![corrected.clone()];
+                }
+            }
+        }
+        let r = recall(&memory, "上次和这一次矛盾吗").unwrap();
+        assert_eq!(r.intent.tag(), "corrections");
+        assert!(r.text.contains("共记录 1 条更正关系"));
+        assert!(r.text.contains("撤回了先前命题"));
     }
 }

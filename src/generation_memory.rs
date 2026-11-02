@@ -1008,4 +1008,40 @@ mod tests {
         assert!(forgotten.is_empty());
         assert_eq!(manager.revision(), revision);
     }
+
+    #[test]
+    fn corrects_quads_emitted_and_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let (index, _session, _chronicle) = sample_index(&dir);
+        let mut memory = GenerationMemory::from_index(&index, 0);
+        let corrected = index.reply(2).unwrap().claims[0].uri.clone();
+        let latest_seq = memory.latest_reply().unwrap().seq;
+        for stored in memory.turns.values_mut() {
+            for reply in stored.replies.iter_mut() {
+                if reply.seq == latest_seq {
+                    reply.corrects = vec![corrected.clone()];
+                }
+            }
+        }
+        let quads = memory.to_quads().unwrap();
+        assert!(
+            quads.iter().any(|quad| {
+                matches!(&quad.graph_name, GraphName::NamedNode(_))
+                    && quad.predicate.as_str() == P_CORRECTS
+                    && matches!(
+                        &quad.object,
+                        Term::NamedNode(node) if node.as_str() == corrected
+                    )
+            }),
+            "应发出 P_CORRECTS 四元组，使更正关系可被 SPARQL 查询"
+        );
+
+        // P_JSON 载荷随 corrects 一并保留，圆满往返不丢更正关系。
+        let loaded = GenerationMemory::from_quads(quads).unwrap();
+        assert_eq!(loaded, memory);
+        assert_eq!(
+            loaded.latest_reply().unwrap().corrects,
+            vec![corrected]
+        );
+    }
 }

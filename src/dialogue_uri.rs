@@ -1770,4 +1770,38 @@ mod tests {
         let error = DialogueSession::load(&path.to_string_lossy()).unwrap_err();
         assert!(error.to_string().contains("高于支持版本"));
     }
+
+    #[test]
+    fn reply_reads_corrects_from_chronicle_payload() {
+        let corrected_uri = claim_uri("s", 1, 1);
+        let mut first = ChronicleEntry {
+            seq: 2,
+            version: 1,
+            kind: "reply".to_string(),
+            payload: serde_json::json!({
+                "answer": "修正后的回答",
+                "corrects": [corrected_uri],
+            }),
+            prev: String::new(),
+            kb_revision: 0,
+            hash: String::new(),
+        };
+        first.hash = first.compute_hash();
+        let mut second = ChronicleEntry {
+            seq: 3,
+            version: 1,
+            kind: "reply".to_string(),
+            payload: serde_json::json!({"answer": "普通回答"}),
+            prev: first.hash.clone(),
+            kb_revision: 0,
+            hash: String::new(),
+        };
+        second.hash = second.compute_hash();
+        let index = DialogueArtifactIndex::build("s", &[first, second]);
+        assert_eq!(
+            index.reply(2).unwrap().corrects,
+            vec![corrected_uri]
+        );
+        assert!(index.reply(3).unwrap().corrects.is_empty());
+    }
 }
