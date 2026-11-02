@@ -306,6 +306,16 @@ impl GenerationMemory {
         self.find_claim(text).is_some()
     }
 
+    /// 整条回答文本是否已作为某条回答的完整正文说过（按规范化文本比对）。
+    pub fn already_replied(&self, answer: &str) -> bool {
+        let needle = answer_key(answer);
+        if needle.is_empty() {
+            return false;
+        }
+        self.reply_iter()
+            .any(|reply| answer_key(&reply.answer) == needle)
+    }
+
     /// 投影为 RDF 四元组（确定性排序、去重）。
     pub fn to_quads(&self) -> MemoryResult<Vec<Quad>> {
         if self.session.trim().is_empty() {
@@ -1043,5 +1053,20 @@ mod tests {
             loaded.latest_reply().unwrap().corrects,
             vec![corrected]
         );
+    }
+
+    #[test]
+    fn already_replied_matches_full_answer_text() {
+        let dir = TempDir::new().unwrap();
+        let (index, _session, _chronicle) = sample_index(&dir);
+        let memory = GenerationMemory::from_index(&index, 0);
+        // 样本里第二条回答的完整正文。
+        let reply = index.reply(2).unwrap();
+        assert!(memory.already_replied(&reply.answer));
+        // 不同标点/空白视为相同。
+        assert!(memory.already_replied(&format!("{} ", reply.answer.trim())));
+        // 改动正文就不命中。
+        assert!(!memory.already_replied(&format!("{}\n多余一句。", reply.answer)));
+        assert!(!memory.already_replied("完全没说过的回答内容。"));
     }
 }
