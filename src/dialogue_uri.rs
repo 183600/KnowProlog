@@ -557,6 +557,9 @@ pub struct ReplyArtifact {
     pub kb_revision: u64,
     pub claims: Vec<ClaimArtifact>,
     pub evidence: Vec<EvidenceArtifact>,
+    /// 该回答更正的先前命题 URI（按轮隔离，内容寻址），用于更正关系追溯。
+    #[serde(default)]
+    pub corrects: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1236,10 +1239,11 @@ impl DialogueArtifactIndex {
                 digest: digest.clone(),
                 text: text.to_string(),
             });
-            self.evidences
-                .entry(digest)
-                .or_insert_with(|| text.to_string());
+        self.evidences
+            .entry(digest)
+            .or_insert_with(|| text.to_string());
         }
+        let corrects = payload_strings(entry, "corrects");
         self.replies.insert(
             entry.seq,
             ReplyArtifact {
@@ -1253,6 +1257,7 @@ impl DialogueArtifactIndex {
                 kb_revision: entry.kb_revision,
                 claims,
                 evidence,
+                corrects,
             },
         );
     }
