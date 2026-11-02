@@ -74,6 +74,8 @@ const P_TURN_COUNT: &str = "http://example.org/kg/ledger/dialogue/turnCount";
 const P_REPLY_COUNT: &str = "http://example.org/kg/ledger/dialogue/replyCount";
 const P_LATEST_SEQ: &str = "http://example.org/kg/ledger/dialogue/latestSeq";
 const P_JSON: &str = "http://example.org/kg/ledger/dialogue/json";
+/// 更正关系：回答 → 其更正的先前命题 URI，按轮隔离、内容寻址。
+const P_CORRECTS: &str = "http://example.org/kg/ledger/dialogue/corrects";
 
 type MemoryResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -759,6 +761,10 @@ fn add_reply_quads(
             serde_json::to_string(evidence).map_err(|error| error.to_string())?,
             graph,
         )?;
+    }
+    for corrected in &reply.corrects {
+        let corrected_node = named_node(corrected)?;
+        push_node(quads, &subject, P_CORRECTS, &corrected_node, graph)?;
     }
     Ok(())
 }
