@@ -413,6 +413,31 @@ fn isolate_dialogue_state_path(path: &mut Option<String>, store_path: &str) {
     );
 }
 
+/// RDF 生成记忆召回：开关打开且输入是元话语问题时，只读命名图回答。
+///
+/// 三级守卫保证默认路径逐字节不变：配置未启用 → 不分类不读图；不是元话语 →
+/// 不读图；读图失败 → 打印原因并退回既有管线（绝不以空结果冒充召回失败）。
+async fn answer_generation_recall(
+    config: &know_prolog::SystemConfig,
+    manager: &OxigraphManager,
+    session: &know_prolog::dialogue_uri::DialogueSession,
+    input: &str,
+) -> Option<know_prolog::generation_recall::RecallReply> {
+    if !config.generation_memory.enabled {
+        return None;
+    }
+    if know_prolog::generation_recall::classify(input).is_none() {
+        return None;
+    }
+    match manager.load_generation_memory(session.id()).await {
+        Ok(memory) => know_prolog::generation_recall::recall(&memory, input),
+        Err(error) => {
+            eprintln!("读取生成记忆失败（本轮不走召回）：{}", error);
+            None
+        }
+    }
+}
+
 /// 解析编年史与会话标识路径（交互模式、工件与生成记忆共用同一规则）。
 fn resolve_dialogue_paths(
     config: &know_prolog::SystemConfig,
@@ -478,12 +503,14 @@ fn run_dialogue_artifacts(
     }
 }
 
-/// `dialogue-memory`：把编年史投影为按轮隔离的 RDF 生成记忆，或按会话忘记。
+/// `dialogue-memory`：把编年史投影为按轮隔离的 RDF 生成记忆，按会话忘记，
+/// 或用 `--recall` 只读命名图回答一句元话语（回顾 / 说过吗 / 第N个命题）。
 async fn run_dialogue_memory(
     config: &know_prolog::SystemConfig,
     store_path: &str,
     sync: bool,
     forget: bool,
+    recall: Option<&str>,
     max_turns: usize,
     json: bool,
     chronicle_override: Option<&str>,
@@ -492,6 +519,14 @@ async fn run_dialogue_memory(
     use know_prolog::generation_memory::GenerationMemory;
     if sync && forget {
         eprintln!("--sync 与 --forget 不能同时使用。");
+        std::process::exit(1);
+    }
+    if sync && recall.is_some() {
+        eprintln!("--sync 与 --recall 不能同时使用：先投影，再召回。");
+        std::process::exit(1);
+    }
+    if forget && recall.is_some() {
+        eprintln!("--forget 与 --recall 不能同时使用。");
         std::process::exit(1);
     }
     let (chronicle_path, session_path) = resolve_dialogue_paths(
@@ -572,6 +607,32 @@ async fn run_dialogue_memory(
             }
         }
     };
+    if let Some(question) = recall {
+        match know_prolog::generation_recall::recall(&memory, question) {
+            Some(reply) => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "question": question,
+                            "intent": reply.intent.tag(),
+                            "answer": reply.render(),
+                        })
+                    );
+                } else {
+                    println!("{}", reply.render());
+                }
+            }
+            None => {
+                eprintln!(
+                    "无法把「{}」理解为生成记忆召回问题（支持：回顾 / 说过吗：<文本> / 第N个命题是什么）。",
+                    question
+                );
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
     if json {
         match serde_json::to_string_pretty(&memory) {
             Ok(text) => println!("{}", text),

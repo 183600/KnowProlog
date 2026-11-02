@@ -427,6 +427,7 @@ async fn main() {
     if let Some(Commands::DialogueMemory {
         sync,
         forget,
+        recall,
         max_turns,
         json,
         chronicle,
@@ -438,6 +439,7 @@ async fn main() {
             &store_path,
             *sync,
             *forget,
+            recall.as_deref(),
             *max_turns,
             *json,
             chronicle.as_deref(),

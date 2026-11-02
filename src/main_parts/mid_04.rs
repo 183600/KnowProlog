@@ -54,10 +54,38 @@ async fn run_ask(
     let mut lens_cache: Option<(viewpoint::LensCorpus, BTreeSet<String>)> = None;
     let mut import_episodes: Option<Vec<know_prolog::import_episode::ImportEpisode>> = None;
     let mut answers: Vec<AskAnswer> = Vec::with_capacity(questions.len());
+    // 生成记忆召回专用：只读会话标识旁车（ask 是只读入口，不创建任何文件）。
+    let recall_session = if config.generation_memory.enabled {
+        let (_, session_path) = resolve_dialogue_paths(config, store_path, None, None);
+        match know_prolog::dialogue_uri::DialogueSession::load(&session_path) {
+            Ok(session) => session,
+            Err(error) => {
+                eprintln!("读取生成记忆会话标识失败（本轮不走召回）：{}", error);
+                None
+            }
+        }
+    } else {
+        None
+    };
     for question in questions {
         // 管道输入常沿用交互脚本的收尾行：不要把它当成待回答的问题。
         if is_ask_terminator(&question) {
             break;
+        }
+        // RDF 生成记忆召回（默认关闭）：只读命名图回答元话语问题，
+        // 与交互模式同一套三级守卫；不创建会话标识，读图失败即放行。
+        if let Some(session) = recall_session.as_ref() {
+            if let Some(reply) =
+                answer_generation_recall(config, oxigraph_manager, session, &question).await
+            {
+                answers.push(AskAnswer {
+                    question,
+                    status: "answered",
+                    answer: Some(reply.render().to_string()),
+                    derivation: None,
+                });
+                continue;
+            }
         }
         // 风格指令与计划审计优先于澄清/悬问回填：脚本里的「简短点」
         // 不会被误当成对上一轮缺失前提的短答。

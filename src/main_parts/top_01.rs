@@ -1637,6 +1637,9 @@ enum Commands {
         /// Delete every generation-memory graph for the session
         #[arg(long)]
         forget: bool,
+        /// Answer one recall question (回顾 / 说过吗：X / 第N个命题) from the graphs
+        #[arg(long, value_name = "QUESTION")]
+        recall: Option<String>,
         /// Maximum recent turns to project (0 = all)
         #[arg(long, default_value_t = generation_memory::DEFAULT_MEMORY_TURNS)]
         max_turns: usize,

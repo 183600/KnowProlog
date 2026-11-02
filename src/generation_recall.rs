@@ -18,7 +18,6 @@
 //! - **坦白不知道**：记忆为空、没有依据时显式说「还没有记录」，绝不伪装成答案；
 //! - **确定性**：排序固定、文案不含挂钟时间，同一份记忆对同一问题逐字节可复现。
 
-use crate::chronicle::answer_key;
 use crate::dialogue_uri::ClaimArtifact;
 use crate::generation_memory::GenerationMemory;
 
@@ -597,7 +596,7 @@ fn strip_suffix_particles(text: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chronicle::{Chronicle, EntityRef, FsyncPolicy};
+    use crate::chronicle::{answer_key, Chronicle, EntityRef, FsyncPolicy};
     use crate::dialogue_uri::{DialogueArtifactIndex, DialogueSession};
     use crate::perf_ledger::PerfLedger;
     use crate::OxigraphManager;

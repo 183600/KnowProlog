@@ -984,6 +984,21 @@
             continue;
         }
 
+        // RDF 生成记忆召回（默认关闭）：启用后，元话语问题先由命名图回答——
+        // 跨重启、有界、只读；未开启、非元话语或读图失败时本块整体不生效。
+        if config.generation_memory.enabled {
+            if let Some(session) = dialogue_session.as_ref() {
+                if let Some(reply) =
+                    answer_generation_recall(&config, &oxigraph_manager, session, input).await
+                {
+                    println!("{}", reply.render());
+                    log_chronicle_reply(&mut chronicle, reply.render(), &reply.plan, &[]);
+                    println!();
+                    continue;
+                }
+            }
+        }
+
         // 本体化对话管理器（纯对话行为）：回顾、解释依据、续聊、展开、寒暄。
         // 用对话本体 + 逻辑程序策略推导话语行为，再由模板组合生成回答。
         if dialogue_enabled {
