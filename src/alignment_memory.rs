@@ -52,7 +52,9 @@ impl AlignmentKind {
 }
 
 /// 规则作用域。跨会话晋升必须走实体注册表，不在这里静默提升。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum AlignmentScope {
     #[default]
