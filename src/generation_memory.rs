@@ -95,7 +95,7 @@ fn default_memory_turns() -> usize {
 impl Default for GenerationMemoryConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             max_turns: DEFAULT_MEMORY_TURNS,
         }
     }
