@@ -1932,12 +1932,12 @@ mod session_tests {
         chronicle
             .append_turn("张三的身高是多少", "query", None, 0)
             .unwrap();
-        chronicle.append_reply("226 厘米", &[], &[]).unwrap();
+        chronicle.append_reply("226 厘米", &[], &[], &[]).unwrap();
         chronicle.set_kb_revision(1);
         chronicle
             .append_turn("张三的身高是多少呢", "query", None, 0)
             .unwrap();
-        chronicle.append_reply("228 厘米", &[], &[]).unwrap();
+        chronicle.append_reply("228 厘米", &[], &[], &[]).unwrap();
 
         let mut registry = EntityRegistry::new();
         registry.observe_kb_entity("张三", &BTreeSet::new(), &[], "test");

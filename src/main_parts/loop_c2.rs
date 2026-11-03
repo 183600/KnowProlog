@@ -96,7 +96,7 @@
                                     kb_revision + 1,
                                 );
                             }
-                            log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
+                            log_chronicle_reply(&mut chronicle, &answer, &[], &[], &[]);
                             // 推理器只增不减：用更正后的图快照重建，使回答基于更新后的图谱
                             rebuild_symbolic_reasoner(
                                 &mut symbolic_reasoner,
@@ -135,7 +135,7 @@
         ) {
             let answer = symbolic_reasoner.resolve_batch_answer(target);
             println!("{}", answer);
-            log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
+            log_chronicle_reply(&mut chronicle, &answer, &[], &[], &[]);
             println!();
             continue;
         }
@@ -179,7 +179,7 @@
                 println!("{}", answer);
                 if let Some(deferred) = symbolic_reasoner.resolve_pending_after_assertion() {
                     println!("{}", deferred);
-                    log_chronicle_reply(&mut chronicle, &deferred, &[], &[]);
+                    log_chronicle_reply(&mut chronicle, &deferred, &[], &[], &[]);
                 }
                 let effects = conversation_theory::effects_from_text(
                     target,
@@ -193,7 +193,7 @@
                         kb_revision,
                     );
                 }
-                log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
+                log_chronicle_reply(&mut chronicle, &answer, &[], &[], &[]);
             }
             println!();
             continue;
@@ -213,7 +213,7 @@
                 println!("{}", answer);
                 if let Some(deferred) = symbolic_reasoner.resolve_pending_after_assertion() {
                     println!("{}", deferred);
-                    log_chronicle_reply(&mut chronicle, &deferred, &[], &[]);
+                    log_chronicle_reply(&mut chronicle, &deferred, &[], &[], &[]);
                 }
                 let effects = conversation_theory::effects_from_text(
                     target,
@@ -227,7 +227,7 @@
                         kb_revision,
                     );
                 }
-                log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
+                log_chronicle_reply(&mut chronicle, &answer, &[], &[], &[]);
             }
             println!();
             continue;
@@ -256,7 +256,7 @@
                         kb_revision,
                     );
                 }
-                log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
+                log_chronicle_reply(&mut chronicle, &answer, &[], &[], &[]);
             }
             println!();
             continue;
@@ -269,7 +269,7 @@
         ) {
             let answer = symbolic_reasoner.forget_rule_report(target);
             println!("{}", answer);
-            log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
+            log_chronicle_reply(&mut chronicle, &answer, &[], &[], &[]);
             sync_rule_ledger_report(&symbolic_reasoner, &oxigraph_manager).await;
             println!();
             continue;
@@ -992,7 +992,7 @@
                     answer_generation_recall(&config, &oxigraph_manager, session, input).await
                 {
                     println!("{}", reply.render());
-                    log_chronicle_reply(&mut chronicle, reply.render(), &reply.plan, &[]);
+                    log_chronicle_reply(&mut chronicle, reply.render(), &reply.plan, &[], &[]);
                     println!();
                     continue;
                 }
@@ -1018,7 +1018,7 @@
                     .last()
                     .map(|turn| turn.provenance.clone())
                     .unwrap_or_default();
-                log_chronicle_reply(&mut chronicle, &text, &reply.plan, &provenance);
+                log_chronicle_reply(&mut chronicle, &text, &reply.plan, &provenance, &[]);
                 log_chronicle_trace(&mut chronicle, &dialogue_manager);
                 println!();
                 continue;
@@ -1333,7 +1333,7 @@
         if symbolic_reasoner.has_pending_question() && !is_command_like(input) {
             if let Some(deferred) = symbolic_reasoner.try_answer_pending_question(input) {
                 println!("{}", deferred);
-                log_chronicle_reply(&mut chronicle, &deferred, &[], &[]);
+                log_chronicle_reply(&mut chronicle, &deferred, &[], &[], &[]);
                 println!();
                 continue;
             }
@@ -1345,7 +1345,7 @@
         if graph_refreshed && symbolic_reasoner.has_pending_question() {
             if let Some(deferred) = symbolic_reasoner.resolve_pending_after_assertion() {
                 println!("{}", deferred);
-                log_chronicle_reply(&mut chronicle, &deferred, &[], &[]);
+                log_chronicle_reply(&mut chronicle, &deferred, &[], &[], &[]);
                 println!();
             }
             graph_refreshed = false;

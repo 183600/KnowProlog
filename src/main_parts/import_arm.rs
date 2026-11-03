@@ -96,7 +96,7 @@
                                         );
                                     }
                                 }
-                                log_chronicle_reply(&mut chronicle, &summary, &[], &[]);
+                                log_chronicle_reply(&mut chronicle, &summary, &[], &[], &[]);
                                 // 抽取即标注：把已落库事实回对齐到原句，学习可逆措辞/问法。
                                 let learned = import_frames.learn_from_import(
                                     kb_revision + 1,

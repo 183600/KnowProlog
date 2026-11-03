@@ -1196,6 +1196,7 @@ mod tests {
                 "姚明的身高是 226。",
                 &["direct_answer".to_string()],
                 &["身高".to_string()],
+                &[],
             )
             .unwrap();
 

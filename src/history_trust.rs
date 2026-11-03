@@ -843,7 +843,7 @@ mod tests {
     }
 
     fn answer(chronicle: &mut Chronicle, text: &str) -> u64 {
-        chronicle.append_reply(text, &[], &[]).unwrap()
+        chronicle.append_reply(text, &[], &[], &[]).unwrap()
     }
 
     #[test]
@@ -889,6 +889,7 @@ mod tests {
                 &[],
                 &[],
                 Some(&certificate.id),
+                &[],
             )
             .unwrap();
         let correction = TheoryCorrection {
@@ -955,6 +956,7 @@ mod tests {
                 &[],
                 &[],
                 None,
+                &[],
             )
             .unwrap();
         // 无证明：即使撤回，也只能降级为 Suspect
@@ -999,6 +1001,7 @@ mod tests {
                 &[],
                 &[],
                 Some(&certificate.id),
+                &[],
             )
             .unwrap();
         append_conflict(
@@ -1061,6 +1064,7 @@ mod tests {
                 &[],
                 &[],
                 Some(&certificate.id),
+                &[],
             )
             .unwrap();
         let assessment = TrustAssessment::from_chronicle(&chronicle);
@@ -1104,6 +1108,7 @@ mod tests {
                 &[],
                 &[],
                 Some(&certificate.id),
+                &[],
             )
             .unwrap();
         append_conflict(
@@ -1191,6 +1196,7 @@ mod tests {
                 &[],
                 &[],
                 None,
+                &[],
             )
             .unwrap();
         let entry = chronicle.entries().last().unwrap();

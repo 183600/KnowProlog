@@ -1230,7 +1230,7 @@
             let report = symbolic_reasoner.undo_last_session_revision();
             println!("{}", report);
             sync_rule_ledger_report(&symbolic_reasoner, &oxigraph_manager).await;
-            log_chronicle_reply(&mut chronicle, &report, &[], &[]);
+            log_chronicle_reply(&mut chronicle, &report, &[], &[], &[]);
             println!();
             continue;
         }
@@ -1254,7 +1254,7 @@
                 refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
                 let report = symbolic_reasoner.correct_nl_fact(target);
                 println!("{}", report);
-                log_chronicle_reply(&mut chronicle, &report, &[], &[]);
+                log_chronicle_reply(&mut chronicle, &report, &[], &[], &[]);
             }
             println!();
             continue;

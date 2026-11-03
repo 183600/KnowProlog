@@ -672,6 +672,7 @@ mod tests {
                 &["direct_answer".to_string()],
                 &["身高".to_string()],
                 Some("proof-1"),
+                &[],
             )
             .unwrap();
         chronicle
@@ -682,6 +683,7 @@ mod tests {
                 "姚明的身高是 226 厘米。",
                 &["direct_answer".to_string()],
                 &["身高".to_string()],
+                &[],
             )
             .unwrap();
         let index = DialogueArtifactIndex::from_chronicle(&session, &chronicle);

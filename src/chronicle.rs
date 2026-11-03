@@ -565,9 +565,17 @@ impl Chronicle {
         answer: &str,
         plan: &[String],
         provenance: &[String],
+        corrects: &[String],
     ) -> std::io::Result<u64> {
         let question = self.last_query_turn().map(str::to_string);
-        self.append_reply_with_context(question.as_deref(), answer, plan, provenance, None)
+        self.append_reply_with_context(
+            question.as_deref(),
+            answer,
+            plan,
+            provenance,
+            None,
+            corrects,
+        )
     }
 
     /// 带问题与证明编号的回答登记（证明携带的回答入口）。
@@ -575,6 +583,8 @@ impl Chronicle {
     /// 回答会记录读取水位：`observed_seq` 是提问时的日志序号，
     /// `read_revision` 是提问时的知识版本，`commit_revision` 是提交时的版本。
     /// 三者让「回答基于旧快照」成为可检测的事实，而不是事后猜测。
+    ///
+    /// `corrects` 记录本回答更正的先前命题 URI，用于更正关系追溯。
     pub fn append_reply_with_context(
         &mut self,
         question: Option<&str>,
@@ -582,6 +592,7 @@ impl Chronicle {
         plan: &[String],
         provenance: &[String],
         proof_id: Option<&str>,
+        corrects: &[String],
     ) -> std::io::Result<u64> {
         let turn = self.last_query_turn_entry().map(|entry| {
             (
@@ -624,6 +635,14 @@ impl Chronicle {
         }
         if let Some(proof_id) = proof_id.map(str::trim).filter(|id| !id.is_empty()) {
             payload["proof_id"] = Value::from(proof_id);
+        }
+        if !corrects.is_empty() {
+            payload["corrects"] = Value::Array(
+                corrects
+                    .iter()
+                    .map(|uri| Value::String(uri.clone()))
+                    .collect(),
+            );
         }
         self.append("reply", payload)
     }
@@ -865,6 +884,7 @@ mod tests {
                 "姚明的身高是 226 厘米。",
                 &["direct_answer".to_string()],
                 &["身高".to_string()],
+                &[],
             )
             .unwrap();
         (chronicle, path_text)
@@ -1071,7 +1091,7 @@ mod tests {
         chronicle
             .append_turn("姚明的身高是多少？", "query", None, 0)
             .unwrap();
-        chronicle.append_reply("226 厘米。", &[], &[]).unwrap();
+        chronicle.append_reply("226 厘米。", &[], &[], &[]).unwrap();
         let reply = chronicle.entries().last().unwrap();
         assert_eq!(
             reply.payload.get("question").and_then(Value::as_str),
@@ -1083,7 +1103,7 @@ mod tests {
         );
 
         chronicle.append_turn("编年史", "command", None, 1).unwrap();
-        chronicle.append_reply("档案状态", &[], &[]).unwrap();
+        chronicle.append_reply("档案状态", &[], &[], &[]).unwrap();
         let reply = chronicle.entries().last().unwrap();
         assert!(
             reply.payload.get("question").is_none(),
@@ -1207,7 +1227,7 @@ mod tests {
             .append_turn("姚明的身高是多少？", "query", None, 0)
             .unwrap();
         chronicle.set_kb_revision(7);
-        chronicle.append_reply("226 厘米。", &[], &[]).unwrap();
+        chronicle.append_reply("226 厘米。", &[], &[], &[]).unwrap();
         let reply = chronicle.entries().last().unwrap();
         assert_eq!(reply.payload["observed_seq"], 1);
         assert_eq!(reply.payload["read_revision"], 0);

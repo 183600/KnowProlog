@@ -255,7 +255,7 @@ mod tests {
     }
 
     fn answer(chronicle: &mut Chronicle, text: &str) -> u64 {
-        let seq = chronicle.append_reply(text, &[], &[]).unwrap();
+        let seq = chronicle.append_reply(text, &[], &[], &[]).unwrap();
         seq
     }
 

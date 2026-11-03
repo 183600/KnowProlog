@@ -1186,7 +1186,7 @@ mod tests {
             .append_turn_with_refs("小李是谁", "query", None, 0, &refs)
             .unwrap();
         chronicle
-            .append_reply("李四是张三的曾用名。", &[], &[])
+            .append_reply("李四是张三的曾用名。", &[], &[], &[])
             .unwrap();
         let bytes_before = std::fs::read(&path_text).unwrap();
 
@@ -1219,7 +1219,7 @@ mod tests {
             .append_turn("小李后来怎么样了", "query", None, 0)
             .unwrap();
         chronicle
-            .append_reply("小李最近去了杭州。", &[], &[])
+            .append_reply("小李最近去了杭州。", &[], &[], &[])
             .unwrap();
 
         let empty = EntityRegistry::new();
@@ -1380,7 +1380,7 @@ mod tests {
             .append_turn_with_refs("张三的身高是多少", "query", None, 0, &refs)
             .unwrap();
         chronicle
-            .append_reply("张三的身高是 226 厘米。", &[], &[])
+            .append_reply("张三的身高是 226 厘米。", &[], &[], &[])
             .unwrap();
         let registry = registry_with(&[("张三", &[], &[])]);
         let digest = EntityThreadDigest::build(&chronicle, &registry);

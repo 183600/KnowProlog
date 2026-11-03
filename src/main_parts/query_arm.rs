@@ -371,7 +371,7 @@
                     .answer_from_overlay(input, &oxigraph_manager.predicate_registry_snapshot())
                 {
                     let answer_text = answer.render_text();
-                    emit_reply(&mut chronicle, &dialogue_session, &answer_text, &[], &[]);
+                    emit_reply(&mut chronicle, &dialogue_session, &answer_text, &[], &[], &[]);
                     println!();
                     continue;
                 }
@@ -404,6 +404,7 @@
                             &reply.text,
                             &reply.plan,
                             &reply.provenance,
+                            &[],
                         );
                         log_chronicle_trace(&mut chronicle, &dialogue_manager);
                         println!();
@@ -436,7 +437,7 @@
                             .last()
                             .map(|turn| turn.provenance.clone())
                             .unwrap_or_default();
-                        emit_reply(&mut chronicle, &dialogue_session, text, &reply.plan, &provenance);
+                        emit_reply(&mut chronicle, &dialogue_session, text, &reply.plan, &provenance, &[]);
                         log_chronicle_trace(&mut chronicle, &dialogue_manager);
                         println!();
                         continue;
@@ -542,7 +543,7 @@
                                     )
                                     .await
                                     {
-                                        emit_reply(&mut chronicle, &dialogue_session, &answer, &[], &[]);
+                                        emit_reply(&mut chronicle, &dialogue_session, &answer, &[], &[], &[]);
                                     } else {
                                         println!("本地知识库中没有相关天气记录。");
                                     }
@@ -600,13 +601,14 @@
                                                     )
                                                     .await
                                                     {
-                                                        emit_reply(
-                                                            &mut chronicle,
-                                                            &dialogue_session,
-                                                            &answer,
-                                                            &[],
-                                                            &[],
-                                                        );
+                                                    emit_reply(
+                                                        &mut chronicle,
+                                                        &dialogue_session,
+                                                        &answer,
+                                                        &[],
+                                                        &[],
+                                                        &[],
+                                                    );
                                                     } else {
                                                         println!(
                                                             "知识库中没有{}的身高记录。",
@@ -630,6 +632,7 @@
                                                         &mut chronicle,
                                                         &dialogue_session,
                                                         &answer,
+                                                        &[],
                                                         &[],
                                                         &[],
                                                     );
@@ -657,6 +660,7 @@
                                                         &answer,
                                                         &[],
                                                         &[],
+                                                        &[],
                                                     );
                                                 }
                                             }
@@ -673,7 +677,7 @@
                                         "感谢" => "不客气！如果您有其他问题，随时可以问我。",
                                         _ => "很高兴和您聊天！",
                                     };
-                                    emit_reply(&mut chronicle, &dialogue_session, chat_reply, &[], &[]);
+                                    emit_reply(&mut chronicle, &dialogue_session, chat_reply, &[], &[], &[]);
                                 }
                                 "知识查询" => {
                                     // 继续使用查询逻辑
@@ -730,7 +734,7 @@
                                     )
                                     .await
                                     {
-                                        emit_reply(&mut chronicle, &dialogue_session, &answer, &[], &[]);
+                                        emit_reply(&mut chronicle, &dialogue_session, &answer, &[], &[], &[]);
                                     } else if let Some((text, plan)) =
                                         plugin_policy_text(&mut plugin_runtime, input)
                                     {
@@ -740,10 +744,11 @@
                                             text,
                                             &[plan.clone()],
                                             &[format!("插件策略 {}", plan)],
+                                            &[],
                                         );
                                     } else {
                                         let fallback = "无法理解您的查询，请重新描述您的问题。";
-                                        emit_reply(&mut chronicle, &dialogue_session, fallback, &[], &[]);
+                                        emit_reply(&mut chronicle, &dialogue_session, fallback, &[], &[], &[]);
                                     }
                                 }
                                 _ => {
@@ -801,7 +806,7 @@
                                     )
                                     .await
                                     {
-                                        emit_reply(&mut chronicle, &dialogue_session, &answer, &[], &[]);
+                                        emit_reply(&mut chronicle, &dialogue_session, &answer, &[], &[], &[]);
                                     } else if let Some((text, plan)) =
                                         plugin_policy_text(&mut plugin_runtime, input)
                                     {
@@ -811,15 +816,17 @@
                                             text,
                                             &[plan.clone()],
                                             &[format!("插件策略 {}", plan)],
+                                            &[],
                                         );
                                     } else {
-                                        emit_reply(
-                                            &mut chronicle,
-                                            &dialogue_session,
-                                            language_config.messages.cannot_understand.clone(),
-                                            &[],
-                                            &[],
-                                        );
+                                    emit_reply(
+                                        &mut chronicle,
+                                        &dialogue_session,
+                                        language_config.messages.cannot_understand.clone(),
+                                        &[],
+                                        &[],
+                                        &[],
+                                    );
                                     }
                                 }
                             }
@@ -975,7 +982,7 @@
                                         .get_direct_answer(&query_type, &final_entities)
                                         .await
                                     {
-                                        emit_reply(&mut chronicle, &dialogue_session, &answer, &[], &[]);
+                                        emit_reply(&mut chronicle, &dialogue_session, &answer, &[], &[], &[]);
                                     } else if let Some(prolog_query) =
                                         PrologEngine::generate_prolog_query(
                                             &query_type,
@@ -991,7 +998,7 @@
                                             &query_type,
                                             &response_formatter,
                                         );
-                                        emit_reply(&mut chronicle, &dialogue_session, &response, &[], &[]);
+                                        emit_reply(&mut chronicle, &dialogue_session, &response, &[], &[], &[]);
                                     } else {
                                         println!("无法生成有效的Prolog查询");
                                     }
@@ -1015,7 +1022,7 @@
                                         .get_direct_answer(&query_type, &entities)
                                         .await
                                     {
-                                        emit_reply(&mut chronicle, &dialogue_session, &answer, &[], &[]);
+                                        emit_reply(&mut chronicle, &dialogue_session, &answer, &[], &[], &[]);
                                     } else if let Some(prolog_query) =
                                         PrologEngine::generate_prolog_query(&query_type, &entities)
                                     {
@@ -1028,7 +1035,7 @@
                                             &query_type,
                                             &response_formatter,
                                         );
-                                        emit_reply(&mut chronicle, &dialogue_session, &response, &[], &[]);
+                                        emit_reply(&mut chronicle, &dialogue_session, &response, &[], &[], &[]);
                                     } else {
                                         println!("无法生成有效的Prolog查询");
                                     }
@@ -1053,7 +1060,7 @@
                                     .get_direct_answer(&query_type, &entities)
                                     .await
                                 {
-                                    emit_reply(&mut chronicle, &dialogue_session, &answer, &[], &[]);
+                                    emit_reply(&mut chronicle, &dialogue_session, &answer, &[], &[], &[]);
                                 } else if let Some(prolog_query) =
                                     PrologEngine::generate_prolog_query(&query_type, &entities)
                                 {
@@ -1066,7 +1073,7 @@
                                         &query_type,
                                         &response_formatter,
                                     );
-                                        emit_reply(&mut chronicle, &dialogue_session, &response, &[], &[]);
+                                        emit_reply(&mut chronicle, &dialogue_session, &response, &[], &[], &[]);
                                     } else {
                                         println!("无法生成有效的Prolog查询");
                                 }
@@ -1095,7 +1102,7 @@
                 )
                                 .await
                                 {
-                                    emit_reply(&mut chronicle, &dialogue_session, &answer, &[], &[]);
+                                    emit_reply(&mut chronicle, &dialogue_session, &answer, &[], &[], &[]);
                                 } else {
                     // 先区分「实体未知」与「问法不支持」：库里完全没有提到过的实体，
                     // 坦白说没有记录，比笼统的「不理解」更接近人类对话
@@ -1152,6 +1159,7 @@
                             text,
                             &[policy_plan.clone()],
                             &[format!("插件策略 {}", policy_plan)],
+                            &[],
                         );
                     } else if let Some(direct_answer) = get_direct_answer(input) {
                         let direct_text = format!("根据常识知识库：{}", direct_answer);
@@ -1159,6 +1167,7 @@
                             &mut chronicle,
                             &dialogue_session,
                             &direct_text,
+                            &[],
                             &[],
                             &[],
                         );
@@ -1199,12 +1208,12 @@
                                 }
                                 match external_outcome_text(&outcome) {
                                     Some(text) => {
-                                        emit_reply(&mut chronicle, &dialogue_session, &text, &[], &[]);
+                                        emit_reply(&mut chronicle, &dialogue_session, &text, &[], &[], &[]);
                                     }
                                     None => {
                                         let fallback =
                                             "很抱歉，我无法理解您的问题。请尝试重新描述。";
-                                        emit_reply(&mut chronicle, &dialogue_session, fallback, &[], &[]);
+                                        emit_reply(&mut chronicle, &dialogue_session, fallback, &[], &[], &[]);
                                     }
                                 }
                             }

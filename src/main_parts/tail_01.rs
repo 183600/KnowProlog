@@ -296,9 +296,10 @@ fn log_chronicle_reply(
     answer: &str,
     plan: &[String],
     provenance: &[String],
+    corrects: &[String],
 ) {
     if let Some(chronicle) = chronicle.as_mut() {
-        let _ = chronicle.append_reply(answer, plan, provenance);
+        let _ = chronicle.append_reply(answer, plan, provenance, corrects);
     }
 }
 
@@ -311,6 +312,7 @@ fn emit_reply(
     answer: impl AsRef<str>,
     plan: &[String],
     provenance: &[String],
+    corrects: &[String],
 ) {
     let answer_str = answer.as_ref();
     let is_repeat = chronicle
@@ -340,7 +342,7 @@ fn emit_reply(
         return;
     }
     println!("{}", answer_str);
-    log_chronicle_reply(chronicle, answer_str, plan, provenance);
+    log_chronicle_reply(chronicle, answer_str, plan, provenance, corrects);
 }
 
 /// 编年史轨迹归档：把对话管理器最近一轮的分层追踪写入 `kind="trace"`，

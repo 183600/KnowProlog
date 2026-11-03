@@ -1213,7 +1213,7 @@
                                 proposal.sentence
                             );
                         }
-                        log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
+                        log_chronicle_reply(&mut chronicle, &answer, &[], &[], &[]);
                     }
                     assertion_reader.clear_pending();
                     persist_acquisition(&acquisition, &acquisition_path);
@@ -1290,7 +1290,7 @@
                             proposal.claim_id, proposal.sentence
                         );
                     }
-                    log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
+                    log_chronicle_reply(&mut chronicle, &answer, &[], &[], &[]);
                     persist_acquisition(&acquisition, &acquisition_path);
                 }
                 None => println!(

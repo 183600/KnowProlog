@@ -1138,20 +1138,20 @@ mod tests {
             .append_turn("姚明的身高是多少？", "query", None, 0)
             .unwrap();
         chronicle
-            .append_reply("姚明身高 226 厘米。", &[], &[])
+            .append_reply("姚明身高 226 厘米。", &[], &[], &[])
             .unwrap();
         chronicle
             .append_turn("姚明的身高是多少呢", "query", None, 1)
             .unwrap();
         chronicle
-            .append_reply("姚明身高 229 厘米。", &[], &[])
+            .append_reply("姚明身高 229 厘米。", &[], &[], &[])
             .unwrap();
         chronicle.set_kb_revision(7);
         chronicle
             .append_turn("姚明的身高是多少呢？", "query", None, 2)
             .unwrap();
         chronicle
-            .append_reply("姚明身高 226 厘米。", &[], &[])
+            .append_reply("姚明身高 226 厘米。", &[], &[], &[])
             .unwrap();
 
         let projection = JournalProjection::from_chronicle(&chronicle);
@@ -1177,7 +1177,7 @@ mod tests {
             chronicle
                 .append_turn("姚明的身高是多少", "query", None, index)
                 .unwrap();
-            chronicle.append_reply("226 厘米", &[], &[]).unwrap();
+            chronicle.append_reply("226 厘米", &[], &[], &[]).unwrap();
         }
         let report = JournalProjection::from_chronicle(&chronicle).consistency(0);
         assert!(report.findings.is_empty());

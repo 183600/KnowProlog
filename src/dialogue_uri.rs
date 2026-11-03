@@ -1604,6 +1604,7 @@ mod tests {
                 "1. 姚明的身高是 226 厘米。\n2. 他是篮球运动员。",
                 &["direct_answer".to_string()],
                 &["身高".to_string(), "职业".to_string()],
+                &[],
             )
             .unwrap();
         chronicle

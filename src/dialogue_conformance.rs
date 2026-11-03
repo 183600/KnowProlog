@@ -527,7 +527,7 @@ fn c10_chronicle_transcript_is_durable_and_deterministic() {
                 .unwrap();
             let reply = ask(&mut manager, kb, input);
             chronicle
-                .append_reply(&reply.text, &reply.plan, &[])
+                .append_reply(&reply.text, &reply.plan, &[], &[])
                 .unwrap();
             outputs.push(format!("[{}] {}", reply.plan.join("+"), reply.text));
         }

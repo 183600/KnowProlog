@@ -243,7 +243,7 @@
                                 proposal.sentence
                             );
                         }
-                        log_chronicle_reply(&mut chronicle, &answer, &[], &[]);
+                        log_chronicle_reply(&mut chronicle, &answer, &[], &[], &[]);
                     }
                     persist_acquisition(&acquisition, &acquisition_path);
                     persist_assertion_reader(&assertion_reader, &assertion_reader_path);
