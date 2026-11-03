@@ -332,6 +332,67 @@ impl GenerationMemory {
             .any(|reply| answer_key(&reply.answer) == needle)
     }
 
+    /// 定位被一次用户更正撤回的先前命题 URI（按回答、命题顺序升序，去重）。
+    ///
+    /// 语义与追踪图的更正一致：「上一轮的说法作废」。匹配保守，宁漏勿错：
+    ///
+    /// 1. **片段锚定**（优先）：旧回答片段是上一条被更正回答首行的截断，
+    ///    取最近一条规范化回答包含该片段（或互为前缀）的回答，作废其全部
+    ///    内容命题（排除以冒号结尾的小节标题）；
+    /// 2. **实体+属性兜底**：片段锚定失败时，回退到同时包含实体与属性名的
+    ///    历史命题（可能覆盖更早轮对同一事实的陈述）；
+    /// 3. 实体名为空（没有锚点）时不匹配任何命题，宁可空着也不猜。
+    pub fn corrected_claim_uris(
+        &self,
+        entity: &str,
+        attribute: &str,
+        previous_answer: &str,
+    ) -> Vec<String> {
+        let entity = entity.trim();
+        if entity.is_empty() {
+            return Vec::new();
+        }
+        let attribute = attribute.trim();
+        let excerpt = previous_answer.trim();
+        let excerpt = excerpt.strip_suffix('…').unwrap_or(excerpt).trim();
+        let prev_key = (!excerpt.is_empty())
+            .then(|| answer_key(excerpt))
+            .filter(|key| !key.is_empty());
+        // 阶段一：旧回答片段锚定最近一条对应回答，整条作废（与追踪图同语义）。
+        if let Some(prev_key) = &prev_key {
+            let replies: Vec<&crate::dialogue_uri::ReplyArtifact> = self.reply_iter().collect();
+            for reply in replies.iter().rev() {
+                let reply_key = answer_key(&reply.answer);
+                if reply_key.is_empty() {
+                    continue;
+                }
+                if reply_key.contains(prev_key.as_str()) || prev_key.starts_with(&reply_key) {
+                    return reply
+                        .claims
+                        .iter()
+                        .filter(|claim| is_proposition(&claim.text))
+                        .map(|claim| claim.uri.clone())
+                        .collect();
+                }
+            }
+        }
+        // 阶段二：实体+属性兜底（两者都非空才启用，避免属性名单独误伤）。
+        if !attribute.is_empty() {
+            let mut uris: Vec<String> = Vec::new();
+            for claim in self.reply_iter().flat_map(|reply| reply.claims.iter()) {
+                if claim.text.contains(entity)
+                    && claim.text.contains(attribute)
+                    && is_proposition(&claim.text)
+                    && !uris.contains(&claim.uri)
+                {
+                    uris.push(claim.uri.clone());
+                }
+            }
+            return uris;
+        }
+        Vec::new()
+    }
+
     /// 投影为 RDF 四元组（确定性排序、去重）。
     pub fn to_quads(&self) -> MemoryResult<Vec<Quad>> {
         if self.session.trim().is_empty() {
@@ -857,6 +918,11 @@ fn compact(text: &str, limit: usize) -> String {
     compact
 }
 
+/// 命题 vs 小节标题：以冒号结尾的回答行（「根据知识图谱：」）不是可撤回的命题。
+fn is_proposition(text: &str) -> bool {
+    !text.trim_end().ends_with(['：', ':'])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1083,5 +1149,90 @@ mod tests {
         // 改动正文就不命中。
         assert!(!memory.already_replied(&format!("{}\n多余一句。", reply.answer)));
         assert!(!memory.already_replied("完全没说过的回答内容。"));
+    }
+
+    #[test]
+    fn corrected_claim_uris_anchor_on_previous_answer_excerpt() {
+        let dir = TempDir::new().unwrap();
+        let (index, _session, _chronicle) = sample_index(&dir);
+        let memory = GenerationMemory::from_index(&index, 0);
+        // 追踪图更正携带的旧回答片段 = 上一条被更正回答首行（可能截断）。
+        let previous = "姚明的身高是 226 厘米。";
+        let uris = memory.corrected_claim_uris("姚明", "身高", previous);
+        assert_eq!(
+            uris,
+            vec![index.reply(4).unwrap().claims[0].uri.clone()],
+            "片段应精确锚定被更正回答的命题"
+        );
+        // 片段被截断（超过 40 字符时带省略号）仍按前缀关系命中。
+        let truncated = format!("{}…", &previous[..previous.len() - '。'.len_utf8()]);
+        assert_eq!(
+            memory.corrected_claim_uris("姚明", "身高", &truncated),
+            uris
+        );
+        // 实体+属性兜底也要求实体匹配：没有叶莉的命题就不得误伤姚明的。
+        assert!(memory.corrected_claim_uris("叶莉", "身高", "").is_empty());
+    }
+
+    #[test]
+    fn corrected_claim_uris_fall_back_to_entity_and_attribute() {
+        let dir = TempDir::new().unwrap();
+        let (index, _session, _chronicle) = sample_index(&dir);
+        let memory = GenerationMemory::from_index(&index, 0);
+        // 片段缺失（追踪图没拿到旧回答）时退化为实体+属性匹配。
+        let uris = memory.corrected_claim_uris("姚明", "身高", "");
+        assert_eq!(uris, vec![index.reply(4).unwrap().claims[0].uri.clone()]);
+        // 片段对不上任何回答（例如中间插了别的轮次），只要实体+属性仍在历史
+        // 命题里，就按兜底规则命中。
+        let uris = memory.corrected_claim_uris("姚明", "身高", "完全无关的旧回答");
+        assert_eq!(uris, vec![index.reply(4).unwrap().claims[0].uri.clone()]);
+    }
+
+    #[test]
+    fn corrected_claim_uris_skip_headers_and_require_anchors() {
+        let dir = TempDir::new().unwrap();
+        let (index, _session, _chronicle) = sample_index(&dir);
+        let memory = GenerationMemory::from_index(&index, 0);
+        // 无实体锚点：宁可空着也不猜。
+        assert!(memory
+            .corrected_claim_uris("", "身高", "姚明的身高是 226 厘米")
+            .is_empty());
+        let empty = GenerationMemory::empty("s");
+        assert!(empty.corrected_claim_uris("姚明", "身高", "").is_empty());
+
+        // 标题行（以冒号结尾）不是可撤回命题：片段锚定整条作废时也要排除。
+        let session_path = dir.path().join("header.session.json");
+        let session = DialogueSession::open_or_create(&session_path.to_string_lossy()).unwrap();
+        let chronicle_path = dir.path().join("header.chronicle.jsonl");
+        let (mut chronicle, audit) =
+            Chronicle::open(&chronicle_path.to_string_lossy(), FsyncPolicy::None).unwrap();
+        assert!(audit.is_clean());
+        chronicle
+            .append_turn_with_refs("叶莉的身高呢", "query", Some("叶莉"), 0, &[])
+            .unwrap();
+        chronicle
+            .append_reply(
+                "根据知识图谱：\n叶莉的身高是 190 厘米。",
+                &["direct_answer".to_string()],
+                &[],
+                &[],
+            )
+            .unwrap();
+        let header_index = DialogueArtifactIndex::from_chronicle(&session, &chronicle);
+        let header_memory = GenerationMemory::from_index(&header_index, 0);
+        // 追踪图的旧回答片段取首条实质行（跳过标题），命题里只剩实质行。
+        let uris = header_memory.corrected_claim_uris("叶莉", "身高", "叶莉的身高是 190 厘米");
+        let reply = header_index.reply(2).unwrap();
+        assert_eq!(
+            uris,
+            reply
+                .claims
+                .iter()
+                .filter(|claim| claim.text.contains("身高"))
+                .map(|claim| claim.uri.clone())
+                .collect::<Vec<_>>(),
+            "标题行不得进入更正负载"
+        );
+        assert_eq!(uris.len(), 1);
     }
 }
