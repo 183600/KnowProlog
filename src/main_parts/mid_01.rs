@@ -1975,3 +1975,66 @@ fn run_batch_teach(
         );
     }
 }
+
+#[cfg(test)]
+mod generation_recall_default_off_tests {
+    use super::*;
+    use std::env;
+    use std::path::Path;
+
+    async fn disabled_config() -> SystemConfig {
+        let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR 应设置");
+        let config_path = Path::new(&manifest_dir).join("config.toml");
+        let mut config =
+            load_config_from(config_path.to_str().unwrap()).await.expect("config.toml 应能加载");
+        config.generation_memory.enabled = false;
+        config
+    }
+
+    #[tokio::test]
+    async fn generation_recall_returns_none_when_disabled() {
+        let config = disabled_config().await;
+        assert!(!config.generation_memory.enabled, "配置默认关闭应生效");
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store_dir = dir.path().join("store");
+        let manager =
+            OxigraphManager::new(store_dir.to_str().unwrap()).expect("打开临时存储应成功");
+
+        let session_path = dir.path().join("dialogue.session.json");
+        let session = DialogueSession::open_or_create(
+            &session_path.to_string_lossy(),
+        )
+        .expect("会话标识打开应成功");
+
+        // 元话语问题在生成记忆关闭时不得读图、不得召回。
+        for question in [
+            "刚才聊了什么",
+            "回顾一下我们的对话",
+            "说过吗：姚明是谁",
+            "上一个回答的第1个命题是什么",
+            "当前焦点是谁",
+        ] {
+            let reply =
+                answer_generation_recall(&config, &manager, &session, question).await;
+            assert!(
+                reply.is_none(),
+                "生成记忆关闭时「{question}」必须返回 None，不得抢答元话语"
+            );
+        }
+
+        // 普通问句不受影响：classify 返回 None 即早退。
+        let reply = answer_generation_recall(&config, &manager, &session, "姚明多大？").await;
+        assert!(reply.is_none());
+
+        // 默认图不得被写入：三级守卫在 enabled=false 时直接返回，不触及命名图。
+        let default_graph = manager
+            .query_sparql("SELECT ?s WHERE { ?s ?p ?o }")
+            .await
+            .expect("SPARQL 查询默认图应成功");
+        assert!(
+            default_graph.data.is_empty(),
+            "生成记忆关闭时默认图必须保持干净"
+        );
+    }
+}
