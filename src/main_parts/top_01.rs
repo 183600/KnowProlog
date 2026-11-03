@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, Read, Write};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 // 从库（know_prolog）中导入所需的功能

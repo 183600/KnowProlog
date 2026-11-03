@@ -761,6 +761,43 @@ async fn run_interactive_mode(
         }
     }
 
+    // 共享的生成记忆：用 Arc<Mutex> 让闭包与循环都能访问最新值。
+    let generation_memory: Arc<Mutex<Option<generation_memory::GenerationMemory>>> = Arc::new(Mutex::new(None));
+    // 加载生成记忆并注入 already_said_check：跨重启记住已说过的命题，
+    // 使生成器不重复陈述；记忆为空时回调返回 false（允许生成）。
+    if generation_memory_enabled {
+        if let Some(session) = dialogue_session.as_ref() {
+            match oxigraph_manager.load_generation_memory(session.id()).await {
+                Ok(memory) => {
+                    if !memory.is_empty() {
+                        println!(
+                            "已恢复生成记忆：{} 轮、{} 条命题（RDF 命名图）。",
+                            memory.turn_count(),
+                            memory.claim_count()
+                        );
+                    }
+                    *generation_memory.lock().unwrap() = Some(memory);
+                }
+                Err(error) => {
+                    eprintln!("生成记忆读取失败（本轮不阻塞生成）：{}", error);
+                }
+            }
+        }
+    }
+    // 注入 already_said_check 到符号推理器：闭包捕获 Arc<Mutex>，
+    // 每轮同步后自动生效（闭包引用同一 Arc，循环内更新即可）。
+    if generation_memory_enabled {
+        let gen_mem = Arc::clone(&generation_memory);
+        symbolic_reasoner.set_already_said_check(Some(Box::new(move |text: &str| {
+            gen_mem
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|mem| mem.already_said(text))
+                .unwrap_or(false)
+        })));
+    }
+
     println!("{}", config.messages.ready);
     println!("{}", config.messages.query_prompt);
     println!("{}", config.messages.import_prompt);
@@ -792,7 +829,10 @@ async fn run_interactive_mode(
                         config.generation_memory.max_turns,
                     );
                     match oxigraph_manager.sync_generation_memory(&memory).await {
-                        Ok(_) => synced_chronicle_len = chronicle.len(),
+                        Ok(_) => {
+                            synced_chronicle_len = chronicle.len();
+                            *generation_memory.lock().unwrap() = Some(memory);
+                        }
                         Err(error) => {
                             eprintln!("生成记忆落图失败（下次重试）：{}", error);
                         }
