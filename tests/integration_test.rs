@@ -7,9 +7,7 @@ use tempfile::TempDir;
 // 假设这些模块在 src/lib.rs 中被导出
 use know_prolog::{
     create_prolog_rules, load_config,
-    nlp::{
-        analyze_query_intent, normalize_words, preprocess, TaggedWord,
-    },
+    nlp::{analyze_query_intent, normalize_words, preprocess, TaggedWord},
     nlu::NLUEngine,
     prolog_engine::{PrologEngine, PrologFact},
     KnowledgeExtractor, KnowledgeItem, OxigraphManager, ResponseFormatter,
