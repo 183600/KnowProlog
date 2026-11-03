@@ -303,6 +303,34 @@ fn log_chronicle_reply(
     }
 }
 
+/// 更正回答的 `corrects` 负载：从追踪图取最近一次值更正，在生成记忆里定位
+/// 被撤回的先前命题 URI。非更正回答（计划里没有 `trace_correction`）返回空表。
+///
+/// 失败语义（尽力而为，绝不阻塞回答）：会话/编年史缺失、追踪图没有更正记录、
+/// 生成记忆里定位不到命题时，一律返回空表，让回答照常落账。
+fn correction_targets(
+    dialogue_manager: &DialogueManager,
+    session: &Option<DialogueSession>,
+    chronicle: &Option<Chronicle>,
+    plan: &[String],
+) -> Vec<String> {
+    if !plan.iter().any(|step| step == "trace_correction") {
+        return Vec::new();
+    }
+    let (Some(session), Some(chronicle)) = (session.as_ref(), chronicle.as_ref()) else {
+        return Vec::new();
+    };
+    let Some(correction) = dialogue_manager.trace_store().corrections().last() else {
+        return Vec::new();
+    };
+    let memory = generation_memory::GenerationMemory::from_chronicle(session, chronicle, 0);
+    memory.corrected_claim_uris(
+        &correction.entity,
+        &correction.attribute,
+        &correction.previous,
+    )
+}
+
 /// 打印回答并写入编年史；若该回答文本已作为某条回答说过（按 `already_replied`），
 /// 或其全部命题单元均已作为某个回答的命题说过（按 `already_said`），
 /// 则改打印重复提示并不再重复落图，避免同一事实在不同轮次被连续输出。
