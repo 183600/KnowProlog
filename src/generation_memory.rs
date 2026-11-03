@@ -79,7 +79,7 @@ const P_CORRECTS: &str = "http://example.org/kg/ledger/dialogue/corrects";
 
 type MemoryResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// RDF 生成记忆配置（默认关闭；开启后每个轮次边界做一次有界投影）。
+/// RDF 生成记忆配置（默认开启；开启后每个轮次边界做一次有界投影）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationMemoryConfig {
     #[serde(default)]
