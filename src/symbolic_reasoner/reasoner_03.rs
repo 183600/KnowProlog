@@ -93,12 +93,12 @@ impl SymbolicReasoner {
         }
         let plan = self.build_answer_plan(&format!("介绍：{}", entity), &entity, &clauses);
         let mut cursor = GenerationCursor::new(&entity, GenerationOrder::Relevance);
-        let page = self.generator.cursor_page(
-            &entity,
-            GenerationOrder::Relevance,
-            &overlay,
-            &mut cursor,
-        )?;
+        // 已经过「已说过」过滤的命题必须直接用于分页渲染：
+        // cursor_page 内部会重新拉取未过滤的完整命题列表，过滤会被
+        // 绕过（test_generate_about_filters_already_said_claims 覆盖）。
+        let page = self
+            .generator
+            .cursor_page_from_clauses(&entity, &mut cursor, clauses)?;
         self.observe_epistemic_plan(&plan);
         self.remember_generation_plan(&plan);
         self.context.record_generation_with_plan(cursor, plan);

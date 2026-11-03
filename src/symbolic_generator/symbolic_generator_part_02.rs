@@ -1284,6 +1284,22 @@ impl SymbolicGenerator {
         cursor: &mut GenerationCursor,
     ) -> Option<CursorPage> {
         let clauses = self.profile_clauses_with_overlay(entity, order, overlay)?;
+        self.cursor_page_from_clauses(entity, cursor, clauses)
+    }
+
+    /// 用调用方给定的命题集合生成一页。
+    ///
+    /// 与 `cursor_page` 的唯一区别：命题列表由调用方提供。调用方可以
+    /// 先做会话级过滤（例如 reasoner 的「已说过命题」检查）再传入，
+    /// 分页推进、话语标记与可信句账本的行为与 `cursor_page` 完全一致；
+    /// 若直接用 `cursor_page`，其内部会重新拉取未过滤的完整命题列表，
+    /// 会话级过滤会被绕过。
+    pub fn cursor_page_from_clauses(
+        &self,
+        entity: &str,
+        cursor: &mut GenerationCursor,
+        clauses: Vec<ProfileClause>,
+    ) -> Option<CursorPage> {
         let advance = cursor.advance(&clauses, self.max_profile_sentences);
         let text = if advance.lines.is_empty() {
             if clauses.is_empty() {
