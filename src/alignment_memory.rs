@@ -309,11 +309,11 @@ pub struct AlignmentRule {
 impl AlignmentRule {
     pub fn is_active_at(&self, turn: u64) -> bool {
         self.status == AlignmentStatus::Active
-            && self.expires_turn.map_or(true, |expires| turn <= expires)
+            && self.expires_turn.is_none_or(|expires| turn <= expires)
     }
 
     pub fn is_expired_at(&self, turn: u64) -> bool {
-        self.expires_turn.map_or(false, |expires| turn > expires)
+        self.expires_turn.is_some_and(|expires| turn > expires)
     }
 
     pub fn matches_literal(&self, surface: &str) -> bool {
