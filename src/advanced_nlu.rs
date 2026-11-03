@@ -764,7 +764,7 @@ impl AdvancedNLU {
         entities.extend(self.extract_number_entities(query).await?);
 
         // 去重和排序
-        entities.sort_by(|a, b| a.start_pos.cmp(&b.start_pos));
+        entities.sort_by_key(|a| a.start_pos);
         self.remove_overlapping_entities(&mut entities);
 
         Ok(entities)
