@@ -1243,7 +1243,7 @@ pub fn render_report(report: &AbductionReport, render: &dyn Fn(&Atom) -> String)
         let frontier = report
             .frontier
             .iter()
-            .map(|atom| render(atom))
+            .map(render)
             .collect::<Vec<_>>()
             .join("；");
         output.push_str(&format!("  失败前沿（缺少的前提）：{}\n", frontier));
@@ -1301,7 +1301,7 @@ pub fn render_scenarios(
     if !frontier.is_empty() {
         let frontier_text = frontier
             .iter()
-            .map(|atom| render(atom))
+            .map(render)
             .collect::<Vec<_>>()
             .join("；");
         output.push_str(&format!("  失败前沿（缺少的前提）：{}\n", frontier_text));
@@ -1443,7 +1443,7 @@ pub fn render_what_if(result: &WhatIfResult, render: &dyn Fn(&Atom) -> String) -
     let assumptions = result
         .assumptions
         .iter()
-        .map(|atom| render(atom))
+        .map(render)
         .collect::<Vec<_>>()
         .join("；");
     let mut output = format!(
