@@ -303,7 +303,8 @@ fn log_chronicle_reply(
 }
 
 /// 打印回答并写入编年史；若该回答文本已作为某条回答说过（按 `already_replied`），
-/// 则改打印重复提示并不再重复落图，避免同一答案在同一轮内被连续输出。
+/// 或其全部命题单元均已作为某个回答的命题说过（按 `already_said`），
+/// 则改打印重复提示并不再重复落图，避免同一事实在不同轮次被连续输出。
 fn emit_reply(
     chronicle: &mut Option<Chronicle>,
     session: &Option<DialogueSession>,
@@ -317,7 +318,21 @@ fn emit_reply(
         .and_then(|c| session.as_ref().map(|s| (c, s)))
         .map(|(chronicle, session)| {
             let memory = generation_memory::GenerationMemory::from_chronicle(session, chronicle, 0);
-            memory.already_replied(answer_str)
+            // 快速路径：整条回答文本是否已作为某条回答的完整正文说过。
+            if memory.already_replied(answer_str) {
+                return true;
+            }
+            // 按命题单元逐条检查：所有子句都已作为某个回答的命题说过，则视为重复。
+            let units: Vec<&str> = answer_str
+                .lines()
+                .map(|line| line.trim())
+                .filter(|line| !line.is_empty())
+                .collect();
+            if units.is_empty() {
+                false
+            } else {
+                units.iter().all(|unit| memory.already_said(unit))
+            }
         })
         .unwrap_or(false);
     if is_repeat {
