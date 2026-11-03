@@ -166,7 +166,7 @@ async fn test_30_sample_questions() {
     println!("==========================================");
 
     let mut successful_classifications = 0;
-    let mut total_questions = questions.len();
+    let total_questions = questions.len();
 
     for (i, (question, expected_type, expected_domain)) in questions.iter().enumerate() {
         println!("\n{}. 问题: {}", i + 1, question);

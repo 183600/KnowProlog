@@ -1,6 +1,3 @@
-use oxigraph::model::*;
-use oxigraph::sparql::{Query, QueryResults};
-use oxigraph::store::Store;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -11,8 +8,7 @@ use tempfile::TempDir;
 use know_prolog::{
     create_prolog_rules, load_config,
     nlp::{
-        analyze_query_intent, normalize_words, pattern_from_strings, preprocess, PrologRule,
-        TaggedWord,
+        analyze_query_intent, normalize_words, preprocess, TaggedWord,
     },
     nlu::NLUEngine,
     prolog_engine::{PrologEngine, PrologFact},
@@ -347,33 +343,6 @@ async fn test_query_intent_analysis() {
     ];
     let manual_result2 = analyze_query_intent(&manual_tagged2, &prolog_rules);
 
-    // 尝试另一种模式 - 与实际分词结果匹配
-    let realistic_tagged2 = vec![
-        TaggedWord {
-            text: "张".to_string(),
-            pos: "unknown".to_string(),
-        },
-        TaggedWord {
-            text: "三".to_string(),
-            pos: "unknown".to_string(),
-        },
-        TaggedWord {
-            text: "和".to_string(),
-            pos: "unknown".to_string(),
-        },
-        TaggedWord {
-            text: "李四".to_string(),
-            pos: "nr".to_string(),
-        },
-        TaggedWord {
-            text: "什么".to_string(),
-            pos: "r".to_string(),
-        },
-        TaggedWord {
-            text: "关系".to_string(),
-            pos: "unknown".to_string(),
-        },
-    ];
     // 对于这种情况，可能不匹配现有规则，所以我们跳过这个测试
 
     let final_result2 = result2.or(manual_result2);
