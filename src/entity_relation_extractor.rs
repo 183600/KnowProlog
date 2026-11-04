@@ -5,6 +5,178 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+/// Common surname characters used for person name recognition
+const COMMON_SURNAMES: &str = "王李张刘陈杨黄赵吴周徐孙马朱胡郭何高林罗郑梁谢宋唐许韩冯邓曹彭曾肖田董潘袁蒋蔡余杜叶程苏魏吕丁任沈姚卢姜崔钟谭陆汪范金石廖贾夏韦付方白邹孟熊秦邱江尹薛闫段雷侯龙史陶黎贺顾毛郝龚邵万钱严覃武戴莫孔向汤";
+
+/// Regex pattern for person name recognition: surname + 1-3 non-function chars
+const COMMON_PERSON_PATTERN: &str =
+    r"[王李张刘陈杨黄赵吴周徐孙马朱胡郭何高林罗郑梁谢宋唐许韩冯邓曹彭曾肖田董潘袁蒋蔡余杜叶程苏魏吕丁任沈姚卢姜崔钟谭陆汪范金石廖贾夏韦付方白邹孟熊秦邱江尹薛闫段雷侯龙史陶黎贺顾毛郝龚邵万钱严覃武戴莫孔向汤][^的了是在有和与及把被给对从向为以于而且或但吗呢吧啊，。！？；：、\s]{1,3}";
+
+/// Organization recognition patterns
+const ORG_PATTERNS: &[&str] = &[
+    r".+公司",
+    r".+集团",
+    r".+学院",
+    r".+大学",
+    r".+研究所",
+    r".+医院",
+];
+
+/// Organization context keywords
+const ORG_KEYWORDS: &[&str] = &[
+    "公司", "集团", "企业", "学校", "大学", "医院", "银行",
+];
+
+/// Location recognition patterns
+const LOC_PATTERNS: &[&str] = &[
+    r".+省",
+    r".+市",
+    r".+县",
+    r".+区",
+    r".+镇",
+    r".+村",
+];
+
+/// Location context keywords
+const LOC_KEYWORDS: &[&str] = &[
+    "省", "市", "县", "区", "位于", "坐落", "地处",
+];
+
+/// Concept recognition patterns
+const CONCEPT_PATTERNS: &[&str] = &[
+    r".+主义",
+    r".+理论",
+    r".+方法",
+    r".+技术",
+    r".+系统",
+];
+
+/// Concept context keywords
+const CONCEPT_KEYWORDS: &[&str] = &[
+    "理论", "概念", "方法", "技术", "系统", "原理", "思想",
+];
+
+/// Extraction patterns (regex-based relation extraction)
+const EXTRACTION_PATTERNS: &[(&str, &str, usize, usize, &str, &[&str])] = &[
+    (
+        "is_a_pattern",
+        r"(.+?)是(.+)",
+        1,
+        2,
+        "是",
+        &["刘德华是演员", "苹果是水果"],
+    ),
+    (
+        "born_in_pattern",
+        r"(.+?)出生于(.+)",
+        1,
+        2,
+        "出生于",
+        &["刘德华出生于香港"],
+    ),
+    (
+        "work_for_pattern",
+        r"(.+?)在(.+?)工作",
+        1,
+        2,
+        "工作于",
+        &["张三在苹果公司工作"],
+    ),
+    (
+        "located_in_pattern",
+        r"(.+?)位于(.+)",
+        1,
+        2,
+        "位于",
+        &["北京大学位于北京"],
+    ),
+    (
+        "founded_by_pattern",
+        r"(.+?)由(.+?)创立",
+        1,
+        2,
+        "由...创立",
+        &["苹果公司由乔布斯创立"],
+    ),
+    (
+        "has_property_pattern",
+        r"(.+?)的(.+?)是(.+)",
+        1,
+        3,
+        "的{2}是",
+        &["刘德华的年龄是60岁"],
+    ),
+    (
+        "member_of_pattern",
+        r"(.+?)是(.+?)的成员",
+        1,
+        2,
+        "是...的成员",
+        &["张三是研发团队的成员"],
+    ),
+    (
+        "owns_pattern",
+        r"(.+?)拥有(.+)",
+        1,
+        2,
+        "拥有",
+        &["公司拥有多项专利"],
+    ),
+    (
+        "married_to_pattern",
+        r"(.+?)与(.+?)结婚",
+        1,
+        2,
+        "与...结婚",
+        &["张三与李四结婚"],
+    ),
+    (
+        "graduated_from_pattern",
+        r"(.+?)毕业于(.+)",
+        1,
+        2,
+        "毕业于",
+        &["张三毕业于清华大学"],
+    ),
+];
+
+/// Relation keywords mapping
+const RELATION_KEYWORDS: &[(&str, &[&str])] = &[
+    (
+        "is_a",
+        &["是", "为", "属于", "作为"],
+    ),
+    (
+        "work_for",
+        &["工作", "就职", "任职", "服务", "供职", "受雇"],
+    ),
+    (
+        "located_in",
+        &["位于", "在", "坐落", "地处", "处于", "设在"],
+    ),
+    (
+        "has_property",
+        &["有", "具有", "拥有", "包含", "含有", "带有"],
+    ),
+    (
+        "born_in",
+        &["出生", "诞生", "生于"],
+    ),
+    (
+        "founded_by",
+        &["创立", "创建", "建立", "成立", "创办", "设立"],
+    ),
+];
+
+/// Dependency pattern configuration
+const DEPENDENCY_PATTERNS: &[(&str, &[&str], &[&str], &[&str], &[(&str, &str)])] = &[(
+    "subject_verb_object",
+    &["n", "nr", "ns"],
+    &["v", "vn"],
+    &["n", "nr", "ns"],
+    &[("是", "is_a"), ("工作", "work_for"), ("位于", "located_in")],
+)];
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntityExtraction {
     pub entity: String,
@@ -123,25 +295,37 @@ impl EntityRelationExtractor {
     fn initialize_default_types(&self) {
         let mut types = self.entity_types.write();
 
-        // 人物类型
-        types.insert("PERSON".to_string(), EntityType {
-            name: "PERSON".to_string(),
-            aliases: vec!["人物".to_string(), "人".to_string(), "个人".to_string()],
-            parent_types: vec!["ENTITY".to_string()],
-            properties: vec![
-                "姓名".to_string(), "年龄".to_string(), "职业".to_string(), "出生地".to_string(),
-                "教育背景".to_string(), "工作单位".to_string(), "家庭关系".to_string(),
-            ],
-            recognition_patterns: vec![
-                r"[王李张刘陈杨黄赵吴周徐孙马朱胡郭何高林罗郑梁谢宋唐许韩冯邓曹彭曾肖田董潘袁蒋蔡余杜叶程苏魏吕丁任沈姚卢姜崔钟谭陆汪范金石廖贾夏韦付方白邹孟熊秦邱江尹薛闫段雷侯龙史陶黎贺顾毛郝龚邵万钱严覃武戴莫孔向汤][^的了是在有和与及把被给对从向为以于而且或但吗呢吧啊，。！？；：、\s]{1,3}".to_string(),
-            ],
-            context_keywords: vec![
-                "先生".to_string(), "女士".to_string(), "老师".to_string(), "教授".to_string(),
-                "博士".to_string(), "演员".to_string(), "歌手".to_string(), "导演".to_string(),
-            ],
-        });
+        // Person type
+        types.insert(
+            "PERSON".to_string(),
+            EntityType {
+                name: "PERSON".to_string(),
+                aliases: vec!["人物".to_string(), "人".to_string(), "个人".to_string()],
+                parent_types: vec!["ENTITY".to_string()],
+                properties: vec![
+                    "姓名".to_string(),
+                    "年龄".to_string(),
+                    "职业".to_string(),
+                    "出生地".to_string(),
+                    "教育背景".to_string(),
+                    "工作单位".to_string(),
+                    "家庭关系".to_string(),
+                ],
+                recognition_patterns: vec![COMMON_PERSON_PATTERN.to_string()],
+                context_keywords: vec![
+                    "先生".to_string(),
+                    "女士".to_string(),
+                    "老师".to_string(),
+                    "教授".to_string(),
+                    "博士".to_string(),
+                    "演员".to_string(),
+                    "歌手".to_string(),
+                    "导演".to_string(),
+                ],
+            },
+        );
 
-        // 组织类型
+        // Organization type
         types.insert(
             "ORGANIZATION".to_string(),
             EntityType {
@@ -157,27 +341,12 @@ impl EntityRelationExtractor {
                     "业务范围".to_string(),
                     "领导人".to_string(),
                 ],
-                recognition_patterns: vec![
-                    r".+公司".to_string(),
-                    r".+集团".to_string(),
-                    r".+学院".to_string(),
-                    r".+大学".to_string(),
-                    r".+研究所".to_string(),
-                    r".+医院".to_string(),
-                ],
-                context_keywords: vec![
-                    "公司".to_string(),
-                    "集团".to_string(),
-                    "企业".to_string(),
-                    "学校".to_string(),
-                    "大学".to_string(),
-                    "医院".to_string(),
-                    "银行".to_string(),
-                ],
+                recognition_patterns: ORG_PATTERNS.iter().map(|s| s.to_string()).collect(),
+                context_keywords: ORG_KEYWORDS.iter().map(|s| s.to_string()).collect(),
             },
         );
 
-        // 地点类型
+        // Location type
         types.insert(
             "LOCATION".to_string(),
             EntityType {
@@ -193,27 +362,12 @@ impl EntityRelationExtractor {
                     "气候".to_string(),
                     "特产".to_string(),
                 ],
-                recognition_patterns: vec![
-                    r".+省".to_string(),
-                    r".+市".to_string(),
-                    r".+县".to_string(),
-                    r".+区".to_string(),
-                    r".+镇".to_string(),
-                    r".+村".to_string(),
-                ],
-                context_keywords: vec![
-                    "省".to_string(),
-                    "市".to_string(),
-                    "县".to_string(),
-                    "区".to_string(),
-                    "位于".to_string(),
-                    "坐落".to_string(),
-                    "地处".to_string(),
-                ],
+                recognition_patterns: LOC_PATTERNS.iter().map(|s| s.to_string()).collect(),
+                context_keywords: LOC_KEYWORDS.iter().map(|s| s.to_string()).collect(),
             },
         );
 
-        // 概念类型
+        // Concept type
         types.insert(
             "CONCEPT".to_string(),
             EntityType {
@@ -228,22 +382,8 @@ impl EntityRelationExtractor {
                     "相关概念".to_string(),
                     "历史".to_string(),
                 ],
-                recognition_patterns: vec![
-                    r".+主义".to_string(),
-                    r".+理论".to_string(),
-                    r".+方法".to_string(),
-                    r".+技术".to_string(),
-                    r".+系统".to_string(),
-                ],
-                context_keywords: vec![
-                    "理论".to_string(),
-                    "概念".to_string(),
-                    "方法".to_string(),
-                    "技术".to_string(),
-                    "系统".to_string(),
-                    "原理".to_string(),
-                    "思想".to_string(),
-                ],
+                recognition_patterns: CONCEPT_PATTERNS.iter().map(|s| s.to_string()).collect(),
+                context_keywords: CONCEPT_KEYWORDS.iter().map(|s| s.to_string()).collect(),
             },
         );
     }
@@ -251,185 +391,51 @@ impl EntityRelationExtractor {
     fn initialize_extraction_patterns(&self) {
         let mut patterns = self.extraction_patterns.write();
 
-        // 基本关系模式
-        patterns.extend(vec![
-            ExtractionPattern {
-                name: "is_a_pattern".to_string(),
-                pattern: r"(.+?)是(.+)".to_string(),
-                relation_type: "is_a".to_string(),
-                subject_group: 1,
-                object_group: 2,
-                predicate_template: "是".to_string(),
-                examples: vec!["刘德华是演员".to_string(), "苹果是水果".to_string()],
-            },
-            ExtractionPattern {
-                name: "born_in_pattern".to_string(),
-                pattern: r"(.+?)出生于(.+)".to_string(),
-                relation_type: "born_in".to_string(),
-                subject_group: 1,
-                object_group: 2,
-                predicate_template: "出生于".to_string(),
-                examples: vec!["刘德华出生于香港".to_string()],
-            },
-            ExtractionPattern {
-                name: "work_for_pattern".to_string(),
-                pattern: r"(.+?)在(.+?)工作".to_string(),
-                relation_type: "work_for".to_string(),
-                subject_group: 1,
-                object_group: 2,
-                predicate_template: "工作于".to_string(),
-                examples: vec!["张三在苹果公司工作".to_string()],
-            },
-            ExtractionPattern {
-                name: "located_in_pattern".to_string(),
-                pattern: r"(.+?)位于(.+)".to_string(),
-                relation_type: "located_in".to_string(),
-                subject_group: 1,
-                object_group: 2,
-                predicate_template: "位于".to_string(),
-                examples: vec!["北京大学位于北京".to_string()],
-            },
-            ExtractionPattern {
-                name: "founded_by_pattern".to_string(),
-                pattern: r"(.+?)由(.+?)创立".to_string(),
-                relation_type: "founded_by".to_string(),
-                subject_group: 1,
-                object_group: 2,
-                predicate_template: "由...创立".to_string(),
-                examples: vec!["苹果公司由乔布斯创立".to_string()],
-            },
-            ExtractionPattern {
-                name: "has_property_pattern".to_string(),
-                pattern: r"(.+?)的(.+?)是(.+)".to_string(),
-                relation_type: "has_property".to_string(),
-                subject_group: 1,
-                object_group: 3,
-                predicate_template: "的{2}是".to_string(),
-                examples: vec!["刘德华的年龄是60岁".to_string()],
-            },
-            ExtractionPattern {
-                name: "member_of_pattern".to_string(),
-                pattern: r"(.+?)是(.+?)的成员".to_string(),
-                relation_type: "member_of".to_string(),
-                subject_group: 1,
-                object_group: 2,
-                predicate_template: "是...的成员".to_string(),
-                examples: vec!["张三是研发团队的成员".to_string()],
-            },
-            ExtractionPattern {
-                name: "owns_pattern".to_string(),
-                pattern: r"(.+?)拥有(.+)".to_string(),
-                relation_type: "owns".to_string(),
-                subject_group: 1,
-                object_group: 2,
-                predicate_template: "拥有".to_string(),
-                examples: vec!["公司拥有多项专利".to_string()],
-            },
-            ExtractionPattern {
-                name: "married_to_pattern".to_string(),
-                pattern: r"(.+?)与(.+?)结婚".to_string(),
-                relation_type: "married_to".to_string(),
-                subject_group: 1,
-                object_group: 2,
-                predicate_template: "与...结婚".to_string(),
-                examples: vec!["张三与李四结婚".to_string()],
-            },
-            ExtractionPattern {
-                name: "graduated_from_pattern".to_string(),
-                pattern: r"(.+?)毕业于(.+)".to_string(),
-                relation_type: "graduated_from".to_string(),
-                subject_group: 1,
-                object_group: 2,
-                predicate_template: "毕业于".to_string(),
-                examples: vec!["张三毕业于清华大学".to_string()],
-            },
-        ]);
+        patterns.extend(
+            EXTRACTION_PATTERNS
+                .iter()
+                .map(|(name, pattern, subj_grp, obj_grp, pred_tmpl, examples)| {
+                    ExtractionPattern {
+                        name: name.to_string(),
+                        pattern: pattern.to_string(),
+                        relation_type: name.strip_suffix("_pattern").unwrap_or(name).to_string(),
+                        subject_group: *subj_grp,
+                        object_group: *obj_grp,
+                        predicate_template: pred_tmpl.to_string(),
+                        examples: examples.iter().map(|s| s.to_string()).collect(),
+                    }
+                }),
+        );
     }
 
     fn initialize_relation_keywords(&self) {
         let mut keywords = self.relation_keywords.write();
 
-        keywords.insert(
-            "is_a".to_string(),
-            vec![
-                "是".to_string(),
-                "为".to_string(),
-                "属于".to_string(),
-                "作为".to_string(),
-            ],
-        );
-
-        keywords.insert(
-            "work_for".to_string(),
-            vec![
-                "工作".to_string(),
-                "就职".to_string(),
-                "任职".to_string(),
-                "服务".to_string(),
-                "供职".to_string(),
-                "受雇".to_string(),
-            ],
-        );
-
-        keywords.insert(
-            "located_in".to_string(),
-            vec![
-                "位于".to_string(),
-                "在".to_string(),
-                "坐落".to_string(),
-                "地处".to_string(),
-                "处于".to_string(),
-                "设在".to_string(),
-            ],
-        );
-
-        keywords.insert(
-            "has_property".to_string(),
-            vec![
-                "有".to_string(),
-                "具有".to_string(),
-                "拥有".to_string(),
-                "包含".to_string(),
-                "含有".to_string(),
-                "带有".to_string(),
-            ],
-        );
-
-        keywords.insert(
-            "born_in".to_string(),
-            vec!["出生".to_string(), "诞生".to_string(), "生于".to_string()],
-        );
-
-        keywords.insert(
-            "founded_by".to_string(),
-            vec![
-                "创立".to_string(),
-                "创建".to_string(),
-                "建立".to_string(),
-                "成立".to_string(),
-                "创办".to_string(),
-                "设立".to_string(),
-            ],
-        );
+        for (rel_type, kw_list) in RELATION_KEYWORDS {
+            keywords.insert(
+                rel_type.to_string(),
+                kw_list.iter().map(|s| s.to_string()).collect(),
+            );
+        }
     }
 
     fn initialize_dependency_patterns(&self) {
         let mut patterns = self.dependency_patterns.write();
 
-        patterns.extend(vec![DependencyPattern {
-            pattern_name: "subject_verb_object".to_string(),
-            subject_pos: vec!["n".to_string(), "nr".to_string(), "ns".to_string()],
-            verb_pos: vec!["v".to_string(), "vn".to_string()],
-            object_pos: vec!["n".to_string(), "nr".to_string(), "ns".to_string()],
-            relation_mapping: [
-                ("是".to_string(), "is_a".to_string()),
-                ("工作".to_string(), "work_for".to_string()),
-                ("位于".to_string(), "located_in".to_string()),
-            ]
-            .iter()
-            .cloned()
-            .collect(),
-        }]);
+        patterns.extend(
+            DEPENDENCY_PATTERNS.iter().map(
+                |(pname, subj_pos, verb_pos, obj_pos, rel_map)| DependencyPattern {
+                    pattern_name: pname.to_string(),
+                    subject_pos: subj_pos.iter().map(|s| s.to_string()).collect(),
+                    verb_pos: verb_pos.iter().map(|s| s.to_string()).collect(),
+                    object_pos: obj_pos.iter().map(|s| s.to_string()).collect(),
+                    relation_mapping: rel_map
+                        .iter()
+                        .map(|(k, v)| (k.to_string(), v.to_string()))
+                        .collect(),
+                },
+            ),
+        );
     }
 
     pub async fn extract_entities_and_relations(
@@ -1320,8 +1326,7 @@ impl EntityRelationExtractor {
 }
 
 fn is_common_surname(ch: char) -> bool {
-    "王李张刘陈杨黄赵吴周徐孙马朱胡郭何高林罗郑梁谢宋唐许韩冯邓曹彭曾肖田董潘袁蒋蔡余杜叶程苏魏吕丁任沈姚卢姜崔钟谭陆汪范金石廖贾夏韦付方白邹孟熊秦邱江尹薛闫段雷侯龙史陶黎贺顾毛郝龚邵万钱严覃武戴莫孔向汤"
-        .contains(ch)
+    COMMON_SURNAMES.contains(ch)
 }
 
 impl Default for EntityRelationExtractor {

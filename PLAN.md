@@ -1,4 +1,4 @@
-# KnowProlog 开发计划
+# KnowProlog 维护者设计文档
 
 本文档面向维护者，说明项目目标、运行方式、模块边界、质量门禁与后续路线。
 它描述当前设计约定与工作方法，不记录历史变更。
@@ -82,7 +82,7 @@ KnowProlog 把中文文本转成可查询、可推理、可追溯的知识图谱
 
 | 层 | 主要模块 | 职责 |
 | --- | --- | --- |
-| 交互 | `src/main_parts/`、`src/serve_api/` | CLI 子命令、交互循环、HTTP 服务与结果渲染 |
+| 交互 | `src/main_parts/`、`src/serve_api.rs` | CLI 子命令、交互循环、HTTP 服务与结果渲染 |
 | 语言 | `src/nlp.rs`、`src/question_analyzer.rs`、`src/advanced_nlu.rs` | 分词、词性、同义词归一化、问句分类与关键词 |
 | 抽取 | `src/entity_relation_extractor.rs`、`src/lib/` | 实体、关系、属性的模式抽取与 JSON-LD 导入 |
 | 存储 | `OxigraphManager`（`src/lib/`） | RDF 三元组读写、SPARQL 查询、事实导出 |
@@ -109,11 +109,11 @@ KnowProlog 把中文文本转成可查询、可推理、可追溯的知识图谱
    │                                      └── 失败：不写半批，不推进版本
    │
    └── 查询模式 ──► 意图与实体 ──► 查询计划 ──► Prolog / SPARQL
-                                                │
-                          ┌─────────────────────┼─────────────────────┐
-                          ▼                     ▼                     ▼
-                       有解                  无解                引擎故障
-                   渲染绑定与证据      明确说「没有记录」      保留错误并上报
+                                                    │
+                              ┌─────────────────────┼─────────────────────┐
+                              ▼                     ▼                     ▼
+                           有解                  无解                引擎故障
+                       渲染绑定与证据      明确说「没有记录」      保留错误并上报
 ```
 
 关键约定：
@@ -128,7 +128,7 @@ KnowProlog 把中文文本转成可查询、可推理、可追溯的知识图谱
 
 | 文件 | 作用 |
 | --- | --- |
-| `config.toml` | 系统、NLP、实体类型、抽取规则、查询规则与文案 |
+| `config.toml` | 系统、NLP、实体类型、抽取规则、查询规则、谓词画像、类型体系、插件、对话帧等 |
 | `knowledge_base*.txt` | 基础与扩展中文语料 |
 | `additional_knowledge.txt` | 追加知识 |
 | `comprehensive_knowledge_expansion.txt` | 综合扩展语料 |
@@ -190,6 +190,27 @@ range = ["人物"]
 谓词画像负责别名归一、互逆方向、传递闭包与定义域/值域校验；导入与查询
 共用同一套画像，避免两边各自解释。功能谓词与对称谓词也应在此声明，让冲突
 检测与方向换算有统一依据。
+
+### 6.4 类型体系
+
+```toml
+[type_system]
+closure_gate = true
+
+[[type_system.aliases]]
+alias = "Person"
+canonical = "人物"
+
+[[type_system.subclasses]]
+sub = "人物"
+sup = "实体"
+
+[[type_system.disjoint]]
+left = "人物"
+right = "地点"
+```
+
+用于实体类型的别名归一、子类闭包与互斥判定；模式闸门按「别名 + 子类 + 互斥」三重证据决定是否放行。
 
 ## 7. 质量门禁
 
