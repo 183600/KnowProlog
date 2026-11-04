@@ -459,6 +459,7 @@ impl AlignmentMemory {
     }
 
     /// 学习一次「词面 ↔ 规范身份」对齐。同形不同目标的字面规则不静默替换。
+    #[allow(clippy::too_many_arguments)]
     pub fn learn_pair(
         &mut self,
         turn: u64,
