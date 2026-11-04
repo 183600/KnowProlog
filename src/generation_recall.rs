@@ -216,14 +216,29 @@ pub fn recall_intent(memory: &GenerationMemory, intent: RecallIntent) -> RecallR
 }
 
 /// 会话回顾：计数 + 最近若干轮的问答切片 + 当前焦点；空记忆显式说明。
+///
+/// 有界投影不得谎称「本会话共 N 轮」：投影收据记录了丢弃的轮次，
+/// 措辞必须披露「另有 K 轮更早轮次不在记忆中」。
 fn render_recap(memory: &GenerationMemory) -> String {
     if memory.is_empty() {
         return "生成记忆里还没有投影任何轮次；先用「dialogue-memory --sync」从编年史投影，再问这句话。"
             .to_string();
     }
+    let scope = match memory.projection.as_ref() {
+        Some(receipt) if receipt.dropped_turns.is_empty() => {
+            format!("本会话共 {} 轮", memory.turn_count())
+        }
+        Some(receipt) => format!(
+            "投影保留最近 {} 轮（编年史共 {} 轮，另有 {} 轮更早轮次不在记忆中）",
+            receipt.kept_turns.len(),
+            receipt.source_turns,
+            receipt.dropped_turns.len()
+        ),
+        None => format!("本会话共 {} 轮", memory.turn_count()),
+    };
     let mut text = format!(
-        "生成记忆回顾（RDF 命名图）：本会话共 {} 轮、{} 条回答、{} 条命题、{} 条依据。",
-        memory.turn_count(),
+        "生成记忆回顾（RDF 命名图）：{}、{} 条回答、{} 条命题、{} 条依据。",
+        scope,
         memory.reply_count(),
         memory.claim_count(),
         memory.evidence_count()
@@ -286,10 +301,23 @@ fn render_said(memory: &GenerationMemory, target: Option<&str>) -> String {
             ),
             None => format!("这句话说过：第 {} 点——「{}」。", claim.index, claim.text),
         },
-        None => format!(
-            "这句话在本会话的生成记忆里没有说过（已检索 {} 条命题）。",
-            memory.claim_count()
-        ),
+        None => {
+            // 有界投影下「没有说过」必须披露检索范围：更早轮次不在记忆里，
+            // 未命中不等于从未说过。
+            let bound = match memory.projection.as_ref() {
+                Some(receipt) if !receipt.dropped_turns.is_empty() => format!(
+                    "；记忆为最近 {} 轮的有界投影，更早 {} 轮不在检索范围",
+                    receipt.kept_turns.len(),
+                    receipt.dropped_turns.len()
+                ),
+                _ => String::new(),
+            };
+            format!(
+                "这句话在本会话的生成记忆里没有说过（已检索 {} 条命题{}）。",
+                memory.claim_count(),
+                bound
+            )
+        }
     }
 }
 
@@ -807,6 +835,66 @@ mod tests {
 
         let focus = recall(&memory, "当前焦点是谁").unwrap();
         assert!(focus.text.contains("「姚明」"), "{}", focus.text);
+    }
+
+    #[test]
+    fn bounded_projection_recap_and_said_disclose_the_window() {
+        let dir = TempDir::new().unwrap();
+        let session_path = dir.path().join("dialogue.session.json");
+        let session = DialogueSession::open_or_create(&session_path.to_string_lossy()).unwrap();
+        let chronicle_path = dir.path().join("dialogue.chronicle.jsonl");
+        let (mut chronicle, audit) =
+            Chronicle::open(&chronicle_path.to_string_lossy(), FsyncPolicy::None).unwrap();
+        assert!(audit.is_clean());
+        chronicle
+            .append_turn_with_refs(
+                "姚明是谁",
+                "query",
+                None,
+                0,
+                &[EntityRef::linked("姚明", "姚明")],
+            )
+            .unwrap();
+        chronicle
+            .append_reply("姚明是篮球运动员。", &[], &[], &[])
+            .unwrap();
+        chronicle
+            .append_turn_with_refs("他的身高呢", "query", Some("姚明"), 1, &[])
+            .unwrap();
+        chronicle
+            .append_reply("姚明的身高是 226 厘米。", &[], &[], &[])
+            .unwrap();
+        let index = DialogueArtifactIndex::from_chronicle(&session, &chronicle);
+        let memory = GenerationMemory::from_index(&index, 1);
+
+        // 有界投影的回顾不得谎称「本会话共 1 轮」。
+        let recap = recall(&memory, "我们刚才聊了点什么").unwrap();
+        assert!(
+            recap.text.contains("投影保留最近 1 轮"),
+            "{}",
+            recap.text
+        );
+        assert!(
+            recap.text.contains("编年史共 2 轮，另有 1 轮更早轮次不在记忆中"),
+            "{}",
+            recap.text
+        );
+
+        // 「没有说过」在有界投影下必须披露检索范围。
+        let miss = recall(&memory, "说过吗：姚明是篮球运动员").unwrap();
+        assert!(miss.text.contains("没有说过"), "{}", miss.text);
+        assert!(
+            miss.text.contains("更早 1 轮不在检索范围"),
+            "{}",
+            miss.text
+        );
+
+        // 无丢弃的投影沿用「本会话共 N 轮」。
+        let full = GenerationMemory::from_index(&index, 0);
+        let full_recap = recall(&full, "我们刚才聊了点什么").unwrap();
+        assert!(full_recap.text.contains("本会话共 2 轮"), "{}", full_recap.text);
+        let full_miss = recall(&full, "说过吗：姚明是足球运动员").unwrap();
+        assert!(!full_miss.text.contains("有界投影"), "{}", full_miss.text);
     }
 
     #[test]
