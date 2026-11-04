@@ -371,22 +371,6 @@ pub fn session_graph_prefix(session: &str) -> String {
     )
 }
 
-/// 会话生成记忆的命名图 IRI 集合（用于 SPARQL GRAPH 子句）。
-/// 返回最近 `max_turns` 轮的图 IRI，`0` 表示全部。
-/// 这提供了一个有界的图集合，防止查询膨胀至全会话图。
-pub fn session_graph_iris(max_turns: usize, session: &str) -> Vec<String> {
-    let prefix = session_graph_prefix(session);
-    if max_turns == 0 {
-        // 完整列表由 OxigraphManager::generation_memory_graphs 从 store 实时获取
-        // 此处返回占位，实际查询由 manager 层处理
-        vec![]
-    } else {
-        (1..=max_turns)
-            .map(|seq| format!("{}turn/{}", prefix, seq))
-            .collect()
-    }
-}
-
 /// 轮次命名图 IRI。
 pub fn turn_graph_iri(session: &str, turn_seq: u64) -> String {
     format!("{}turn/{}", session_graph_prefix(session), turn_seq)
