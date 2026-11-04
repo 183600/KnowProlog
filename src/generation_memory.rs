@@ -112,6 +112,65 @@ pub fn already_said_sparql_query(session: &str, text: &str, max_turns: usize) ->
     }
 }
 
+/// 构建 SPARQL SELECT 查询，用于列出会话中所有已说的命题文本。
+///
+/// 返回的查询字符串可直接传给 `oxigraph_manager.query_sparql()` 执行，
+/// 结果将包含 `(?digest, ?text)` 元组，其中 `?digest` 是命题的内容摘要（MD5/FFFV1a 哈希），
+/// `?text` 是命题的完整文本。
+pub fn list_all_claims_sparql(session: &str, max_turns: usize) -> String {
+    let prefix = session_graph_prefix(session);
+    if max_turns == 0 {
+        // 搜索全部轮次：遍历所有 turn 图
+        format!(
+            "SELECT ?digest ?text WHERE {{ GRAPH ?g {{ ?s a <{}> . ?s <{}> ?digest . ?s <{}> ?text . }} }}",
+            TURN_CLASS, P_DIGEST, P_TEXT
+        )
+    } else {
+        // 搜索最近 max_turns 轮
+        let turn_iris: Vec<String> = (1..=max_turns)
+            .map(|seq| format!("{}/turn/{}", prefix, seq))
+            .collect();
+        let graph_clause: String = turn_iris
+            .iter()
+            .map(|iri| format!("GRAPH <{}>", iri))
+            .collect();
+        format!(
+            "SELECT ?digest ?text WHERE {{ {} {{ ?s a <{}> . ?s <{}> ?digest . ?s <{}> ?text . }} }}",
+            graph_clause, TURN_CLASS, P_DIGEST, P_TEXT
+        )
+    }
+}
+
+/// 构建 SPARQL ASK 查询，用于检查会话中是否已说过具有特定实体-属性组合的命题。
+///
+/// 检查是否存在命题同时包含给定的实体词面和属性词面（用于实体+属性兜底规则）。
+pub fn entity_attribute_said_sparql_query(session: &str, entity: &str, attribute: &str, max_turns: usize) -> String {
+    let entity = entity.trim();
+    let attribute = attribute.trim();
+    if entity.is_empty() || attribute.is_empty() {
+        return String::new();
+    }
+    let prefix = session_graph_prefix(session);
+    if max_turns == 0 {
+        format!(
+            "ASK {{ ?g <{}> {{ ?s a <{}> . ?s <{}> ?text . FILTER(CONTAINS(LCASE(?text), LCASE(\"{}\")) && CONTAINS(LCASE(?text), LCASE(\"{}\")) }} }}",
+            DIALOGUE_MEMORY_GRAPH_NS, CLAIM_CLASS, P_TEXT, entity, attribute
+        )
+    } else {
+        let turn_iris: Vec<String> = (1..=max_turns)
+            .map(|seq| format!("{}/turn/{}", prefix, seq))
+            .collect();
+        let graph_clause: String = turn_iris
+            .iter()
+            .map(|iri| format!("GRAPH <{}>", iri))
+            .collect();
+        format!(
+            "ASK {{ {} {{ ?s a <{}> . ?s <{}> ?text . FILTER(CONTAINS(LCASE(?text), LCASE(\"{}\")) && CONTAINS(LCASE(?text), LCASE(\"{}\")) }} }}",
+            graph_clause, CLAIM_CLASS, P_TEXT, entity, attribute
+        )
+    }
+}
+
 /// RDF 生成记忆配置（默认开启；开启后每个轮次边界做一次有界投影）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationMemoryConfig {
