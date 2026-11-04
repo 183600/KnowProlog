@@ -632,28 +632,26 @@ impl AnswerPlan {
             None,
         );
         for (index, claim) in self.claims.iter().take(shown).enumerate() {
+            let suffix = if detailed {
+                format!(
+                    "（谓词：{}；来源：{}）{}{}{}{}",
+                    claim.predicate,
+                    claim.source_label(),
+                    claim.envelope_note(),
+                    claim.evidence_note(),
+                    claim.justification_note(true),
+                    claim.media_note(true)
+                )
+            } else {
+                claim.media_note(false)
+            };
             builder.push(
                 SurfaceUnitKind::Claim,
                 format!(
                     "  {}. {}{}\n",
                     index + 1,
                     claim.text.trim(),
-                    if detailed {
-                        format!(
-                            "（谓词：{}；来源：{}）{}",
-                            claim.predicate,
-                            claim.source_label(),
-                            format!(
-                                "{}{}{}{}",
-                                claim.envelope_note(),
-                                claim.evidence_note(),
-                                claim.justification_note(true),
-                                claim.media_note(true)
-                            )
-                        )
-                    } else {
-                        claim.media_note(false)
-                    }
+                    suffix
                 ),
                 Some(&claim.slot),
                 Some(index + 1),
@@ -695,6 +693,13 @@ impl AnswerPlan {
             None,
             None,
         );
+        let notes = format!(
+            "{}{}{}{}",
+            claim.envelope_note(),
+            claim.evidence_note(),
+            claim.justification_note(true),
+            claim.media_note(true)
+        );
         builder.push(
             SurfaceUnitKind::Claim,
             format!(
@@ -702,13 +707,7 @@ impl AnswerPlan {
                 claim.text.trim(),
                 claim.predicate,
                 claim.source_label(),
-                format!(
-                    "{}{}{}{}",
-                    claim.envelope_note(),
-                    claim.evidence_note(),
-                    claim.justification_note(true),
-                    claim.media_note(true)
-                )
+                notes
             ),
             Some(&claim.slot),
             Some(index),
