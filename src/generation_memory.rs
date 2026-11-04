@@ -13,6 +13,7 @@
 //! - **可追溯**：命题指向内容寻址陈述，回答指向轮次，生成史不再是黑箱文本。
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
 use oxigraph::model::{GraphName, Literal, NamedNode, Quad, Subject, Term};
 use serde::{Deserialize, Serialize};
@@ -88,12 +89,13 @@ pub fn already_said_sparql_query(session: &str, text: &str, max_turns: usize) ->
     if normalized.is_empty() {
         return String::new();
     }
+    let escaped = escape_sparql_literal(&normalized);
     let prefix = session_graph_prefix(session);
     if max_turns == 0 {
         // 搜索全部轮次：使用 GRAPH ?g 遍历所有生成记忆图
         format!(
             "ASK {{ ?g <{}> {{ ?s ?p ?o . FILTER(str(?o) = str(\"{}\") || str(?o) = str(\"{}\") ) }} }}",
-            DIALOGUE_MEMORY_GRAPH_NS, normalized, normalized
+            DIALOGUE_MEMORY_GRAPH_NS, escaped, escaped
         )
     } else {
         // 搜索最近 max_turns 轮：显式列出图 IRI
@@ -107,9 +109,30 @@ pub fn already_said_sparql_query(session: &str, text: &str, max_turns: usize) ->
         let graph_clause: String = graph_iris.join(" ");
         format!(
             "ASK {{ {} {{ ?s ?p ?o . FILTER(str(?o) = str(\"{}\") || str(?o) = str(\"{}\") ) }} }}",
-            graph_clause, normalized, normalized
+            graph_clause, escaped, escaped
         )
     }
+}
+
+/// 把待插入 SPARQL 简单字面量的文本转义：反斜杠与双引号做转义，控制字符
+/// 改写为 SPARQL 转义序列，避免用户文本破坏查询语法或注入额外子句。
+/// 仅用于生成记忆内部拼装的受控查询，不处理任意 IRI。
+fn escape_sparql_literal(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            other if other.is_control() => {
+                let _ = write!(out, "\\u{:04x}", other as u32);
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// 构建 SPARQL SELECT 查询，用于列出会话中所有已说的命题文本。
@@ -144,17 +167,24 @@ pub fn list_all_claims_sparql(session: &str, max_turns: usize) -> String {
 /// 构建 SPARQL ASK 查询，用于检查会话中是否已说过具有特定实体-属性组合的命题。
 ///
 /// 检查是否存在命题同时包含给定的实体词面和属性词面（用于实体+属性兜底规则）。
-pub fn entity_attribute_said_sparql_query(session: &str, entity: &str, attribute: &str, max_turns: usize) -> String {
+pub fn entity_attribute_said_sparql_query(
+    session: &str,
+    entity: &str,
+    attribute: &str,
+    max_turns: usize,
+) -> String {
     let entity = entity.trim();
     let attribute = attribute.trim();
     if entity.is_empty() || attribute.is_empty() {
         return String::new();
     }
+    let escaped_entity = escape_sparql_literal(entity);
+    let escaped_attribute = escape_sparql_literal(attribute);
     let prefix = session_graph_prefix(session);
     if max_turns == 0 {
         format!(
             "ASK {{ ?g <{}> {{ ?s a <{}> . ?s <{}> ?text . FILTER(CONTAINS(LCASE(?text), LCASE(\"{}\")) && CONTAINS(LCASE(?text), LCASE(\"{}\")) }} }}",
-            DIALOGUE_MEMORY_GRAPH_NS, CLAIM_CLASS, P_TEXT, entity, attribute
+            DIALOGUE_MEMORY_GRAPH_NS, CLAIM_CLASS, P_TEXT, escaped_entity, escaped_attribute
         )
     } else {
         let turn_iris: Vec<String> = (1..=max_turns)
@@ -166,7 +196,7 @@ pub fn entity_attribute_said_sparql_query(session: &str, entity: &str, attribute
             .collect();
         format!(
             "ASK {{ {} {{ ?s a <{}> . ?s <{}> ?text . FILTER(CONTAINS(LCASE(?text), LCASE(\"{}\")) && CONTAINS(LCASE(?text), LCASE(\"{}\")) }} }}",
-            graph_clause, CLAIM_CLASS, P_TEXT, entity, attribute
+            graph_clause, CLAIM_CLASS, P_TEXT, escaped_entity, escaped_attribute
         )
     }
 }
@@ -1332,5 +1362,67 @@ mod tests {
             "标题行不得进入更正负载"
         );
         assert_eq!(uris.len(), 1);
+    }
+
+    #[test]
+    fn escape_sparql_literal_neutralizes_quotes_and_backslashes() {
+        assert_eq!(
+            escape_sparql_literal("he said \"hi\""),
+            "he said \\\"hi\\\""
+        );
+        assert_eq!(
+            escape_sparql_literal("path\\file \"x\""),
+            "path\\\\file \\\"x\\\""
+        );
+        assert_eq!(escape_sparql_literal("a\nb\tc"), "a\\nb\\tc");
+        assert_eq!(escape_sparql_literal("plain"), "plain");
+        assert_eq!(escape_sparql_literal(""), "");
+    }
+
+    #[test]
+    fn already_said_sparql_query_escapes_and_bounds_turns() {
+        let session = "s-1";
+        let unbounded = already_said_sparql_query(session, "姚明\"说'话", 0);
+        assert!(!unbounded.is_empty());
+        // 引号被转义（出现反斜杠），查询结构保持 ASK + 默认图遍历。
+        assert!(unbounded.contains('\\'), "{}", unbounded);
+        assert!(unbounded.contains("str("), "{}", unbounded);
+        assert!(!unbounded.contains("GRAPH <"));
+        assert!(unbounded.contains("?g <"));
+
+        let bounded = already_said_sparql_query(session, "姚明是谁", 3);
+        assert!(bounded.contains("GRAPH <"), "{}", bounded);
+        assert!(bounded.matches("GRAPH <").count() == 3, "{}", bounded);
+        assert!(!bounded.contains("?g"), "{}", bounded);
+
+        // 空文本不产出生成查询。
+        assert!(already_said_sparql_query(session, "   ", 0).is_empty());
+        assert!(already_said_sparql_query(session, "", 3).is_empty());
+    }
+
+    #[test]
+    fn entity_attribute_said_sparql_query_escapes_and_rejects_empty() {
+        let session = "s-1";
+        let q = entity_attribute_said_sparql_query(session, "姚\"明", "身高", 2);
+        assert!(q.contains('\\'), "{}", q);
+        assert!(q.contains("身高"), "{}", q);
+        assert!(q.matches("GRAPH <").count() == 2, "{}", q);
+
+        // 任一为空不产出生成查询。
+        assert!(entity_attribute_said_sparql_query(session, "", "身高", 0).is_empty());
+        assert!(entity_attribute_said_sparql_query(session, "姚明", "", 0).is_empty());
+        assert!(entity_attribute_said_sparql_query(session, "   ", "身高", 0).is_empty());
+    }
+
+    #[test]
+    fn list_all_claims_sparql_bounds_turns() {
+        let session = "s-1";
+        let unbounded = list_all_claims_sparql(session, 0);
+        assert!(unbounded.contains("GRAPH ?g"), "{}", unbounded);
+        assert!(!unbounded.contains("GRAPH <"), "{}", unbounded);
+
+        let bounded = list_all_claims_sparql(session, 4);
+        assert!(bounded.matches("GRAPH <").count() == 4, "{}", bounded);
+        assert!(!bounded.contains("?g"), "{}", bounded);
     }
 }
