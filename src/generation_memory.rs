@@ -170,7 +170,11 @@ impl GenerationMemory {
     /// 空记忆（保留会话标识，用于「尚未记录」与「已忘记」）。
     pub fn empty(session: impl Into<String>) -> Self {
         let s = session.into().trim().to_string();
-        let session = if s.is_empty() { "unknown".to_string() } else { s };
+        let session = if s.is_empty() {
+            "unknown".to_string()
+        } else {
+            s
+        };
         GenerationMemory {
             session,
             ..Self::default()
