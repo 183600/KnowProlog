@@ -302,6 +302,7 @@ impl AssociationMiner {
         self.rules.truncate(200);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_rule(
         &self,
         antecedent: &[String],
