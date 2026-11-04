@@ -120,17 +120,7 @@ impl OxigraphManager {
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         let quads = graph_ledger::rule_quads(entries)?;
         let graph = GraphName::NamedNode(NamedNode::new(graph_ledger::RULES_GRAPH)?);
-        let store = self.store.lock().await;
-        let existing: Vec<Quad> = store
-            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        for quad in existing {
-            store.remove(&quad)?;
-        }
-        for quad in &quads {
-            store.insert(quad)?;
-        }
-        self.perf.bump("rule_ledger_sync");
+        self.replace_graph_quads(graph, &quads, "rule_ledger_sync").await?;
         Ok(entries.len())
     }
 
@@ -139,11 +129,7 @@ impl OxigraphManager {
         &self,
     ) -> Result<graph_ledger::RuleLedger, Box<dyn std::error::Error + Send + Sync>> {
         let graph = GraphName::NamedNode(NamedNode::new(graph_ledger::RULES_GRAPH)?);
-        let store = self.store.lock().await;
-        let quads: Vec<Quad> = store
-            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        self.perf.bump("rule_ledger_load");
+        let quads = self.read_graph_quads(graph, "rule_ledger_load").await?;
         Ok(graph_ledger::parse_rule_graph(quads.into_iter()))
     }
 
@@ -157,17 +143,7 @@ impl OxigraphManager {
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         let quads = pattern_ir::pattern_quads(entries)?;
         let graph = GraphName::NamedNode(NamedNode::new(pattern_ir::PATTERNS_GRAPH)?);
-        let store = self.store.lock().await;
-        let existing: Vec<Quad> = store
-            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        for quad in existing {
-            store.remove(&quad)?;
-        }
-        for quad in &quads {
-            store.insert(quad)?;
-        }
-        self.perf.bump("pattern_ledger_sync");
+        self.replace_graph_quads(graph, &quads, "pattern_ledger_sync").await?;
         Ok(entries.len())
     }
 
@@ -176,11 +152,7 @@ impl OxigraphManager {
         &self,
     ) -> Result<Vec<pattern_ir::PatternEntry>, Box<dyn std::error::Error + Send + Sync>> {
         let graph = GraphName::NamedNode(NamedNode::new(pattern_ir::PATTERNS_GRAPH)?);
-        let store = self.store.lock().await;
-        let quads: Vec<Quad> = store
-            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        self.perf.bump("pattern_ledger_load");
+        let quads = self.read_graph_quads(graph, "pattern_ledger_load").await?;
         Ok(pattern_ir::parse_pattern_graph(quads.into_iter()))
     }
 
@@ -192,17 +164,7 @@ impl OxigraphManager {
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         let quads = pattern_ir::episode_quads(episodes)?;
         let graph = GraphName::NamedNode(NamedNode::new(pattern_ir::EPISODES_GRAPH)?);
-        let store = self.store.lock().await;
-        let existing: Vec<Quad> = store
-            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        for quad in existing {
-            store.remove(&quad)?;
-        }
-        for quad in &quads {
-            store.insert(quad)?;
-        }
-        self.perf.bump("pattern_episode_sync");
+        self.replace_graph_quads(graph, &quads, "pattern_episode_sync").await?;
         Ok(episodes.len())
     }
 
@@ -211,11 +173,7 @@ impl OxigraphManager {
         &self,
     ) -> Result<Vec<pattern_ir::PatternEpisode>, Box<dyn std::error::Error + Send + Sync>> {
         let graph = GraphName::NamedNode(NamedNode::new(pattern_ir::EPISODES_GRAPH)?);
-        let store = self.store.lock().await;
-        let quads: Vec<Quad> = store
-            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        self.perf.bump("pattern_episode_load");
+        let quads = self.read_graph_quads(graph, "pattern_episode_load").await?;
         Ok(pattern_ir::parse_episode_graph(quads.into_iter()))
     }
 
@@ -228,17 +186,7 @@ impl OxigraphManager {
         let quads = pattern_evolution::evolution_quads(ledger)?;
         let graph =
             GraphName::NamedNode(NamedNode::new(pattern_evolution::EVOLUTION_GRAPH)?);
-        let store = self.store.lock().await;
-        let existing: Vec<Quad> = store
-            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        for quad in existing {
-            store.remove(&quad)?;
-        }
-        for quad in &quads {
-            store.insert(quad)?;
-        }
-        self.perf.bump("pattern_evolution_sync");
+        self.replace_graph_quads(graph, &quads, "pattern_evolution_sync").await?;
         Ok(ledger.generations.len())
     }
 
@@ -248,11 +196,7 @@ impl OxigraphManager {
     ) -> Result<pattern_evolution::EvolutionLedger, Box<dyn std::error::Error + Send + Sync>> {
         let graph =
             GraphName::NamedNode(NamedNode::new(pattern_evolution::EVOLUTION_GRAPH)?);
-        let store = self.store.lock().await;
-        let quads: Vec<Quad> = store
-            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        self.perf.bump("pattern_evolution_load");
+        let quads = self.read_graph_quads(graph, "pattern_evolution_load").await?;
         Ok(pattern_evolution::parse_evolution_graph(quads.into_iter()))
     }
 
@@ -264,17 +208,7 @@ impl OxigraphManager {
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         let quads = memory.to_quads()?;
         let graph = GraphName::NamedNode(NamedNode::new(lexical_memory::LEXICAL_MEMORY_GRAPH)?);
-        let store = self.store.lock().await;
-        let existing: Vec<Quad> = store
-            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        for quad in existing {
-            store.remove(&quad)?;
-        }
-        for quad in &quads {
-            store.insert(quad)?;
-        }
-        self.perf.bump("lexical_memory_sync");
+        self.replace_graph_quads(graph, &quads, "lexical_memory_sync").await?;
         Ok(memory.len())
     }
 
@@ -283,11 +217,7 @@ impl OxigraphManager {
         &self,
     ) -> Result<lexical_memory::LexicalMemory, Box<dyn std::error::Error + Send + Sync>> {
         let graph = GraphName::NamedNode(NamedNode::new(lexical_memory::LEXICAL_MEMORY_GRAPH)?);
-        let store = self.store.lock().await;
-        let quads: Vec<Quad> = store
-            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        self.perf.bump("lexical_memory_load");
+        let quads = self.read_graph_quads(graph, "lexical_memory_load").await?;
         Ok(lexical_memory::LexicalMemory::from_quads(quads.into_iter()))
     }
 
@@ -301,17 +231,7 @@ impl OxigraphManager {
         let graph_name = GraphName::NamedNode(NamedNode::new(
             synonym_graph::SYNONYM_GRAPH_IRI,
         )?);
-        let store = self.store.lock().await;
-        let existing: Vec<Quad> = store
-            .quads_for_pattern(None, None, None, Some(graph_name.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        for quad in existing {
-            store.remove(&quad)?;
-        }
-        for quad in &quads {
-            store.insert(quad)?;
-        }
-        self.perf.bump("synonym_graph_sync");
+        self.replace_graph_quads(graph_name, &quads, "synonym_graph_sync").await?;
         Ok(graph.len())
     }
 
@@ -322,11 +242,7 @@ impl OxigraphManager {
         let graph_name = GraphName::NamedNode(NamedNode::new(
             synonym_graph::SYNONYM_GRAPH_IRI,
         )?);
-        let store = self.store.lock().await;
-        let quads: Vec<Quad> = store
-            .quads_for_pattern(None, None, None, Some(graph_name.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        self.perf.bump("synonym_graph_load");
+        let quads = self.read_graph_quads(graph_name, "synonym_graph_load").await?;
         Ok(synonym_graph::SynonymGraph::from_quads(
             quads.into_iter(),
         ))
@@ -422,17 +338,7 @@ impl OxigraphManager {
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         let quads = graph_ledger::derived_quads(entries, revision, fingerprint)?;
         let graph = GraphName::NamedNode(NamedNode::new(graph_ledger::DERIVED_GRAPH)?);
-        let store = self.store.lock().await;
-        let existing: Vec<Quad> = store
-            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        for quad in existing {
-            store.remove(&quad)?;
-        }
-        for quad in &quads {
-            store.insert(quad)?;
-        }
-        self.perf.bump("derived_ledger_materialize");
+        self.replace_graph_quads(graph, &quads, "derived_ledger_materialize").await?;
         Ok(entries.len())
     }
 
@@ -441,17 +347,69 @@ impl OxigraphManager {
         &self,
     ) -> Result<graph_ledger::DerivedLedger, Box<dyn std::error::Error + Send + Sync>> {
         let graph = GraphName::NamedNode(NamedNode::new(graph_ledger::DERIVED_GRAPH)?);
-        let store = self.store.lock().await;
-        let quads: Vec<Quad> = store
-            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        self.perf.bump("derived_ledger_load");
+        let quads = self.read_graph_quads(graph, "derived_ledger_load").await?;
         Ok(graph_ledger::parse_derived_graph(quads.into_iter()))
     }
 
     // ------------------------------------------------------------------
     // 知识融合：命名空间源图 + 融合账本 + 受审默认视图
     // ------------------------------------------------------------------
+
+    /// 清空命名图并重写一批四元组（幂等；不推进知识版本）。
+    async fn replace_graph_quads(
+        &self,
+        graph: GraphName,
+        quads: &[Quad],
+        perf_key: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let store = self.store.lock().await;
+        let existing: Vec<Quad> = store
+            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        for quad in existing {
+            store.remove(&quad)?;
+        }
+        for quad in quads {
+            store.insert(quad)?;
+        }
+        self.perf.bump(perf_key);
+        Ok(())
+    }
+
+    /// 只读取命名图内全部四元组（不触碰缓存）。
+    async fn read_graph_quads(
+        &self,
+        graph: GraphName,
+        perf_key: &str,
+    ) -> Result<Vec<Quad>, Box<dyn std::error::Error + Send + Sync>> {
+        let store = self.store.lock().await;
+        let quads: Vec<Quad> = store
+            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.perf.bump(perf_key);
+        Ok(quads)
+    }
+
+    /// 清空命名图并重写一批四元组（在已持锁上下文中调用；幂等；不推进知识版本）。
+    fn replace_graph_quads_locked(
+        store: &Store,
+        graph: GraphName,
+        quads: &[Quad],
+        perf: &Arc<perf_ledger::PerfLedger>,
+        perf_key: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let existing: Vec<Quad> = store
+            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        for quad in existing {
+            store.remove(&quad)?;
+        }
+        for quad in quads {
+            store.insert(quad)?;
+        }
+        perf.bump(perf_key);
+        Ok(())
+    }
 
     /// 断言谓词 → RDF 谓词 IRI：`type` 归一到 rdf:type，外部 IRI 原样保留，
     /// 其余按 `BASE_NS` 展开。
@@ -564,16 +522,7 @@ impl OxigraphManager {
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         let quads = knowledge_fusion::fusion_quads(ledger)?;
         let graph = GraphName::NamedNode(NamedNode::new(knowledge_fusion::FUSION_GRAPH)?);
-        let existing: Vec<Quad> = store
-            .quads_for_pattern(None, None, None, Some(graph.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
-        for quad in existing {
-            store.remove(&quad)?;
-        }
-        for quad in &quads {
-            store.insert(quad)?;
-        }
-        self.perf.bump("fusion_ledger_sync");
+        Self::replace_graph_quads_locked(store, graph, &quads, &self.perf, "fusion_ledger_sync")?;
         Ok(ledger.assertions.len())
     }
 

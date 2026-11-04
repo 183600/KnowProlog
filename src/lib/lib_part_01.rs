@@ -29,23 +29,20 @@ fn sparql_literal(text: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(escaped)
 }
 /// 把 IRI 的 kg 本地名（或实体路径名）计入增量足迹；外部 IRI 原样计入。
-fn touch_iri_name(delta: &mut DeltaFootprint, iri: &str) {
+/// `removed` 为 true 时记入删除足迹，否则记入新增足迹。
+fn touch_iri_name(delta: &mut DeltaFootprint, iri: &str, removed: bool) {
     if let Some(name) = crate::identity::entity_local_name(BASE_NS, iri)
         .or_else(|| crate::identity::local_name(BASE_NS, iri))
     {
-        delta.touch_name(name);
+        if removed {
+            delta.touch_removed_name(name);
+        } else {
+            delta.touch_name(name);
+        }
+    } else if removed {
+        delta.touch_removed_name(iri);
     } else {
         delta.touch_name(iri);
-    }
-}
-
-fn touch_removed_iri_name(delta: &mut DeltaFootprint, iri: &str) {
-    if let Some(name) = crate::identity::entity_local_name(BASE_NS, iri)
-        .or_else(|| crate::identity::local_name(BASE_NS, iri))
-    {
-        delta.touch_removed_name(name);
-    } else {
-        delta.touch_removed_name(iri);
     }
 }
 
@@ -74,11 +71,7 @@ fn footprint_from_quad_sets(added: &[Quad], removed: &[Quad]) -> DeltaFootprint 
 
 fn touch_quad(delta: &mut DeltaFootprint, quad: &Quad, removed: bool) {
     if let Subject::NamedNode(node) = &quad.subject {
-        if removed {
-            touch_removed_iri_name(delta, node.as_str());
-        } else {
-            touch_iri_name(delta, node.as_str());
-        }
+        touch_iri_name(delta, node.as_str(), removed);
     }
     let predicate = crate::identity::local_name(BASE_NS, quad.predicate.as_str())
         .unwrap_or_else(|| quad.predicate.as_str().to_string());
@@ -89,11 +82,7 @@ fn touch_quad(delta: &mut DeltaFootprint, quad: &Quad, removed: bool) {
     }
     match &quad.object {
         Term::NamedNode(node) => {
-            if removed {
-                touch_removed_iri_name(delta, node.as_str());
-            } else {
-                touch_iri_name(delta, node.as_str());
-            }
+            touch_iri_name(delta, node.as_str(), removed);
         }
         Term::Literal(literal) => {
             if removed {
@@ -116,8 +105,8 @@ fn footprint_from_actions(actions: &[predicate_registry::ImportAction]) -> Delta
                 predicate,
                 object,
             } => {
-                touch_iri_name(&mut delta, subject);
-                touch_iri_name(&mut delta, object);
+                touch_iri_name(&mut delta, subject, false);
+                touch_iri_name(&mut delta, object, false);
                 delta.touch_predicate(
                     crate::identity::local_name(BASE_NS, predicate)
                         .unwrap_or_else(|| predicate.clone()),
@@ -128,7 +117,7 @@ fn footprint_from_actions(actions: &[predicate_registry::ImportAction]) -> Delta
                 predicate,
                 value,
             } => {
-                touch_iri_name(&mut delta, subject);
+                touch_iri_name(&mut delta, subject, false);
                 delta.touch_name(value.clone());
                 delta.touch_predicate(
                     crate::identity::local_name(BASE_NS, predicate)
