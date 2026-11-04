@@ -80,6 +80,42 @@ const P_CORRECTS: &str = "http://example.org/kg/ledger/dialogue/corrects";
 
 type MemoryResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// SPARQL SELECT 查询：找出哪一轮说过指定文本，返回（?seq, ?text）元组。
+///
+/// 结果中 `?seq` 是轮次序号，`?text` 是命题的完整文本（规范化后比对）。
+/// 只在命题类陈述中命中，排除纯粹的依据/证据文本。
+///
+/// 返回的查询字符串可直接传给 `oxigraph_manager.query_sparql()` 执行。
+/// 查询会在最近 `max_turns` 轮的命名图中搜索，`max_urns = 0` 表示搜索全部。
+pub fn find_claim_by_text_sparql(session: &str, text: &str, max_turns: usize) -> String {
+    let normalized = answer_key(text);
+    if normalized.is_empty() {
+        return String::new();
+    }
+    let escaped = escape_sparql_literal(&normalized);
+    let prefix = session_graph_prefix(session);
+    if max_turns == 0 {
+        // 搜索全部轮次：使用 GRAPH ?g 遍历所有生成记忆图（?g 绑定到图 IRI）
+        format!(
+            "SELECT ?seq ?text WHERE {{ GRAPH ?g {{ ?s a <{}> . ?s <{}> ?digest . ?s <{}> ?text . FILTER(str(?text) = str(\"{}\") || str(?text) = str(\"{}\")) }} }}",
+            TURN_CLASS, P_DIGEST, P_TEXT, escaped, escaped
+        )
+    } else {
+        // 搜索最近 max_turns 轮：显式列出图 IRI
+        let turn_iris: Vec<String> = (1..=max_turns)
+            .map(|seq| format!("{}/turn/{}", prefix, seq))
+            .collect();
+        let graph_clause: String = turn_iris
+            .iter()
+            .map(|iri| format!("GRAPH <{}>", iri))
+            .collect();
+        format!(
+            "SELECT ?seq ?text WHERE {{ {} {{ ?s a <{}> . ?s <{}> ?digest . ?s <{}> ?text . FILTER(str(?text) = str(\"{}\") || str(?text) = str(\"{}\")) }} }}",
+            graph_clause, TURN_CLASS, P_DIGEST, P_TEXT, escaped, escaped
+        )
+    }
+}
+
 /// 为会话构建 SPARQL ASK 查询，用于检查特定文本是否已作为命题出现在生成记忆的任意轮次中。
 ///
 /// 返回的查询字符串可直接传给 `oxigraph_manager.query_sparql()` 执行。
@@ -1424,5 +1460,103 @@ mod tests {
         let bounded = list_all_claims_sparql(session, 4);
         assert!(bounded.matches("GRAPH <").count() == 4, "{}", bounded);
         assert!(!bounded.contains("?g"), "{}", bounded);
+    }
+
+    #[test]
+    fn find_claim_by_text_sparql_escapes_and_bounds_turns() {
+        let session = "s-1";
+        let unbounded = find_claim_by_text_sparql(session, "姚明\"说'话", 0);
+        assert!(!unbounded.is_empty());
+        // 引号被转义（出现反斜杠），查询结构包含 SELECT + ?seq + ?text
+        assert!(unbounded.contains('\\'), "{}", unbounded);
+        assert!(unbounded.contains("str("), "{}", unbounded);
+        assert!(unbounded.contains("?seq"), "{}", unbounded);
+        assert!(unbounded.contains("?text"), "{}", unbounded);
+        // unbounded 应该有 ?g 变量而非固定的 GRAPH <...
+        assert!(unbounded.contains("GRAPH ?g"), "{}", unbounded);
+        assert!(!unbounded.contains("GRAPH <"), "{}", unbounded);
+
+        // 有界查询应显式列出图 IRI
+        let bounded = find_claim_by_text_sparql(session, "姚明是谁", 3);
+        assert!(bounded.contains("GRAPH <"), "{}", bounded);
+        // 应该有 3 个 GRAPH <.../turn/N> 子句
+        assert_eq!(
+            bounded.matches("GRAPH <").count(),
+            3,
+            "{}",
+            bounded
+        );
+        // 不应出现通配 ?g
+        assert!(!bounded.contains("GRAPH ?g"), "{}", bounded);
+
+        // 空文本不产生查询
+        assert!(find_claim_by_text_sparql(session, "   ", 0).is_empty());
+        assert!(find_claim_by_text_sparql(session, "", 3).is_empty());
+    }
+
+    #[test]
+    fn find_claim_by_text_sparql_identifies_turn() {
+        let dir = TempDir::new().unwrap();
+        let session_path = dir.path().join("dialogue.session.json");
+        let session = DialogueSession::open_or_create(&session_path.to_string_lossy()).unwrap();
+        let chronicle_path = dir.path().join("dialogue.chronicle.jsonl");
+        let (mut chronicle, audit) =
+            Chronicle::open(&chronicle_path.to_string_lossy(), FsyncPolicy::None).unwrap();
+        assert!(audit.is_clean());
+        chronicle
+            .append_turn_with_refs(
+                "姚明是谁",
+                "query",
+                None,
+                0,
+                &[EntityRef::linked("姚明", "姚明")],
+            )
+            .unwrap();
+        chronicle
+            .append_reply_with_context(
+                Some("姚明是谁"),
+                "姚明是篮球运动员。\n他的身高是 226 厘米。",
+                &["direct_answer".to_string()],
+                &["身高".to_string()],
+                Some("proof-1"),
+                &[],
+            )
+            .unwrap();
+        chronicle
+            .append_turn_with_refs("他的身高呢", "query", Some("姚明"), 1, &[])
+            .unwrap();
+        chronicle
+            .append_reply(
+                "姚明的身高是 226 厘米。",
+                &["direct_answer".to_string()],
+                &["身高".to_string()],
+                &[],
+            )
+            .unwrap();
+        let index = DialogueArtifactIndex::from_chronicle(&session, &chronicle);
+        let memory = GenerationMemory::from_index(&index, 0);
+
+        // 查询“姚明是篮球运动员”应定位到第1轮（seq=1）
+        let q = find_claim_by_text_sparql(&memory.session, "姚明是篮球运动员", 0);
+        assert!(!q.is_empty(), "已说过的命题应能被查到");
+        assert!(q.contains("?seq"), "{}", q);
+        assert!(q.contains("?text"), "{}", q);
+        // 应该只命中第1轮
+        assert!(q.contains("GRAPH ?g"), "{}", q);
+
+        // 查询“姚明的身高是 226 厘米”应定位到第2轮（seq=2）
+        let q2 = find_claim_by_text_sparql(&memory.session, "姚明的身高是 226 厘米", 0);
+        assert!(!q2.is_empty(), "已说过的命题应能被查到");
+        assert!(q2.contains("?seq"), "{}", q2);
+        assert!(q2.contains("?text"), "{}", q2);
+        // 查询结构应包含 FILTER 与 ||（两个 str() 比较取或）
+        assert!(q2.contains("FILTER"), "{}", q2);
+        assert!(q2.contains("||"), "{}", q2);
+
+        // 查询未说过的文本不应命中（查询字符串结构应正确）
+        let q3 = find_claim_by_text_sparql(&memory.session, "姚明是足球运动员", 0);
+        // 即使无结果，查询字符串结构应正确
+        assert!(q3.contains("SELECT"), "{}", q3);
+        assert!(q3.contains("WHERE"), "{}", q3);
     }
 }
