@@ -10,6 +10,8 @@
 //! - **幂等重写**：同步先清空该会话的全部生成记忆图，再全量写入，不推进知识版本；
 //! - **默认图零污染**：所有四元组都落在 `kg:graphs/dialogue/` 下，全图扫描看不到；
 //! - **有界投影**：调用方按最近 N 轮投影，避免记忆无限膨胀；
+//! - **可审计**：每次投影在会话图里留一份「投影收据」——窗口多大、编年史共几轮、
+//!   保留了哪些 seq、丢弃了哪些 seq——上下文选择不再是黑箱截断；
 //! - **可追溯**：命题指向内容寻址陈述，回答指向轮次，生成史不再是黑箱文本。
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -59,6 +61,8 @@ const P_PROOF_ID: &str = "http://example.org/kg/ledger/dialogue/proofId";
 const P_TEXT: &str = "http://example.org/kg/ledger/dialogue/text";
 const P_DIGEST: &str = "http://example.org/kg/ledger/dialogue/digest";
 const P_STATEMENT: &str = "http://example.org/kg/ledger/dialogue/statement";
+/// 命题文本的规范化键（`answer_key` 口径），供 SPARQL 与内存路径同口径匹配。
+const P_TEXT_KEY: &str = "http://example.org/kg/ledger/dialogue/textKey";
 const P_SURFACE: &str = "http://example.org/kg/ledger/dialogue/surface";
 const P_ENTITY: &str = "http://example.org/kg/ledger/dialogue/entity";
 const P_ENTITY_URI: &str = "http://example.org/kg/ledger/dialogue/entityUri";
@@ -77,77 +81,144 @@ const P_LATEST_SEQ: &str = "http://example.org/kg/ledger/dialogue/latestSeq";
 const P_JSON: &str = "http://example.org/kg/ledger/dialogue/json";
 /// 更正关系：回答 → 其更正的先前命题 URI，按轮隔离、内容寻址。
 const P_CORRECTS: &str = "http://example.org/kg/ledger/dialogue/corrects";
+/// 投影收据：会话图里的上下文选择记录（窗口/来源/保留/丢弃）。
+const P_PROJECTION_JSON: &str = "http://example.org/kg/ledger/dialogue/projectionJson";
+const P_WINDOW: &str = "http://example.org/kg/ledger/dialogue/projectionWindow";
+const P_SOURCE_TURNS: &str = "http://example.org/kg/ledger/dialogue/projectionSourceTurns";
+const P_DROPPED_TURNS: &str = "http://example.org/kg/ledger/dialogue/projectionDroppedTurns";
+const P_DROPPED_SEQS: &str = "http://example.org/kg/ledger/dialogue/projectionDroppedSeqs";
+const P_SOURCE_REPLIES: &str = "http://example.org/kg/ledger/dialogue/projectionSourceReplies";
+const P_DROPPED_REPLIES: &str = "http://example.org/kg/ledger/dialogue/projectionDroppedReplies";
 
 type MemoryResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// SPARQL SELECT 查询：找出哪一轮说过指定文本，返回（?seq, ?text）元组。
+/// 会话内承载工件图的 IRI 列表：轮次图 + 无轮次回答图（升序）。
 ///
-/// 结果中 `?seq` 是轮次序号，`?text` 是命题的完整文本（规范化后比对）。
-/// 只在命题类陈述中命中，排除纯粹的依据/证据文本。
+/// 编年史 `seq` 是跨条目（turn/reply/trace）的全局计数，轮次图 IRI 因此是
+/// 稀疏的（如 1、3、5）：**绝不能用 `1..=N` 枚举图 IRI**，那会漏掉真实轮次、
+/// 又掺入不存在的图。图集合必须从记忆投影本身取，见
+/// [`GenerationMemory::graph_iris`]。
 ///
-/// 返回的查询字符串可直接传给 `oxigraph_manager.query_sparql()` 执行。
-/// 查询会在最近 `max_turns` 轮的命名图中搜索，`max_urns = 0` 表示搜索全部。
-pub fn find_claim_by_text_sparql(session: &str, text: &str, max_turns: usize) -> String {
-    let normalized = answer_key(text);
-    if normalized.is_empty() {
-        return String::new();
-    }
-    let escaped = escape_sparql_literal(&normalized);
-    let prefix = session_graph_prefix(session);
-    if max_turns == 0 {
-        // 搜索全部轮次：使用 GRAPH ?g 遍历所有生成记忆图（?g 绑定到图 IRI）
-        format!(
-            "SELECT ?seq ?text WHERE {{ GRAPH ?g {{ ?s a <{}> . ?s <{}> ?digest . ?s <{}> ?text . FILTER(str(?text) = str(\"{}\") || str(?text) = str(\"{}\")) }} }}",
-            TURN_CLASS, P_DIGEST, P_TEXT, escaped, escaped
-        )
+/// 组装 `GRAPH ?g { 主语的会话过滤 + 模式 } [FILTER(?g IN (图列表))]` 的
+/// WHERE 主体：会话过滤直接落在模式主语（`?claim`）上，避免引入自由变量
+/// 与工件模式做笛卡尔积；跨会话图不会被扫到。图列表为空（空记忆）时省略
+/// 过滤器，会话过滤天然无解，同样不泄漏。
+fn memory_graph_body(memory: &GenerationMemory, subject: &str, pattern: &str) -> String {
+    let session = escape_sparql_literal(&memory.session);
+    let iris = memory.graph_iris();
+    let filter = if iris.is_empty() {
+        String::new()
     } else {
-        // 搜索最近 max_turns 轮：显式列出图 IRI
-        let turn_iris: Vec<String> = (1..=max_turns)
-            .map(|seq| format!("{}/turn/{}", prefix, seq))
-            .collect();
-        let graph_clause: String = turn_iris
+        let list = iris
             .iter()
-            .map(|iri| format!("GRAPH <{}>", iri))
-            .collect();
-        format!(
-            "SELECT ?seq ?text WHERE {{ {} {{ ?s a <{}> . ?s <{}> ?digest . ?s <{}> ?text . FILTER(str(?text) = str(\"{}\") || str(?text) = str(\"{}\")) }} }}",
-            graph_clause, TURN_CLASS, P_DIGEST, P_TEXT, escaped, escaped
-        )
-    }
+            .map(|iri| format!("<{}>", iri))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(" FILTER(?g IN ({}))", list)
+    };
+    format!(
+        "GRAPH ?g {{ {} <{}> \"{}\" . {} }}{}",
+        subject, P_SESSION, session, pattern, filter
+    )
 }
 
-/// 为会话构建 SPARQL ASK 查询，用于检查特定文本是否已作为命题出现在生成记忆的任意轮次中。
+/// SPARQL SELECT 查询：找出记忆里哪条回答的哪个命题说过指定文本，
+/// 返回 `(?seq, ?text)`；`?seq` 是回答关联的轮次 seq（无轮次回答时不绑定）。
 ///
-/// 返回的查询字符串可直接传给 `oxigraph_manager.query_sparql()` 执行。
-/// 查询会在最近 `max_turns` 轮的命名图中搜索，`max_turns = 0` 表示搜索全部。
-pub fn already_said_sparql_query(session: &str, text: &str, max_turns: usize) -> String {
+/// 匹配走命题的规范化键（`answer_key` 口径，折叠空白/标点/大小写），与内存
+/// 侧 `GenerationMemory::find_claim` 同口径。返回空串表示待查文本规范化后
+/// 为空，没有可执行的查询；否则查询可直接传给 `oxigraph_manager.query_sparql()`
+/// 执行。
+pub fn find_claim_by_text_sparql(memory: &GenerationMemory, text: &str) -> String {
     let normalized = answer_key(text);
     if normalized.is_empty() {
         return String::new();
     }
     let escaped = escape_sparql_literal(&normalized);
-    let prefix = session_graph_prefix(session);
-    if max_turns == 0 {
-        // 搜索全部轮次：使用 GRAPH ?g 遍历所有生成记忆图
-        format!(
-            "ASK {{ ?g <{}> {{ ?s ?p ?o . FILTER(str(?o) = str(\"{}\") || str(?o) = str(\"{}\") ) }} }}",
-            DIALOGUE_MEMORY_GRAPH_NS, escaped, escaped
+    format!(
+        "SELECT ?seq ?text WHERE {{ {} }}",
+        memory_graph_body(
+            memory,
+            "?claim",
+            &format!(
+                "?claim a <{}> . ?claim <{}> ?text . ?claim <{}> \"{}\" . \
+                 OPTIONAL {{ ?claim <{}> ?reply . ?reply <{}> ?seq . }}",
+                CLAIM_CLASS, P_TEXT, P_TEXT_KEY, escaped, P_REPLY, P_TURN_SEQ
+            )
         )
-    } else {
-        // 搜索最近 max_turns 轮：显式列出图 IRI
-        let turn_iris: Vec<String> = (1..=max_turns)
-            .map(|seq| format!("{}/turn/{}", prefix, seq))
-            .collect();
-        let graph_iris: Vec<String> = turn_iris
-            .iter()
-            .map(|iri| format!("GRAPH <{}>", iri))
-            .collect();
-        let graph_clause: String = graph_iris.join(" ");
-        format!(
-            "ASK {{ {} {{ ?s ?p ?o . FILTER(str(?o) = str(\"{}\") || str(?o) = str(\"{}\") ) }} }}",
-            graph_clause, escaped, escaped
-        )
+    )
+}
+
+/// SPARQL ASK 查询：特定文本是否已作为命题出现在记忆的任意回答里。
+///
+/// 与 [`find_claim_by_text_sparql`] 同一口径（命题类陈述、规范化键匹配、
+/// 只在本记忆的命名图内搜索）；返回空串表示待查文本为空，无查询可执行。
+pub fn already_said_sparql_query(memory: &GenerationMemory, text: &str) -> String {
+    let normalized = answer_key(text);
+    if normalized.is_empty() {
+        return String::new();
     }
+    let escaped = escape_sparql_literal(&normalized);
+    format!(
+        "ASK {{ {} }}",
+        memory_graph_body(
+            memory,
+            "?claim",
+            &format!(
+                "?claim a <{}> . ?claim <{}> \"{}\" .",
+                CLAIM_CLASS, P_TEXT_KEY, escaped
+            )
+        )
+    )
+}
+
+/// SPARQL SELECT 查询：列出记忆中全部已说命题的 `(?digest, ?text)`。
+///
+/// `?digest` 是命题的内容摘要（FNV-1a 十六进制），`?text` 是命题完整文本；
+/// 只含命题类陈述，不含依据文本。查询可直接传给
+/// `oxigraph_manager.query_sparql()` 执行。
+pub fn list_all_claims_sparql(memory: &GenerationMemory) -> String {
+    format!(
+        "SELECT ?digest ?text WHERE {{ {} }}",
+        memory_graph_body(
+            memory,
+            "?claim",
+            &format!(
+                "?claim a <{}> . ?claim <{}> ?digest . ?claim <{}> ?text .",
+                CLAIM_CLASS, P_DIGEST, P_TEXT
+            )
+        )
+    )
+}
+
+/// SPARQL ASK 查询：记忆里是否说过同时包含指定实体词面与属性词面的命题。
+///
+/// 词面用 `CONTAINS` 做大小写不敏感的包含匹配，对应生成侧「实体+属性兜底」
+/// 的保守口径；实体或属性为空时返回空串，不产出查询。
+pub fn entity_attribute_said_sparql_query(
+    memory: &GenerationMemory,
+    entity: &str,
+    attribute: &str,
+) -> String {
+    let entity = entity.trim();
+    let attribute = attribute.trim();
+    if entity.is_empty() || attribute.is_empty() {
+        return String::new();
+    }
+    let escaped_entity = escape_sparql_literal(entity);
+    let escaped_attribute = escape_sparql_literal(attribute);
+    format!(
+        "ASK {{ {} }}",
+        memory_graph_body(
+            memory,
+            "?claim",
+            &format!(
+                "?claim a <{}> . ?claim <{}> ?text . \
+                 FILTER(CONTAINS(LCASE(?text), LCASE(\"{}\")) && CONTAINS(LCASE(?text), LCASE(\"{}\")))",
+                CLAIM_CLASS, P_TEXT, escaped_entity, escaped_attribute
+            )
+        )
+    )
 }
 
 /// 把待插入 SPARQL 简单字面量的文本转义：反斜杠与双引号做转义，控制字符
@@ -171,73 +242,7 @@ fn escape_sparql_literal(text: &str) -> String {
     out
 }
 
-/// 构建 SPARQL SELECT 查询，用于列出会话中所有已说的命题文本。
-///
-/// 返回的查询字符串可直接传给 `oxigraph_manager.query_sparql()` 执行，
-/// 结果将包含 `(?digest, ?text)` 元组，其中 `?digest` 是命题的内容摘要（MD5/FFFV1a 哈希），
-/// `?text` 是命题的完整文本。
-pub fn list_all_claims_sparql(session: &str, max_turns: usize) -> String {
-    let prefix = session_graph_prefix(session);
-    if max_turns == 0 {
-        // 搜索全部轮次：遍历所有 turn 图
-        format!(
-            "SELECT ?digest ?text WHERE {{ GRAPH ?g {{ ?s a <{}> . ?s <{}> ?digest . ?s <{}> ?text . }} }}",
-            TURN_CLASS, P_DIGEST, P_TEXT
-        )
-    } else {
-        // 搜索最近 max_turns 轮
-        let turn_iris: Vec<String> = (1..=max_turns)
-            .map(|seq| format!("{}/turn/{}", prefix, seq))
-            .collect();
-        let graph_clause: String = turn_iris
-            .iter()
-            .map(|iri| format!("GRAPH <{}>", iri))
-            .collect();
-        format!(
-            "SELECT ?digest ?text WHERE {{ {} {{ ?s a <{}> . ?s <{}> ?digest . ?s <{}> ?text . }} }}",
-            graph_clause, TURN_CLASS, P_DIGEST, P_TEXT
-        )
-    }
-}
-
-/// 构建 SPARQL ASK 查询，用于检查会话中是否已说过具有特定实体-属性组合的命题。
-///
-/// 检查是否存在命题同时包含给定的实体词面和属性词面（用于实体+属性兜底规则）。
-pub fn entity_attribute_said_sparql_query(
-    session: &str,
-    entity: &str,
-    attribute: &str,
-    max_turns: usize,
-) -> String {
-    let entity = entity.trim();
-    let attribute = attribute.trim();
-    if entity.is_empty() || attribute.is_empty() {
-        return String::new();
-    }
-    let escaped_entity = escape_sparql_literal(entity);
-    let escaped_attribute = escape_sparql_literal(attribute);
-    let prefix = session_graph_prefix(session);
-    if max_turns == 0 {
-        format!(
-            "ASK {{ ?g <{}> {{ ?s a <{}> . ?s <{}> ?text . FILTER(CONTAINS(LCASE(?text), LCASE(\"{}\")) && CONTAINS(LCASE(?text), LCASE(\"{}\")) }} }}",
-            DIALOGUE_MEMORY_GRAPH_NS, CLAIM_CLASS, P_TEXT, escaped_entity, escaped_attribute
-        )
-    } else {
-        let turn_iris: Vec<String> = (1..=max_turns)
-            .map(|seq| format!("{}/turn/{}", prefix, seq))
-            .collect();
-        let graph_clause: String = turn_iris
-            .iter()
-            .map(|iri| format!("GRAPH <{}>", iri))
-            .collect();
-        format!(
-            "ASK {{ {} {{ ?s a <{}> . ?s <{}> ?text . FILTER(CONTAINS(LCASE(?text), LCASE(\"{}\")) && CONTAINS(LCASE(?text), LCASE(\"{}\")) }} }}",
-            graph_clause, CLAIM_CLASS, P_TEXT, escaped_entity, escaped_attribute
-        )
-    }
-}
-
-/// RDF 生成记忆配置（默认开启；开启后每个轮次边界做一次有界投影）。
+/// RDF 生成记忆配置（serde 默认关闭；显式开启后每个轮次边界做一次有界投影）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationMemoryConfig {
     #[serde(default)]
@@ -253,9 +258,79 @@ fn default_memory_turns() -> usize {
 impl Default for GenerationMemoryConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             max_turns: DEFAULT_MEMORY_TURNS,
         }
+    }
+}
+
+/// 投影收据：一次有界投影的上下文选择记录，随会话图落 RDF、可查询可审计。
+///
+/// 「保留了哪些轮、丢弃了哪些轮、为什么」都写进会话命名图：`window` 是投影
+/// 时的轮次上限（0 = 未设上限，全量投影）；`source_turns`/`source_replies`
+/// 是工件索引里的轮次/回答总数；`kept_turns`/`dropped_turns` 是保留与丢弃的
+/// 轮次 seq（升序）；`dropped_replies` 是因窗口被丢弃的回答数。丢弃原因恒为
+/// 「超出最近 N 轮窗口」，不再单独建模。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionReceipt {
+    /// 投影窗口（最近 N 轮）；0 表示未设上限。
+    pub window: usize,
+    /// 工件索引中的轮次总数。
+    pub source_turns: usize,
+    /// 保留进记忆的轮次 seq（升序）。
+    pub kept_turns: Vec<u64>,
+    /// 因窗口被丢弃的轮次 seq（升序）。
+    pub dropped_turns: Vec<u64>,
+    /// 工件索引中的回答总数。
+    pub source_replies: usize,
+    /// 因窗口被丢弃的回答数（含超出保留数的无轮次回答）。
+    pub dropped_replies: usize,
+}
+
+impl ProjectionReceipt {
+    /// 丢弃轮次的紧凑词面（逗号连接；无丢弃为空串）。
+    pub fn dropped_seqs_joined(&self) -> String {
+        self.dropped_turns
+            .iter()
+            .map(|seq| seq.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// 是否为全量投影（未设窗口且无丢弃）。
+    pub fn is_unbounded(&self) -> bool {
+        self.window == 0
+    }
+
+    /// 确定性单行摘要（CLI 报告与召回措辞共用同一口径）。
+    pub fn render_line(&self) -> String {
+        if self.is_unbounded() {
+            return format!(
+                "投影窗口：未设上限（max_turns=0）；编年史共 {} 轮全部在记忆中，回答 {} 条。",
+                self.source_turns, self.source_replies
+            );
+        }
+        if self.dropped_turns.is_empty() && self.dropped_replies == 0 {
+            return format!(
+                "投影窗口：最近 {} 轮；编年史共 {} 轮全部保留，回答 {} 条。",
+                self.window, self.source_turns, self.source_replies
+            );
+        }
+        let dropped_seqs = self.dropped_seqs_joined();
+        let seqs = if dropped_seqs.is_empty() {
+            String::new()
+        } else {
+            format!("（seq {}）", dropped_seqs)
+        };
+        format!(
+            "投影窗口：最近 {} 轮；编年史共 {} 轮，保留 {} 轮，丢弃 {} 轮{}，丢弃回答 {} 条。",
+            self.window,
+            self.source_turns,
+            self.kept_turns.len(),
+            self.dropped_turns.len(),
+            seqs,
+            self.dropped_replies
+        )
     }
 }
 
@@ -273,6 +348,9 @@ pub struct GenerationMemory {
     pub turns: BTreeMap<u64, MemoryTurn>,
     /// 没有关联轮次的回答（仍保留，避免静默丢历史）。
     pub unattached_replies: BTreeMap<u64, ReplyArtifact>,
+    /// 最近一次投影的收据；空记忆或旧投影（无收据版本）为 `None`。
+    #[serde(default)]
+    pub projection: Option<ProjectionReceipt>,
 }
 
 /// 会话图 IRI（索引与计数，不含正文）。
@@ -391,10 +469,26 @@ impl GenerationMemory {
                 .collect();
             unattached_replies.retain(|seq, _| keep.contains(seq));
         }
+        let kept_replies = turns.values().map(|turn| turn.replies.len()).sum::<usize>()
+            + unattached_replies.len();
+        let kept_turns: BTreeSet<u64> = turns.keys().copied().collect();
+        let receipt = ProjectionReceipt {
+            window: max_turns,
+            source_turns: index.turn_count(),
+            kept_turns: kept_turns.iter().copied().collect(),
+            dropped_turns: index
+                .turns()
+                .map(|turn| turn.seq)
+                .filter(|seq| !kept_turns.contains(seq))
+                .collect(),
+            source_replies: index.reply_count(),
+            dropped_replies: index.reply_count().saturating_sub(kept_replies),
+        };
         GenerationMemory {
             session,
             turns,
             unattached_replies,
+            projection: Some(receipt),
         }
     }
 
@@ -461,6 +555,32 @@ impl GenerationMemory {
     /// 最近一条回答。
     pub fn latest_reply(&self) -> Option<&ReplyArtifact> {
         self.reply_iter().max_by_key(|reply| reply.seq)
+    }
+
+    /// 记忆中实际保留的轮次 seq（升序）。编年史 seq 是跨条目全局计数，
+    /// 轮次图 IRI 因此稀疏；SPARQL 的图集合必须从这里取，不得用 `1..=N` 猜。
+    pub fn kept_turn_seqs(&self) -> Vec<u64> {
+        self.turns.keys().copied().collect()
+    }
+
+    /// 记忆承载工件图的 IRI 列表（轮次图 + 无轮次回答图，升序、去重）。
+    ///
+    /// 这是「有界查询」的图集合来源：所有面向记忆的 SPARQL 构造器都用它
+    /// 约束 `?g`，保证查询只落在本会话本轮投影的图上。
+    pub fn graph_iris(&self) -> Vec<String> {
+        let mut iris: Vec<String> = self
+            .turns
+            .keys()
+            .map(|seq| turn_graph_iri(&self.session, *seq))
+            .chain(
+                self.unattached_replies
+                    .keys()
+                    .map(|seq| reply_graph_iri(&self.session, *seq)),
+            )
+            .collect();
+        iris.sort();
+        iris.dedup();
+        iris
     }
 
     /// 最近一条回答的命题计划。
@@ -564,6 +684,9 @@ impl GenerationMemory {
         }
         let mut quads: Vec<Quad> = Vec::new();
         self.add_session_quads(&mut quads)?;
+        if let Some(receipt) = &self.projection {
+            add_projection_quads(&mut quads, &self.session, receipt)?;
+        }
         for stored in self.turns.values() {
             let graph =
                 GraphName::NamedNode(named_node(&turn_graph_iri(&self.session, stored.turn.seq))?);
@@ -604,6 +727,7 @@ impl GenerationMemory {
         let mut json_by_subject: BTreeMap<String, String> = BTreeMap::new();
         let mut turn_subjects: BTreeSet<String> = BTreeSet::new();
         let mut reply_subjects: BTreeSet<String> = BTreeSet::new();
+        let mut projection_json: Option<String> = None;
         for quad in quads {
             let subject = match &quad.subject {
                 Subject::NamedNode(node) => node.as_str().to_string(),
@@ -622,6 +746,18 @@ impl GenerationMemory {
                         }
                         Some(_) => {}
                         None => session = Some(value),
+                    }
+                }
+                continue;
+            }
+            if predicate == P_PROJECTION_JSON {
+                if let Term::Literal(literal) = &quad.object {
+                    match &projection_json {
+                        Some(existing) if existing != literal.value() => {
+                            return Err("生成记忆含多份投影收据，拒绝猜测以哪份为准".to_string());
+                        }
+                        Some(_) => {}
+                        None => projection_json = Some(literal.value().to_string()),
                     }
                 }
                 continue;
@@ -714,10 +850,17 @@ impl GenerationMemory {
         if turns.is_empty() && unattached_replies.is_empty() && session.is_empty() {
             return Err("生成记忆缺少会话标识".to_string());
         }
+        let projection = match projection_json {
+            Some(body) => Some(serde_json::from_str::<ProjectionReceipt>(&body).map_err(
+                |error| format!("投影收据解码失败：{}", error),
+            )?),
+            None => None,
+        };
         Ok(GenerationMemory {
             session,
             turns,
             unattached_replies,
+            projection,
         })
     }
 
@@ -737,6 +880,10 @@ impl GenerationMemory {
             self.claim_count(),
             self.evidence_count()
         ));
+        match &self.projection {
+            Some(receipt) => output.push_str(&format!("  {}\n", receipt.render_line())),
+            None => output.push_str("  投影窗口：（无收据；空记忆或旧版本投影）\n"),
+        }
         let recent = self.recent_turns(DEFAULT_MEMORY_TURNS);
         if recent.is_empty() {
             output.push_str("  最近：（还没有投影任何轮次；可先运行 --sync）\n");
@@ -831,6 +978,63 @@ impl GenerationMemory {
 
 fn named_node(iri: &str) -> MemoryResult<NamedNode> {
     Ok(NamedNode::new(iri)?)
+}
+
+/// 投影收据落图：会话图内的上下文选择记录。
+///
+/// JSON 载荷保证无损读回，标量四元组（窗口/来源/丢弃计数/丢弃 seq 词面）
+/// 让「这次投影丢了什么」可以用 SPARQL 直接问出来。
+fn add_projection_quads(
+    quads: &mut Vec<Quad>,
+    session: &str,
+    receipt: &ProjectionReceipt,
+) -> MemoryResult<()> {
+    let graph = GraphName::NamedNode(named_node(&session_graph_iri(session))?);
+    let subject = named_node(&session_uri(session))?;
+    push_literal(
+        quads,
+        &subject,
+        P_PROJECTION_JSON,
+        serde_json::to_string(receipt).map_err(|error| error.to_string())?,
+        &graph,
+    )?;
+    push_literal(quads, &subject, P_WINDOW, receipt.window.to_string(), &graph)?;
+    push_literal(
+        quads,
+        &subject,
+        P_SOURCE_TURNS,
+        receipt.source_turns.to_string(),
+        &graph,
+    )?;
+    push_literal(
+        quads,
+        &subject,
+        P_DROPPED_TURNS,
+        receipt.dropped_turns.len().to_string(),
+        &graph,
+    )?;
+    push_literal(
+        quads,
+        &subject,
+        P_DROPPED_SEQS,
+        receipt.dropped_seqs_joined(),
+        &graph,
+    )?;
+    push_literal(
+        quads,
+        &subject,
+        P_SOURCE_REPLIES,
+        receipt.source_replies.to_string(),
+        &graph,
+    )?;
+    push_literal(
+        quads,
+        &subject,
+        P_DROPPED_REPLIES,
+        receipt.dropped_replies.to_string(),
+        &graph,
+    )?;
+    Ok(())
 }
 
 fn push_literal(
@@ -1036,6 +1240,10 @@ fn add_claim_quads(
     push_literal(quads, &subject, P_INDEX, claim.index.to_string(), graph)?;
     push_literal(quads, &subject, P_DIGEST, &claim.digest, graph)?;
     push_literal(quads, &subject, P_TEXT, &claim.text, graph)?;
+    let text_key = crate::chronicle::answer_key(&claim.text);
+    if !text_key.is_empty() {
+        push_literal(quads, &subject, P_TEXT_KEY, text_key, graph)?;
+    }
     push_node(
         quads,
         &subject,
@@ -1090,6 +1298,7 @@ fn is_proposition(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value as JsonValue;
     use crate::chronicle::{EntityRef, FsyncPolicy};
     use crate::perf_ledger::PerfLedger;
     use crate::OxigraphManager;
@@ -1192,10 +1401,73 @@ mod tests {
         assert_eq!(memory.turns.keys().copied().collect::<Vec<_>>(), vec![3]);
         assert_eq!(memory.reply_count(), 1);
         assert_eq!(memory.recent_turns(0).len(), 1);
+        // 收据如实记录窗口与丢弃：编年史 2 轮，保留 seq 3，丢弃 seq 1。
+        let receipt = memory.projection.as_ref().unwrap();
+        assert_eq!(receipt.window, 1);
+        assert_eq!(receipt.source_turns, 2);
+        assert_eq!(receipt.kept_turns, vec![3]);
+        assert_eq!(receipt.dropped_turns, vec![1]);
+        assert_eq!(receipt.source_replies, 2);
+        assert_eq!(receipt.dropped_replies, 1);
+        assert_eq!(receipt.dropped_seqs_joined(), "1");
+        assert!(!receipt.is_unbounded());
+    }
+
+    #[test]
+    fn unbounded_projection_receipt_reports_no_drops() {
+        let dir = TempDir::new().unwrap();
+        let (index, _session, _chronicle) = sample_index(&dir);
+        let memory = GenerationMemory::from_index(&index, 0);
+        let receipt = memory.projection.as_ref().unwrap();
+        assert_eq!(receipt.window, 0);
+        assert_eq!(receipt.source_turns, 2);
+        assert_eq!(receipt.kept_turns, vec![1, 3]);
+        assert!(receipt.dropped_turns.is_empty());
+        assert_eq!(receipt.dropped_replies, 0);
+        assert!(receipt.is_unbounded());
+        let line = receipt.render_line();
+        assert!(line.contains("未设上限"), "{}", line);
+        assert!(!line.contains("丢弃"), "{}", line);
+
+        let bounded_line = GenerationMemory::from_index(&index, 1)
+            .projection
+            .unwrap()
+            .render_line();
+        assert!(bounded_line.contains("最近 1 轮"), "{}", bounded_line);
+        assert!(bounded_line.contains("丢弃 1 轮（seq 1）"), "{}", bounded_line);
+    }
+
+    #[test]
+    fn projection_receipt_roundtrips_through_quads_and_store() {
+        let dir = TempDir::new().unwrap();
+        let (index, _session, _chronicle) = sample_index(&dir);
+        let memory = GenerationMemory::from_index(&index, 1);
+        let loaded = GenerationMemory::from_quads(memory.to_quads().unwrap()).unwrap();
+        assert_eq!(loaded.projection, memory.projection, "收据必须无损往返");
+        assert_eq!(loaded, memory);
+    }
+
+    #[test]
+    fn corrupted_projection_receipt_is_rejected_not_guessed() {
+        let dir = TempDir::new().unwrap();
+        let (index, _session, _chronicle) = sample_index(&dir);
+        let memory = GenerationMemory::from_index(&index, 0);
+        let mut quads = memory.to_quads().unwrap();
+        for quad in quads.iter_mut() {
+            if quad.predicate.as_str() == P_PROJECTION_JSON {
+                quad.object = Literal::new_simple_literal("{\"window\": not-json}").into();
+            }
+        }
+        let error = GenerationMemory::from_quads(quads).unwrap_err();
+        assert!(error.contains("投影收据解码失败"), "{}", error);
     }
 
     #[test]
     fn config_defaults_off_and_parses_explicit_values() {
+        assert!(
+            !GenerationMemoryConfig::default().enabled,
+            "Default 与 serde 默认一致：生成记忆默认关闭"
+        );
         let defaults: GenerationMemoryConfig = toml::from_str("").unwrap();
         assert!(!defaults.enabled);
         assert_eq!(defaults.max_turns, DEFAULT_MEMORY_TURNS);
@@ -1416,147 +1688,184 @@ mod tests {
     }
 
     #[test]
-    fn already_said_sparql_query_escapes_and_bounds_turns() {
-        let session = "s-1";
-        let unbounded = already_said_sparql_query(session, "姚明\"说'话", 0);
+    fn already_said_sparql_query_escapes_and_bounds_to_memory_graphs() {
+        let dir = TempDir::new().unwrap();
+        let (index, _session, _chronicle) = sample_index(&dir);
+        let memory = GenerationMemory::from_index(&index, 0);
+        let unbounded = already_said_sparql_query(&memory, "姚明\"说'话");
         assert!(!unbounded.is_empty());
-        // 引号被转义（出现反斜杠），查询结构保持 ASK + 默认图遍历。
+        // 引号被转义（出现反斜杠），查询结构保持 ASK + 命名图遍历。
         assert!(unbounded.contains('\\'), "{}", unbounded);
-        assert!(unbounded.contains("str("), "{}", unbounded);
-        assert!(!unbounded.contains("GRAPH <"));
-        assert!(unbounded.contains("?g <"));
+        assert!(unbounded.contains(P_TEXT_KEY), "{}", unbounded);
+        assert!(unbounded.contains("GRAPH ?g"), "{}", unbounded);
+        // 会话过滤内嵌于图模式，跨会话图不会被扫到。
+        assert!(unbounded.contains(&escape_sparql_literal(&memory.session)), "{}", unbounded);
 
-        let bounded = already_said_sparql_query(session, "姚明是谁", 3);
-        assert!(bounded.contains("GRAPH <"), "{}", bounded);
-        assert!(bounded.matches("GRAPH <").count() == 3, "{}", bounded);
-        assert!(!bounded.contains("?g"), "{}", bounded);
+        // 有界：?g 被约束到记忆实际承载的图 IRI（稀疏 seq 1、3，不得枚举 1..=N）。
+        assert!(unbounded.contains("FILTER(?g IN"), "{}", unbounded);
+        assert!(unbounded.contains(&turn_graph_iri(&memory.session, 1)), "{}", unbounded);
+        assert!(unbounded.contains(&turn_graph_iri(&memory.session, 3)), "{}", unbounded);
+        assert!(!unbounded.contains(&turn_graph_iri(&memory.session, 2)), "{}", unbounded);
 
         // 空文本不产出生成查询。
-        assert!(already_said_sparql_query(session, "   ", 0).is_empty());
-        assert!(already_said_sparql_query(session, "", 3).is_empty());
+        let blank = GenerationMemory::empty("s-1");
+        assert!(already_said_sparql_query(&blank, "   ").is_empty());
+        assert!(already_said_sparql_query(&blank, "").is_empty());
     }
 
     #[test]
     fn entity_attribute_said_sparql_query_escapes_and_rejects_empty() {
-        let session = "s-1";
-        let q = entity_attribute_said_sparql_query(session, "姚\"明", "身高", 2);
+        let dir = TempDir::new().unwrap();
+        let (index, _session, _chronicle) = sample_index(&dir);
+        let memory = GenerationMemory::from_index(&index, 0);
+        let q = entity_attribute_said_sparql_query(&memory, "姚\"明", "身高");
         assert!(q.contains('\\'), "{}", q);
         assert!(q.contains("身高"), "{}", q);
-        assert!(q.matches("GRAPH <").count() == 2, "{}", q);
+        assert!(q.contains("CONTAINS(LCASE(?text)"), "{}", q);
+        assert!(q.contains("ASK {"), "{}", q);
 
         // 任一为空不产出生成查询。
-        assert!(entity_attribute_said_sparql_query(session, "", "身高", 0).is_empty());
-        assert!(entity_attribute_said_sparql_query(session, "姚明", "", 0).is_empty());
-        assert!(entity_attribute_said_sparql_query(session, "   ", "身高", 0).is_empty());
+        let blank = GenerationMemory::empty("s-1");
+        assert!(entity_attribute_said_sparql_query(&blank, "", "身高").is_empty());
+        assert!(entity_attribute_said_sparql_query(&blank, "姚明", "", ).is_empty());
+        assert!(entity_attribute_said_sparql_query(&blank, "   ", "身高").is_empty());
     }
 
     #[test]
-    fn list_all_claims_sparql_bounds_turns() {
-        let session = "s-1";
-        let unbounded = list_all_claims_sparql(session, 0);
-        assert!(unbounded.contains("GRAPH ?g"), "{}", unbounded);
-        assert!(!unbounded.contains("GRAPH <"), "{}", unbounded);
-
-        let bounded = list_all_claims_sparql(session, 4);
-        assert!(bounded.matches("GRAPH <").count() == 4, "{}", bounded);
-        assert!(!bounded.contains("?g"), "{}", bounded);
-    }
-
-    #[test]
-    fn find_claim_by_text_sparql_escapes_and_bounds_turns() {
-        let session = "s-1";
-        let unbounded = find_claim_by_text_sparql(session, "姚明\"说'话", 0);
-        assert!(!unbounded.is_empty());
-        // 引号被转义（出现反斜杠），查询结构包含 SELECT + ?seq + ?text
-        assert!(unbounded.contains('\\'), "{}", unbounded);
-        assert!(unbounded.contains("str("), "{}", unbounded);
-        assert!(unbounded.contains("?seq"), "{}", unbounded);
-        assert!(unbounded.contains("?text"), "{}", unbounded);
-        // unbounded 应该有 ?g 变量而非固定的 GRAPH <...
-        assert!(unbounded.contains("GRAPH ?g"), "{}", unbounded);
-        assert!(!unbounded.contains("GRAPH <"), "{}", unbounded);
-
-        // 有界查询应显式列出图 IRI
-        let bounded = find_claim_by_text_sparql(session, "姚明是谁", 3);
-        assert!(bounded.contains("GRAPH <"), "{}", bounded);
-        // 应该有 3 个 GRAPH <.../turn/N> 子句
-        assert_eq!(
-            bounded.matches("GRAPH <").count(),
-            3,
-            "{}",
-            bounded
-        );
-        // 不应出现通配 ?g
-        assert!(!bounded.contains("GRAPH ?g"), "{}", bounded);
-
-        // 空文本不产生查询
-        assert!(find_claim_by_text_sparql(session, "   ", 0).is_empty());
-        assert!(find_claim_by_text_sparql(session, "", 3).is_empty());
-    }
-
-    #[test]
-    fn find_claim_by_text_sparql_identifies_turn() {
+    fn list_all_claims_sparql_bounds_to_memory_graphs() {
         let dir = TempDir::new().unwrap();
-        let session_path = dir.path().join("dialogue.session.json");
-        let session = DialogueSession::open_or_create(&session_path.to_string_lossy()).unwrap();
-        let chronicle_path = dir.path().join("dialogue.chronicle.jsonl");
-        let (mut chronicle, audit) =
-            Chronicle::open(&chronicle_path.to_string_lossy(), FsyncPolicy::None).unwrap();
-        assert!(audit.is_clean());
-        chronicle
-            .append_turn_with_refs(
-                "姚明是谁",
-                "query",
-                None,
-                0,
-                &[EntityRef::linked("姚明", "姚明")],
-            )
-            .unwrap();
-        chronicle
-            .append_reply_with_context(
-                Some("姚明是谁"),
-                "姚明是篮球运动员。\n他的身高是 226 厘米。",
-                &["direct_answer".to_string()],
-                &["身高".to_string()],
-                Some("proof-1"),
-                &[],
-            )
-            .unwrap();
-        chronicle
-            .append_turn_with_refs("他的身高呢", "query", Some("姚明"), 1, &[])
-            .unwrap();
-        chronicle
-            .append_reply(
-                "姚明的身高是 226 厘米。",
-                &["direct_answer".to_string()],
-                &["身高".to_string()],
-                &[],
-            )
-            .unwrap();
-        let index = DialogueArtifactIndex::from_chronicle(&session, &chronicle);
+        let (index, _session, _chronicle) = sample_index(&dir);
         let memory = GenerationMemory::from_index(&index, 0);
+        let bounded = list_all_claims_sparql(&memory);
+        assert!(bounded.contains("SELECT ?digest ?text"), "{}", bounded);
+        assert!(bounded.contains("GRAPH ?g"), "{}", bounded);
+        assert!(bounded.contains("FILTER(?g IN"), "{}", bounded);
+        assert!(bounded.contains(&turn_graph_iri(&memory.session, 1)), "{}", bounded);
+        assert!(bounded.contains(&turn_graph_iri(&memory.session, 3)), "{}", bounded);
+        // 命题而非轮次：类别与摘要谓词都落在 claim 上。
+        assert!(bounded.contains(CLAIM_CLASS), "{}", bounded);
+        assert!(bounded.contains(P_DIGEST), "{}", bounded);
+        assert!(!bounded.contains(TURN_CLASS), "{}", bounded);
 
-        // 查询“姚明是篮球运动员”应定位到第1轮（seq=1）
-        let q = find_claim_by_text_sparql(&memory.session, "姚明是篮球运动员", 0);
-        assert!(!q.is_empty(), "已说过的命题应能被查到");
-        assert!(q.contains("?seq"), "{}", q);
-        assert!(q.contains("?text"), "{}", q);
-        // 应该只命中第1轮
-        assert!(q.contains("GRAPH ?g"), "{}", q);
+        // 空记忆仍产出可执行查询（会话过滤天然无解）。
+        let blank = list_all_claims_sparql(&GenerationMemory::empty("s-1"));
+        assert!(blank.contains("GRAPH ?g"), "{}", blank);
+        assert!(!blank.contains("FILTER(?g IN"), "{}", blank);
+    }
 
-        // 查询“姚明的身高是 226 厘米”应定位到第2轮（seq=2）
-        let q2 = find_claim_by_text_sparql(&memory.session, "姚明的身高是 226 厘米", 0);
-        assert!(!q2.is_empty(), "已说过的命题应能被查到");
-        assert!(q2.contains("?seq"), "{}", q2);
-        assert!(q2.contains("?text"), "{}", q2);
-        // 查询结构应包含 FILTER 与 ||（两个 str() 比较取或）
-        assert!(q2.contains("FILTER"), "{}", q2);
-        assert!(q2.contains("||"), "{}", q2);
+    #[test]
+    fn find_claim_by_text_sparql_escapes_and_bounds_to_memory_graphs() {
+        let dir = TempDir::new().unwrap();
+        let (index, _session, _chronicle) = sample_index(&dir);
+        let memory = GenerationMemory::from_index(&index, 0);
+        let bounded = find_claim_by_text_sparql(&memory, "姚明\"说'话");
+        assert!(!bounded.is_empty());
+        assert!(bounded.contains('\\'), "{}", bounded);
+        assert!(bounded.contains("SELECT ?seq ?text"), "{}", bounded);
+        assert!(bounded.contains("GRAPH ?g"), "{}", bounded);
+        assert!(bounded.contains("FILTER(?g IN"), "{}", bounded);
+        assert!(bounded.contains(&turn_graph_iri(&memory.session, 3)), "{}", bounded);
+        assert!(bounded.contains(CLAIM_CLASS), "{}", bounded);
+        // 命题→回答→轮次 seq 的链路，使 ?seq 可定位轮次。
+        assert!(bounded.contains(P_REPLY), "{}", bounded);
+        assert!(bounded.contains(P_TURN_SEQ), "{}", bounded);
 
-        // 查询未说过的文本不应命中（查询字符串结构应正确）
-        let q3 = find_claim_by_text_sparql(&memory.session, "姚明是足球运动员", 0);
-        // 即使无结果，查询字符串结构应正确
-        assert!(q3.contains("SELECT"), "{}", q3);
-        assert!(q3.contains("WHERE"), "{}", q3);
+        // 空文本不产生查询。
+        let blank = GenerationMemory::empty("s-1");
+        assert!(find_claim_by_text_sparql(&blank, "   ").is_empty());
+        assert!(find_claim_by_text_sparql(&blank, "").is_empty());
+    }
+
+    #[tokio::test]
+    async fn sparql_builders_execute_against_projected_memory() {
+        let dir = TempDir::new().unwrap();
+        let (index, _session, _chronicle) = sample_index(&dir);
+        let memory = GenerationMemory::from_index(&index, 0);
+        let store_dir = dir.path().join("store");
+        let manager = OxigraphManager::with_perf_ledger(
+            &store_dir.to_string_lossy(),
+            Arc::new(PerfLedger::new()),
+        )
+        .unwrap();
+        manager.sync_generation_memory(&memory).await.unwrap();
+
+        // 精确查找：命中第 1 轮（seq=1）的命题。
+        let found = manager
+            .query_sparql(&find_claim_by_text_sparql(&memory, "姚明是篮球运动员"))
+            .await
+            .unwrap();
+        assert_eq!(found.data.len(), 1, "{:?}", found.data);
+        assert_eq!(
+            found.data[0].get("text").and_then(JsonValue::as_str),
+            Some("姚明是篮球运动员。")
+        );
+        assert_eq!(
+            found.data[0].get("seq").and_then(JsonValue::as_str),
+            Some("1"),
+            "命题应能定位到第 1 轮"
+        );
+
+        // ASK：说过返回真（规范化键与内存路径同口径），没说过返回假。
+        let said = manager
+            .query_sparql(&already_said_sparql_query(
+                &memory,
+                "姚明的身高是 226 厘米。",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(said.data[0].get("boolean"), Some(&JsonValue::Bool(true)));
+        let unsaid = manager
+            .query_sparql(&already_said_sparql_query(&memory, "姚明是足球运动员"))
+            .await
+            .unwrap();
+        assert_eq!(unsaid.data[0].get("boolean"), Some(&JsonValue::Bool(false)));
+
+        // 枚举全部命题：只含命题，不含依据文本。
+        let claims = manager
+            .query_sparql(&list_all_claims_sparql(&memory))
+            .await
+            .unwrap();
+        assert_eq!(claims.data.len(), 3, "{:?}", claims.data);
+
+        // 实体+属性兜底口径：包含两个词面即命中。
+        let combined = manager
+            .query_sparql(&entity_attribute_said_sparql_query(&memory, "姚明", "身高"))
+            .await
+            .unwrap();
+        assert_eq!(combined.data[0].get("boolean"), Some(&JsonValue::Bool(true)));
+
+        // 跨会话隔离：另一会话同词面不串扰。
+        let other_dir = TempDir::new().unwrap();
+        let other_session = DialogueSession::open_or_create(
+            &other_dir.path().join("dialogue.session.json").to_string_lossy(),
+        )
+        .unwrap();
+        let (mut other_chronicle, _) = Chronicle::open(
+            &other_dir.path().join("dialogue.chronicle.jsonl").to_string_lossy(),
+            FsyncPolicy::None,
+        )
+        .unwrap();
+        other_chronicle
+            .append_turn("姚明是谁", "query", None, 0)
+            .unwrap();
+        other_chronicle
+            .append_reply("姚明是篮球运动员。", &[], &[], &[])
+            .unwrap();
+        let other_memory = GenerationMemory::from_chronicle(&other_session, &other_chronicle, 0);
+        manager.sync_generation_memory(&other_memory).await.unwrap();
+        let scoped = manager
+            .query_sparql(&find_claim_by_text_sparql(&memory, "姚明是篮球运动员"))
+            .await
+            .unwrap();
+        assert_eq!(
+            scoped.data.len(),
+            1,
+            "本会话查询不得命中其它会话的同词面命题：{:?}",
+            scoped.data
+        );
+        assert_eq!(
+            scoped.data[0].get("seq").and_then(JsonValue::as_str),
+            Some("1")
+        );
     }
 }
