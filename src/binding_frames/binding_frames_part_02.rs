@@ -147,7 +147,7 @@ struct FrameSession {
 ///
 /// 空态不写入快照（`DialogueManagerSnapshot` 用 `Option` + skip），
 /// 因此未启用绑定帧的会话字节不变。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct FrameMemory {
     #[serde(default)]
     turn: u64,
@@ -179,27 +179,6 @@ pub struct FrameMemory {
     ambiguities_cancelled: u64,
     #[serde(default)]
     enumerations: u64,
-}
-impl Default for FrameMemory {
-    fn default() -> Self {
-        Self {
-            turn: 0,
-            env: BTreeMap::new(),
-            last: BTreeMap::new(),
-            pending: None,
-            pending_ambiguity: None,
-            session: None,
-            answered: 0,
-            inherited_slots: 0,
-            clarifications_asked: 0,
-            clarifications_bound: 0,
-            clarifications_cancelled: 0,
-            ambiguities_asked: 0,
-            ambiguities_resolved: 0,
-            ambiguities_cancelled: 0,
-            enumerations: 0,
-        }
-    }
 }
 impl FrameMemory {
     pub fn new() -> Self {
