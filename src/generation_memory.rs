@@ -453,8 +453,8 @@ impl GenerationMemory {
                 .collect();
             unattached_replies.retain(|seq, _| keep.contains(seq));
         }
-        let kept_replies = turns.values().map(|turn| turn.replies.len()).sum::<usize>()
-            + unattached_replies.len();
+        let kept_replies =
+            turns.values().map(|turn| turn.replies.len()).sum::<usize>() + unattached_replies.len();
         let kept_turns: BTreeSet<u64> = turns.keys().copied().collect();
         let receipt = ProjectionReceipt {
             window: max_turns,
@@ -835,9 +835,10 @@ impl GenerationMemory {
             return Err("生成记忆缺少会话标识".to_string());
         }
         let projection = match projection_json {
-            Some(body) => Some(serde_json::from_str::<ProjectionReceipt>(&body).map_err(
-                |error| format!("投影收据解码失败：{}", error),
-            )?),
+            Some(body) => Some(
+                serde_json::from_str::<ProjectionReceipt>(&body)
+                    .map_err(|error| format!("投影收据解码失败：{}", error))?,
+            ),
             None => None,
         };
         Ok(GenerationMemory {
@@ -982,7 +983,13 @@ fn add_projection_quads(
         serde_json::to_string(receipt).map_err(|error| error.to_string())?,
         &graph,
     )?;
-    push_literal(quads, &subject, P_WINDOW, receipt.window.to_string(), &graph)?;
+    push_literal(
+        quads,
+        &subject,
+        P_WINDOW,
+        receipt.window.to_string(),
+        &graph,
+    )?;
     push_literal(
         quads,
         &subject,
@@ -1282,10 +1289,10 @@ fn is_proposition(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::Value as JsonValue;
     use crate::chronicle::{EntityRef, FsyncPolicy};
     use crate::perf_ledger::PerfLedger;
     use crate::OxigraphManager;
+    use serde_json::Value as JsonValue;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -1418,7 +1425,11 @@ mod tests {
             .unwrap()
             .render_line();
         assert!(bounded_line.contains("最近 1 轮"), "{}", bounded_line);
-        assert!(bounded_line.contains("丢弃 1 轮（seq 1）"), "{}", bounded_line);
+        assert!(
+            bounded_line.contains("丢弃 1 轮（seq 1）"),
+            "{}",
+            bounded_line
+        );
     }
 
     #[test]
@@ -1557,6 +1568,31 @@ mod tests {
     }
 
     #[test]
+    fn latest_reply_projects_into_memory_reply_fragment() {
+        let dir = TempDir::new().unwrap();
+        let (index, _session, _chronicle) = sample_index(&dir);
+        let memory = GenerationMemory::from_index(&index, 0);
+        // 与 interactive.rs 注入的供给闭包同一构造路径：最近一条回答 → 切片。
+        let reply = memory.latest_reply().unwrap();
+        let fragment = crate::symbolic_reasoner::MemoryReplyFragment {
+            reply_seq: reply.seq,
+            claims: reply
+                .claims
+                .iter()
+                .map(|claim| (claim.index, claim.text.clone()))
+                .collect(),
+        };
+        assert_eq!(fragment.reply_seq, 4);
+        assert_eq!(
+            fragment.claims,
+            vec![(1u32, "姚明的身高是 226 厘米。".to_string())]
+        );
+        // 空记忆不产切片：复述回退落回既有指引，不伪装成答案。
+        let empty = GenerationMemory::empty("s");
+        assert!(empty.latest_reply().is_none());
+    }
+
+    #[test]
     fn already_replied_matches_full_answer_text() {
         let dir = TempDir::new().unwrap();
         let (index, _session, _chronicle) = sample_index(&dir);
@@ -1683,13 +1719,29 @@ mod tests {
         assert!(unbounded.contains(P_TEXT_KEY), "{}", unbounded);
         assert!(unbounded.contains("GRAPH ?g"), "{}", unbounded);
         // 会话过滤内嵌于图模式，跨会话图不会被扫到。
-        assert!(unbounded.contains(&escape_sparql_literal(&memory.session)), "{}", unbounded);
+        assert!(
+            unbounded.contains(&escape_sparql_literal(&memory.session)),
+            "{}",
+            unbounded
+        );
 
         // 有界：?g 被约束到记忆实际承载的图 IRI（稀疏 seq 1、3，不得枚举 1..=N）。
         assert!(unbounded.contains("FILTER(?g IN"), "{}", unbounded);
-        assert!(unbounded.contains(&turn_graph_iri(&memory.session, 1)), "{}", unbounded);
-        assert!(unbounded.contains(&turn_graph_iri(&memory.session, 3)), "{}", unbounded);
-        assert!(!unbounded.contains(&turn_graph_iri(&memory.session, 2)), "{}", unbounded);
+        assert!(
+            unbounded.contains(&turn_graph_iri(&memory.session, 1)),
+            "{}",
+            unbounded
+        );
+        assert!(
+            unbounded.contains(&turn_graph_iri(&memory.session, 3)),
+            "{}",
+            unbounded
+        );
+        assert!(
+            !unbounded.contains(&turn_graph_iri(&memory.session, 2)),
+            "{}",
+            unbounded
+        );
 
         // 空文本不产出生成查询。
         let blank = GenerationMemory::empty("s-1");
@@ -1711,7 +1763,7 @@ mod tests {
         // 任一为空不产出生成查询。
         let blank = GenerationMemory::empty("s-1");
         assert!(entity_attribute_said_sparql_query(&blank, "", "身高").is_empty());
-        assert!(entity_attribute_said_sparql_query(&blank, "姚明", "", ).is_empty());
+        assert!(entity_attribute_said_sparql_query(&blank, "姚明", "",).is_empty());
         assert!(entity_attribute_said_sparql_query(&blank, "   ", "身高").is_empty());
     }
 
@@ -1724,8 +1776,16 @@ mod tests {
         assert!(bounded.contains("SELECT ?digest ?text"), "{}", bounded);
         assert!(bounded.contains("GRAPH ?g"), "{}", bounded);
         assert!(bounded.contains("FILTER(?g IN"), "{}", bounded);
-        assert!(bounded.contains(&turn_graph_iri(&memory.session, 1)), "{}", bounded);
-        assert!(bounded.contains(&turn_graph_iri(&memory.session, 3)), "{}", bounded);
+        assert!(
+            bounded.contains(&turn_graph_iri(&memory.session, 1)),
+            "{}",
+            bounded
+        );
+        assert!(
+            bounded.contains(&turn_graph_iri(&memory.session, 3)),
+            "{}",
+            bounded
+        );
         // 命题而非轮次：类别与摘要谓词都落在 claim 上。
         assert!(bounded.contains(CLAIM_CLASS), "{}", bounded);
         assert!(bounded.contains(P_DIGEST), "{}", bounded);
@@ -1748,7 +1808,11 @@ mod tests {
         assert!(bounded.contains("SELECT ?seq ?text"), "{}", bounded);
         assert!(bounded.contains("GRAPH ?g"), "{}", bounded);
         assert!(bounded.contains("FILTER(?g IN"), "{}", bounded);
-        assert!(bounded.contains(&turn_graph_iri(&memory.session, 3)), "{}", bounded);
+        assert!(
+            bounded.contains(&turn_graph_iri(&memory.session, 3)),
+            "{}",
+            bounded
+        );
         assert!(bounded.contains(CLAIM_CLASS), "{}", bounded);
         // 命题→回答→轮次 seq 的链路，使 ?seq 可定位轮次。
         assert!(bounded.contains(P_REPLY), "{}", bounded);
@@ -1816,16 +1880,25 @@ mod tests {
             .query_sparql(&entity_attribute_said_sparql_query(&memory, "姚明", "身高"))
             .await
             .unwrap();
-        assert_eq!(combined.data[0].get("boolean"), Some(&JsonValue::Bool(true)));
+        assert_eq!(
+            combined.data[0].get("boolean"),
+            Some(&JsonValue::Bool(true))
+        );
 
         // 跨会话隔离：另一会话同词面不串扰。
         let other_dir = TempDir::new().unwrap();
         let other_session = DialogueSession::open_or_create(
-            &other_dir.path().join("dialogue.session.json").to_string_lossy(),
+            &other_dir
+                .path()
+                .join("dialogue.session.json")
+                .to_string_lossy(),
         )
         .unwrap();
         let (mut other_chronicle, _) = Chronicle::open(
-            &other_dir.path().join("dialogue.chronicle.jsonl").to_string_lossy(),
+            &other_dir
+                .path()
+                .join("dialogue.chronicle.jsonl")
+                .to_string_lossy(),
             FsyncPolicy::None,
         )
         .unwrap();

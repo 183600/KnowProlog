@@ -253,6 +253,11 @@ impl SymbolicReasoner {
             return None;
         }
         let Some(state) = self.context.generation_state().cloned() else {
+            // 会话内没有生成状态（如重启后）：`Focus(n)` 可从 RDF 生成记忆
+            // 回退到「最近一条已说过的回答」，其余指令维持既有指引。
+            if let Some(text) = self.memory_reply_focus(&directive) {
+                return Some(text);
+            }
             return Some(
                 "还没有可复述的回答计划。先用「介绍：实体名」生成一段介绍，再说「简短点」或「完整讲讲」。"
                     .to_string(),
@@ -301,6 +306,37 @@ impl SymbolicReasoner {
                 ))
             }
             Err(error) => Some(error.to_string()),
+        }
+    }
+
+    /// 会话内生成状态缺失时的记忆回退：只接 `Focus(n)`。
+    ///
+    /// 这是「last_plan 跨重启」的最小桥：生成记忆（RDF 命名图）记录了最近
+    /// 一条已说过的回答及其命题点号，`第二点是什么` 一类复述据此仍能应答；
+    /// 其余指令（Brief/Detailed/Restate）语义依赖会话内的 `AnswerPlan`，
+    /// 记忆里只有命题文本，强行桥接会名不副实，维持既有指引措辞。
+    ///
+    /// 供给闭包缺失或返回 `None`（记忆未启用/为空）时返回 `None`，
+    /// 调用方落回「还没有可复述的回答计划」——绝不把空记忆伪装成答案。
+    /// 这是只读召回：不写记忆、不推进知识版本、不重建生成状态。
+    fn memory_reply_focus(&self, directive: &StyleDirective) -> Option<String> {
+        let StyleDirective::Focus(index) = directive else {
+            return None;
+        };
+        let fragment = (self.memory_reply_provider.as_ref()?)()?;
+        let claims = &fragment.claims;
+        let index = *index as u32;
+        match claims.iter().find(|(claim_index, _)| *claim_index == index) {
+            Some((_, text)) => Some(format!(
+                "会话内还没有可复述的回答计划；RDF 生成记忆里最近一条回答（第 {} 条）的第 {} 点：「{}」。",
+                fragment.reply_seq, index, text
+            )),
+            None => Some(format!(
+                "会话内还没有可复述的回答计划；RDF 生成记忆里最近一条回答（第 {} 条）共 {} 点，没有第 {} 点。",
+                fragment.reply_seq,
+                claims.len(),
+                index
+            )),
         }
     }
 
@@ -362,10 +398,7 @@ impl SymbolicReasoner {
     }
 
     /// 单条 claim 的完整解释。
-    pub fn claim_explain(
-        &self,
-        id: &str,
-    ) -> Result<String, crate::claim_lifecycle::ClaimError> {
+    pub fn claim_explain(&self, id: &str) -> Result<String, crate::claim_lifecycle::ClaimError> {
         self.claims.explain(id)
     }
 
@@ -390,7 +423,8 @@ impl SymbolicReasoner {
         reason: &str,
     ) -> Result<crate::claim_lifecycle::Impact, crate::claim_lifecycle::ClaimError> {
         let revision = self.revision;
-        self.claims.retire_fact(fact, kind, reason, revision, revision)
+        self.claims
+            .retire_fact(fact, kind, reason, revision, revision)
     }
 
     /// 显式退役一条生成断言，并传播到依赖它的后代。
@@ -401,7 +435,8 @@ impl SymbolicReasoner {
         reason: &str,
     ) -> Result<crate::claim_lifecycle::Impact, crate::claim_lifecycle::ClaimError> {
         let revision = self.revision;
-        self.claims.retire_claim(id, kind, reason, revision, revision)
+        self.claims
+            .retire_claim(id, kind, reason, revision, revision)
     }
 
     /// 把一条生成断言标为待复核；复述时会被闸门拦下。

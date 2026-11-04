@@ -18,6 +18,8 @@ impl Clone for SymbolicReasoner {
             persisted_laws: self.persisted_laws.clone(),
             context: self.context.clone(),
             already_said_check: None,
+            // 供给闭包不可克隆（Box<dyn Fn>）：分叉后的会话重设或保持无回退。
+            memory_reply_provider: None,
             claims: self.claims.clone(),
             epistemic_turns: self.epistemic_turns.clone(),
             beliefs: self.beliefs.clone(),

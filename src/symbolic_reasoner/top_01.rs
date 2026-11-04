@@ -40,6 +40,7 @@ use crate::dialogue_frame::{self, AskAttributeFrame, FrameMemory, OntologyView};
 use crate::discourse::DiscoursePlanner;
 use crate::entity_linker::{EntityLinker, LinkMethod, LinkedMention};
 use crate::epistemic_turn::{EpistemicTurnBook, TurnEnvelope, TurnPolicy};
+use crate::foil_refinement::FoilLedger;
 use crate::graph_diagnosis::diagnose_failure;
 use crate::graph_ledger;
 use crate::graph_question::{CompiledGraphQuestion, GraphQuestionKind, PatternLexicon};
@@ -74,7 +75,6 @@ use crate::perf_ledger::PerfLedger;
 use crate::plugin::{PluginOutcome, PluginRuntime, RecipeDirection};
 use crate::predicate_registry::PredicateRegistry;
 use crate::prediction_draft::PredictionDrafts;
-use crate::foil_refinement::FoilLedger;
 use crate::predictive_elaboration::{PredictionGuard, PredictiveElaboration};
 use crate::probabilistic_query_intent::{
     Claim, EpistemicMode, EpistemicTarget, ProbabilisticQueryIntent,
@@ -1311,6 +1311,22 @@ pub enum FormalClarificationOutcome {
     NotAnAnswer,
 }
 
+/// RDF 生成记忆里的最近一条回答切片：命题（点号 → 文本）+ 回答 seq。
+///
+/// 会话内生成状态缺失时（重启后），复述指令可据此回退到「已说过的话」，
+/// 而不是谎称没有历史。只承载命题文本，不承载 `AnswerPlan` 结构体：
+/// 跨重启恢复的是「说过什么」，不是生成器内部状态。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryReplyFragment {
+    /// 回答在编年史中的 seq（定位用）。
+    pub reply_seq: u64,
+    /// 命题清单（点号从 1 开始，与回答计划的第 N 点一致）。
+    pub claims: Vec<(u32, String)>,
+}
+
+/// 生成记忆供给闭包：返回最近一条回答的命题切片；无记忆时返回 `None`。
+pub type MemoryReplyProvider = Box<dyn Fn() -> Option<MemoryReplyFragment> + Send + Sync>;
+
 pub struct SymbolicReasoner {
     config: ReasoningConfig,
     aligner: OntologyAligner,
@@ -1334,6 +1350,10 @@ pub struct SymbolicReasoner {
     // 既有生成行为不变。闭包返回 true 表示该命题文本已说过，生成时应跳过，
     // 实现“生成受约束、不重复陈述”。
     already_said_check: Option<Box<dyn Fn(&str) -> bool + Send + Sync>>,
+    // 可选的“生成记忆供给”闭包：由对话循环按已投影的生成记忆设置，默认 None，
+    // 既有复述行为不变。会话内生成状态缺失时（重启后），`Focus(n)` 类复述
+    // 据此回退到记忆里最近一条回答的第 N 点，实现 last_plan 跨重启连续。
+    memory_reply_provider: Option<MemoryReplyProvider>,
     // 生成断言的提交前闸门与生命周期；随对话快照持久化，不写知识图谱。
     claims: crate::claim_lifecycle::ClaimLedger,
     epistemic_turns: EpistemicTurnBook,

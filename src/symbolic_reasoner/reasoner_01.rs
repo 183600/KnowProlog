@@ -143,8 +143,7 @@ impl SymbolicReasoner {
             config.holographic_similarity_floor,
             config.holographic_max_hits,
         );
-        let search_session =
-            crate::search_port::SearchSession::new(config.search_session.clone());
+        let search_session = crate::search_port::SearchSession::new(config.search_session.clone());
         let mut reasoner = Self {
             config,
             aligner,
@@ -160,6 +159,7 @@ impl SymbolicReasoner {
             persisted_laws: None,
             context: DialogueContext::new(5),
             already_said_check: None,
+            memory_reply_provider: None,
             claims: crate::claim_lifecycle::ClaimLedger::new(),
             epistemic_turns: EpistemicTurnBook::new(),
             beliefs: BeliefLedger::default(),
@@ -228,11 +228,15 @@ impl SymbolicReasoner {
     /// 设置“已说过命题”过滤闭包。由对话循环按已投影的生成记忆设置；
     /// `None`（默认）表示不过滤，既有生成行为不变。闭包返回 true 时，
     /// 生成器在 `generate_about` 中跳过该命题文本，避免重复陈述。
-    pub fn set_already_said_check(
-        &mut self,
-        f: Option<Box<dyn Fn(&str) -> bool + Send + Sync>>,
-    ) {
+    pub fn set_already_said_check(&mut self, f: Option<Box<dyn Fn(&str) -> bool + Send + Sync>>) {
         self.already_said_check = f;
+    }
+
+    /// 设置“生成记忆供给”闭包。由对话循环按已投影的生成记忆设置；
+    /// `None`（默认）表示无记忆回退，复述指令维持既有措辞。会话内生成
+    /// 状态缺失时，`Focus(n)` 复述据此取记忆里最近一条回答的第 N 点。
+    pub fn set_memory_reply_provider(&mut self, f: Option<MemoryReplyProvider>) {
+        self.memory_reply_provider = f;
     }
 
     /// 从预热基座分叉一个新会话：知识派生状态按值深拷贝，会话态清零。
@@ -399,8 +403,7 @@ impl SymbolicReasoner {
         &mut self,
         config: &crate::attribute_bridge::AttributeBridgeConfig,
     ) {
-        self.attribute_profiles =
-            crate::attribute_bridge::AttributeRegistry::from_config(config);
+        self.attribute_profiles = crate::attribute_bridge::AttributeRegistry::from_config(config);
         self.generator
             .set_attribute_profiles(&self.attribute_profiles);
     }
@@ -1538,8 +1541,7 @@ impl SymbolicReasoner {
                 sync.inverse_surfaces += 1;
             }
         }
-        let previous: BTreeSet<String> =
-            self.plugin_clauses.iter().map(clause_identity).collect();
+        let previous: BTreeSet<String> = self.plugin_clauses.iter().map(clause_identity).collect();
         let mut current = BTreeSet::new();
         let mut next = Vec::new();
         for compiled in runtime.rule_clauses() {
