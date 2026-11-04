@@ -79,6 +79,39 @@ const P_CORRECTS: &str = "http://example.org/kg/ledger/dialogue/corrects";
 
 type MemoryResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// 为会话构建 SPARQL ASK 查询，用于检查特定文本是否已作为命题出现在生成记忆的任意轮次中。
+///
+/// 返回的查询字符串可直接传给 `oxigraph_manager.query_sparql()` 执行。
+/// 查询会在最近 `max_turns` 轮的命名图中搜索，`max_turns = 0` 表示搜索全部。
+pub fn already_said_sparql_query(session: &str, text: &str, max_turns: usize) -> String {
+    let normalized = answer_key(text);
+    if normalized.is_empty() {
+        return String::new();
+    }
+    let prefix = session_graph_prefix(session);
+    if max_turns == 0 {
+        // 搜索全部轮次：使用 GRAPH ?g 遍历所有生成记忆图
+        format!(
+            "ASK {{ ?g <{}> {{ ?s ?p ?o . FILTER(str(?o) = str(\"{}\") || str(?o) = str(\"{}\") ) }} }}",
+            DIALOGUE_MEMORY_GRAPH_NS, normalized, normalized
+        )
+    } else {
+        // 搜索最近 max_turns 轮：显式列出图 IRI
+        let turn_iris: Vec<String> = (1..=max_turns)
+            .map(|seq| format!("{}/turn/{}", prefix, seq))
+            .collect();
+        let graph_iris: Vec<String> = turn_iris
+            .iter()
+            .map(|iri| format!("GRAPH <{}>", iri))
+            .collect();
+        let graph_clause: String = graph_iris.join(" ");
+        format!(
+            "ASK {{ {} {{ ?s ?p ?o . FILTER(str(?o) = str(\"{}\") || str(?o) = str(\"{}\") ) }} }}",
+            graph_clause, normalized, normalized
+        )
+    }
+}
+
 /// RDF 生成记忆配置（默认开启；开启后每个轮次边界做一次有界投影）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GenerationMemoryConfig {
