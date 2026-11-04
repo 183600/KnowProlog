@@ -878,7 +878,7 @@ pub fn trace_question_with_mention_lexicon(
             let end = start + marker.chars().count();
             let token_at = tokens
                 .iter()
-                .position(|token| token.start <= end - 1 && end - 1 < token.end);
+                .position(|token| token.start < end && end - 1 < token.end);
             let start_aligned = tokens.iter().any(|token| token.start == start);
             let end_aligned = tokens.iter().any(|token| token.end == end);
             markers.push(MarkerTrace {
