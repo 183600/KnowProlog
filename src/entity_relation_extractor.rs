@@ -550,39 +550,119 @@ impl EntityRelationExtractor {
     /// 命中里；这里按词性在第一个功能词/动词处截断，并要求至少两个汉字。
     fn trim_person_candidate(&self, candidate: &str) -> Option<(String, usize)> {
         let mut name = String::new();
+        let mut in_name_mode = false;
+        
         for tag in self.jieba.tag(candidate, false) {
             let word = tag.word;
-            if word.trim().is_empty() || word.chars().any(is_person_boundary) {
-                break;
+            if word.trim().is_empty() {
+                continue;
             }
+            
+            // For person name extraction, we should continue processing as long as we're getting valid name components
+            // The current logic breaks too early at function words like "被"
+            // We should continue processing person names even if there are function words in between
+            
+            if word.trim().is_empty() {
+                continue;
+            }
+            
             let tag_text = tag.tag;
-            if name.is_empty() {
-                let first = word.chars().next()?;
-                if word.chars().count() == 1 && is_common_surname(first) {
-                    name.push_str(word);
-                    continue;
+            
+            // Determine if we're in name extraction mode
+            if !in_name_mode {
+                // Initial mode: be more selective
+                if name.is_empty() {
+                    // For the first character, we're more selective
+                    let first = word.chars().next().unwrap();
+                    if word.chars().count() == 1 && is_common_surname(first) {
+                        name.push_str(word);
+                        in_name_mode = true;
+                        continue;
+                    }
+                    
+                    // If this is a person name tag, we should definitely continue
+                    if crate::pos_ontology::tag_matches("nr", tag_text) {
+                        name.push_str(word);
+                        in_name_mode = true;
+                        continue;
+                    }
+                    
+                    // For the first character, if it's not a surname and not a person name,
+                    // we should check if it's a valid name component
+                    if !is_person_boundary(word.chars().next().unwrap()) && 
+                       !word.chars().any(|c| is_person_boundary(c)) {
+                        // Valid name component, continue
+                        name.push_str(word);
+                        in_name_mode = true;
+                        continue;
+                    }
+                    
+                    // If we have a name started and this word is not a person name tag,
+                    // we should check if we should continue or break
+                    if !name.is_empty() && !crate::pos_ontology::tag_matches("nr", tag_text) {
+                        // We've started extracting a name, and this word is not a person name tag
+                        // Check if it's a valid continuation (like part of a full name)
+                        if word.chars().count() > 1 || 
+                           crate::pos_ontology::tag_matches("nr", tag_text) {
+                            name.push_str(word);
+                            in_name_mode = true;
+                            continue;
+                        }
+                    }
+                    
+                    // If we haven't started a name yet, or this word doesn't make sense as part of a name,
+                    // we should break
+                    if !in_name_mode {
+                        break;
+                    }
                 }
-                if crate::pos_ontology::tag_matches("nr", tag_text) {
-                    name.push_str(word);
-                    continue;
-                }
-                break;
             }
-            if name.chars().count() >= 4 {
-                break;
-            }
-            if crate::pos_ontology::tag_matches("nr", tag_text) {
+            
+            // Continue processing person name tags
+            if in_name_mode && crate::pos_ontology::tag_matches("nr", tag_text) {
                 name.push_str(word);
                 continue;
             }
-            if word.chars().count() == 1
+            
+            // Check length constraint
+            if name.chars().count() >= 4 {
+                break;
+            }
+            
+            // Continue with person name tags
+            if in_name_mode && crate::pos_ontology::tag_matches("nr", tag_text) {
+                name.push_str(word);
+                continue;
+            }
+            
+            // Handle single character cases that might be part of names
+            if in_name_mode && word.chars().count() == 1
                 && matches!(tag_text, "m" | "q" | "a" | "x" | "j" | "s" | "f" | "n")
             {
                 name.push_str(word);
                 continue;
             }
-            break;
+            
+            // If we're in name mode but this word is not a person name tag and doesn't make sense as part of a name,
+            // we should break
+            if in_name_mode && !crate::pos_ontology::tag_matches("nr", tag_text) {
+                // Check if this is a valid continuation (like part of a full name)
+                if word.chars().count() > 1 || 
+                   crate::pos_ontology::tag_matches("nr", tag_text) {
+                    name.push_str(word);
+                    continue;
+                }
+                
+                // Otherwise, break
+                break;
+            }
+            
+            // Default case - break if not in name mode
+            if !in_name_mode {
+                break;
+            }
         }
+        
         let byte_len = name.len();
         let char_count = name.chars().count();
         if (2..=4).contains(&char_count) {
