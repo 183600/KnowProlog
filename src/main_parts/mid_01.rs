@@ -417,11 +417,15 @@ fn isolate_dialogue_state_path(path: &mut Option<String>, store_path: &str) {
 ///
 /// 三级守卫保证默认路径逐字节不变：配置未启用 → 不分类不读图；不是元话语 →
 /// 不读图；读图失败 → 打印原因并退回既有管线（绝不以空结果冒充召回失败）。
+/// `raw_input` 是写前日志登记的用户词面（可能与插件改写后的 `input` 不同）：
+/// 召回前剔除与之匹配的在途未回答轮次，避免回顾把自己的问句复述成历史；
+/// 空词面（ask 等不落编年史的入口）不剔除任何轮次。
 async fn answer_generation_recall(
     config: &know_prolog::SystemConfig,
     manager: &OxigraphManager,
     session: &know_prolog::dialogue_uri::DialogueSession,
     input: &str,
+    raw_input: &str,
 ) -> Option<know_prolog::generation_recall::RecallReply> {
     if !config.generation_memory.enabled {
         return None;
@@ -431,13 +435,16 @@ async fn answer_generation_recall(
     }
     // 先把本会话的生成记忆从 RDF 命名图读回，供 SPARQL 召回用于图边界；
     // 读图失败不阻塞，回退既有管线。
-    let memory = match manager.load_generation_memory(session.id()).await {
+    let mut memory = match manager.load_generation_memory(session.id()).await {
         Ok(memory) => memory,
         Err(error) => {
             eprintln!("读取生成记忆失败（本轮不走召回）：{}", error);
             return None;
         }
     };
+    // 在途轮次剔除（本地副本；共享记忆与 RDF 落图不受影响）。
+    memory.drop_trailing_unanswered_turn(input);
+    memory.drop_trailing_unanswered_turn(raw_input);
     // Try SPARQL-based recall first（已受图边界约束，不扫全图）
     if let Some(reply) =
         know_prolog::generation_recall::recall_sparql(manager, &memory, input).await
@@ -2033,7 +2040,7 @@ mod generation_recall_default_off_tests {
             "当前焦点是谁",
         ] {
             let reply =
-                answer_generation_recall(&config, &manager, &session, question).await;
+                answer_generation_recall(&config, &manager, &session, question, "").await;
             assert!(
                 reply.is_none(),
                 "生成记忆关闭时「{question}」必须返回 None，不得抢答元话语"
@@ -2041,7 +2048,7 @@ mod generation_recall_default_off_tests {
         }
 
         // 普通问句不受影响：classify 返回 None 即早退。
-        let reply = answer_generation_recall(&config, &manager, &session, "姚明多大？").await;
+        let reply = answer_generation_recall(&config, &manager, &session, "姚明多大？", "").await;
         assert!(reply.is_none());
 
         // 默认图不得被写入：三级守卫在 enabled=false 时直接返回，不触及命名图。
@@ -2053,5 +2060,57 @@ mod generation_recall_default_off_tests {
             default_graph.data.is_empty(),
             "生成记忆关闭时默认图必须保持干净"
         );
+    }
+
+    #[tokio::test]
+    async fn generation_recall_excludes_inflight_unanswered_turn() {
+        use know_prolog::dialogue_uri::{DialogueArtifactIndex, DialogueSession};
+        use know_prolog::generation_memory::GenerationMemory;
+
+        let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR 应设置");
+        let config_path = Path::new(&manifest_dir).join("config.toml");
+        let mut config =
+            load_config_from(config_path.to_str().unwrap()).await.expect("config.toml 应能加载");
+        config.generation_memory.enabled = true;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store_dir = dir.path().join("store");
+        let manager =
+            OxigraphManager::new(store_dir.to_str().unwrap()).expect("打开临时存储应成功");
+        let session_path = dir.path().join("dialogue.session.json");
+        let session = DialogueSession::open_or_create(&session_path.to_string_lossy())
+            .expect("会话标识打开应成功");
+
+        // 历史轮 + 在途轮（写前日志已登记当前问句，但还没有回答）。
+        let chronicle_path = dir.path().join("dialogue.chronicle.jsonl");
+        let (mut chronicle, _) = know_prolog::chronicle::Chronicle::open(
+            &chronicle_path.to_string_lossy(),
+            know_prolog::chronicle::FsyncPolicy::None,
+        )
+        .expect("编年史打开应成功");
+        chronicle
+            .append_turn("姚明是谁", "query", None, 0)
+            .unwrap();
+        chronicle
+            .append_reply("姚明是篮球运动员。", &[], &[], &[])
+            .unwrap();
+        chronicle
+            .append_turn("我们刚才聊了什么", "query", None, 1)
+            .unwrap();
+        let memory = GenerationMemory::from_chronicle(&session, &chronicle, 0);
+        manager.sync_generation_memory(&memory).await.unwrap();
+
+        // 回顾不得把当前问句复述成历史轮次；历史问答仍在。
+        let reply =
+            answer_generation_recall(&config, &manager, &session, "我们刚才聊了什么", "我们刚才聊了什么")
+                .await
+                .expect("开启生成记忆后回顾应被召回接管");
+        assert!(
+            !reply.render().contains("我们刚才聊了什么"),
+            "在途问句不得出现在回顾里：{}",
+            reply.render()
+        );
+        assert!(reply.render().contains("姚明是谁"), "{}", reply.render());
+        assert!(reply.render().contains("姚明是篮球运动员"), "{}", reply.render());
     }
 }

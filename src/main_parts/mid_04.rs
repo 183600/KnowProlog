@@ -113,7 +113,7 @@ async fn run_ask(
         // 与交互模式同一套三级守卫；不创建会话标识，读图失败即放行。
         if let Some(session) = recall_session.as_ref() {
             if let Some(reply) =
-                answer_generation_recall(config, oxigraph_manager, session, &question).await
+                answer_generation_recall(config, oxigraph_manager, session, &question, "").await
             {
                 answers.push(AskAnswer {
                     question,

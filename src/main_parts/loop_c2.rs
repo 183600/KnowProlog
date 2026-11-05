@@ -1021,7 +1021,8 @@
                     }
                 }
                 if let Some(reply) =
-                    answer_generation_recall(&config, &oxigraph_manager, session, input).await
+                    answer_generation_recall(&config, &oxigraph_manager, session, input, raw_input)
+                        .await
                 {
                     println!("{}", reply.render());
                     log_chronicle_reply(&mut chronicle, reply.render(), &reply.plan, &[], &[]);

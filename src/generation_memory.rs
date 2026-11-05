@@ -270,14 +270,7 @@ pub fn locate_claim_by_text_sparql(memory: &GenerationMemory, text: &str) -> Str
                 "?claim a <{}> . ?claim <{}> ?text . ?claim <{}> \"{}\" . \
                  ?claim <{}> ?claimIndex . ?claim <{}> ?reply . ?reply <{}> ?replySeq . \
                  OPTIONAL {{ ?reply <{}> ?turnSeq . }}",
-                CLAIM_CLASS,
-                P_TEXT,
-                P_TEXT_KEY,
-                escaped,
-                P_INDEX,
-                P_REPLY,
-                P_SEQ,
-                P_TURN_SEQ
+                CLAIM_CLASS, P_TEXT, P_TEXT_KEY, escaped, P_INDEX, P_REPLY, P_SEQ, P_TURN_SEQ
             )
         )
     )
@@ -289,11 +282,7 @@ pub fn locate_claim_by_text_sparql(memory: &GenerationMemory, text: &str) -> Str
 pub fn count_claims_sparql(memory: &GenerationMemory) -> String {
     format!(
         "SELECT (COUNT(?claim) AS ?total) WHERE {{ {} }}",
-        memory_graph_body(
-            memory,
-            "?claim",
-            &format!("?claim a <{}> .", CLAIM_CLASS)
-        )
+        memory_graph_body(memory, "?claim", &format!("?claim a <{}> .", CLAIM_CLASS))
     )
 }
 
@@ -866,6 +855,31 @@ impl GenerationMemory {
             return uris;
         }
         Vec::new()
+    }
+
+    /// 丢弃末尾「已提问但还没有回答」的轮次（写前日志下的在途回合），
+    /// 供召回在回答前剔除当前问句，避免回顾把自己复述成历史。
+    ///
+    /// 只删最后一轮，且必须同时满足「无回答」与「用户词面一致」（按
+    /// `answer_key` 规范化，折叠空白/标点/大小写）；不满足时不删，崩溃
+    /// 轮次与历史轮次原样保留。若投影收据记录了该轮，同步从保留名单去掉，
+    /// 使「投影保留最近 K 轮」与实际渲染的轮数一致。
+    pub fn drop_trailing_unanswered_turn(&mut self, user: &str) -> bool {
+        let needle = crate::chronicle::answer_key(user);
+        if needle.is_empty() {
+            return false;
+        }
+        let Some((&seq, stored)) = self.turns.iter().next_back() else {
+            return false;
+        };
+        if !stored.replies.is_empty() || crate::chronicle::answer_key(&stored.turn.user) != needle {
+            return false;
+        }
+        self.turns.remove(&seq);
+        if let Some(receipt) = self.projection.as_mut() {
+            receipt.kept_turns.retain(|kept| *kept != seq);
+        }
+        true
     }
 
     /// 投影为 RDF 四元组（确定性排序、去重）。
@@ -1545,6 +1559,59 @@ mod tests {
     }
 
     #[test]
+    fn drop_trailing_unanswered_turn_removes_only_matching_inflight_turn() {
+        let dir = TempDir::new().unwrap();
+        let (index, _session, _chronicle) = sample_index(&dir);
+        let mut memory = GenerationMemory::from_index(&index, 0);
+        let base_turns = memory.turn_count();
+
+        // 在途回合：已写前日志、还没有回答；词面与当前输入一致才删除。
+        memory.add_turn(
+            9,
+            "我们刚才聊了什么？".to_string(),
+            "query".to_string(),
+            None,
+        );
+        assert!(memory.drop_trailing_unanswered_turn("我们刚才聊了什么？"));
+        assert_eq!(memory.turn_count(), base_turns);
+
+        // 词面不一致（即便同样没有回答）不删除：不误伤崩溃轮次。
+        memory.add_turn(9, "还没答的问题".to_string(), "query".to_string(), None);
+        assert!(!memory.drop_trailing_unanswered_turn("我们刚才聊了什么？"));
+        assert_eq!(memory.turn_count(), base_turns + 1);
+
+        // 已有回答的末轮不删除。
+        memory.clear();
+        let mut fresh = GenerationMemory::from_index(&index, 0);
+        assert!(!fresh.drop_trailing_unanswered_turn("姚明是谁"));
+        assert_eq!(fresh.turn_count(), base_turns);
+
+        // 有界投影收据同步收缩：保留名单不再含被剔除的 seq。
+        let (index, _session, _chronicle) = sample_index(&dir);
+        let mut bounded = GenerationMemory::from_index(&index, 2);
+        let kept_before = bounded.projection.as_ref().unwrap().kept_turns.clone();
+        bounded.add_turn(
+            kept_before.last().copied().unwrap_or(0).saturating_add(1),
+            "我们刚才聊了什么".to_string(),
+            "query".to_string(),
+            None,
+        );
+        let inflight_seq = *bounded.turns.keys().next_back().unwrap();
+        assert!(bounded.drop_trailing_unanswered_turn("我们刚才聊了什么"));
+        let receipt = bounded.projection.as_ref().unwrap();
+        assert!(
+            !receipt.kept_turns.contains(&inflight_seq),
+            "{:?}",
+            receipt.kept_turns
+        );
+
+        // 空记忆与空词面直接返回 false。
+        let mut empty = GenerationMemory::empty("s-1");
+        assert!(!empty.drop_trailing_unanswered_turn("随便什么"));
+        assert!(!empty.drop_trailing_unanswered_turn("   "));
+    }
+
+    #[test]
     fn projection_roundtrips_and_isolates_per_turn_graphs() {
         let dir = TempDir::new().unwrap();
         let (index, _session, _chronicle) = sample_index(&dir);
@@ -2063,7 +2130,11 @@ mod tests {
         let (index, _session, _chronicle) = sample_index(&dir);
         let memory = GenerationMemory::from_index(&index, 0);
         let query = latest_reply_claims_sparql(&memory);
-        assert!(query.contains("SELECT ?replySeq ?claimIndex ?text"), "{}", query);
+        assert!(
+            query.contains("SELECT ?replySeq ?claimIndex ?text"),
+            "{}",
+            query
+        );
         assert!(query.contains(REPLY_CLASS), "{}", query);
         assert!(query.contains(P_HAS_CLAIM), "{}", query);
         assert!(
@@ -2194,7 +2265,9 @@ mod tests {
             Some("2")
         );
         assert_eq!(
-            located.data[0].get("claimIndex").and_then(JsonValue::as_str),
+            located.data[0]
+                .get("claimIndex")
+                .and_then(JsonValue::as_str),
             Some("1")
         );
         assert_eq!(
@@ -2207,15 +2280,11 @@ mod tests {
             .query_sparql(&count_claims_sparql(&memory))
             .await
             .unwrap();
-        let total = counted
-            .data[0]
-            .get("total")
-            .cloned()
-            .unwrap_or_default();
+        let total = counted.data[0].get("total").cloned().unwrap_or_default();
         assert_eq!(
-            total.as_u64().or_else(|| {
-                total.as_str().and_then(|s| s.parse::<u64>().ok())
-            }),
+            total
+                .as_u64()
+                .or_else(|| { total.as_str().and_then(|s| s.parse::<u64>().ok()) }),
             Some(3),
             "{:?}",
             counted.data

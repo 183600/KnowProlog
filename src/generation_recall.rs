@@ -261,7 +261,13 @@ async fn recall_already_said_sparql(
         .query_sparql(&generation_memory::count_claims_sparql(memory))
         .await
         .ok()
-        .and_then(|counted| counted.data.first().and_then(|row| row.get("total")).cloned())
+        .and_then(|counted| {
+            counted
+                .data
+                .first()
+                .and_then(|row| row.get("total"))
+                .cloned()
+        })
         .and_then(|total| total.as_u64().map(|n| n as usize))
         .unwrap_or_else(|| memory.claim_count());
     let bound = match memory.projection.as_ref() {
@@ -320,7 +326,10 @@ async fn recall_plan_step_sparql(
     if claims.is_empty() {
         return None;
     }
-    match claims.iter().find(|(claim_index, _)| *claim_index == index as u32) {
+    match claims
+        .iter()
+        .find(|(claim_index, _)| *claim_index == index as u32)
+    {
         Some((_, text)) => Some(format!(
             "第 {} 点出自第 {} 条回答：「{}」。（SPARQL 召回）",
             index, latest_seq, text
@@ -1252,7 +1261,11 @@ mod tests {
             "被窗口丢弃的轮次不得出现在回顾里：{}",
             recap.text
         );
-        assert!(recap.text.contains("姚明的身高是 226 厘米"), "{}", recap.text);
+        assert!(
+            recap.text.contains("姚明的身高是 226 厘米"),
+            "{}",
+            recap.text
+        );
     }
 
     #[test]
@@ -1349,16 +1362,16 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            no_corrections
-                .text
-                .contains("还没有记录更正关系")
+            no_corrections.text.contains("还没有记录更正关系")
                 && no_corrections.text.contains("SPARQL 确认"),
             "{}",
             no_corrections.text
         );
 
         // 当前焦点：SPARQL 召回最近一次焦点（第 3 轮「姚明」）。
-        let focus = recall_sparql(&manager, &loaded, "当前焦点是谁").await.unwrap();
+        let focus = recall_sparql(&manager, &loaded, "当前焦点是谁")
+            .await
+            .unwrap();
         let memory_focus = recall(&loaded, "当前焦点是谁").unwrap();
         assert_eq!(
             focus.text,
@@ -1389,11 +1402,11 @@ mod tests {
             .load_generation_memory(&corrected_memory.session)
             .await
             .unwrap();
-        let corrections_sparql_reply = recall_sparql(&manager, &corrected_loaded, "上次和这次矛盾吗")
-            .await
-            .unwrap();
-        let corrections_memory_reply =
-            recall(&corrected_loaded, "上次和这次矛盾吗").unwrap();
+        let corrections_sparql_reply =
+            recall_sparql(&manager, &corrected_loaded, "上次和这次矛盾吗")
+                .await
+                .unwrap();
+        let corrections_memory_reply = recall(&corrected_loaded, "上次和这次矛盾吗").unwrap();
         assert_eq!(
             corrections_sparql_reply.text,
             format!("{}（SPARQL 确认）", corrections_memory_reply.text),
@@ -1401,7 +1414,9 @@ mod tests {
             corrections_sparql_reply.text,
             corrections_memory_reply.text
         );
-        assert!(corrections_sparql_reply.text.contains("共记录 1 条更正关系"));
+        assert!(corrections_sparql_reply
+            .text
+            .contains("共记录 1 条更正关系"));
 
         // 跨会话隔离：另一会话同词面不串入本会话的 SPARQL 召回。
         let other_dir = TempDir::new().unwrap();
