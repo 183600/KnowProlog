@@ -113,6 +113,75 @@ impl SymbolicReasoner {
         Some(text)
     }
 
+    /// 「还有没说过的事实吗」：把图谱命题与已投影的生成记忆对账。
+    ///
+    /// 与 [`Self::generate_about`] 同一条命题管线（图谱 + 会话覆盖层 → 画像
+    /// 命题，Relevance 排序），再用 `already_said_check` 滤掉已说过的命题，
+    /// 剩下的就是「图谱有、但本会话还没说过」的事实。这是生成约束的只读
+    /// 视图：不重建生成状态、不写记忆、不推进知识版本。
+    ///
+    /// 语义边界：
+    /// - 记忆检查缺失（未启用或未投影）时显式说明，绝不把全部命题谎报为
+    ///   「没说过」；
+    /// - 全部已说时明确说「没有遗漏」；图谱没有该实体时也不伪装成空结果；
+    /// - 排序与 `generate_about` 一致，同输入同输出（确定性）。
+    ///
+    /// `entity_raw` 为 `None` 或空白时回落到当前对话焦点实体。
+    pub fn unsaid_facts_report(&mut self, entity_raw: Option<&str>) -> Option<String> {
+        if !self.config.enable_generation {
+            return None;
+        }
+        let Some(check) = self.already_said_check.as_ref() else {
+            return Some(
+                "生成记忆未启用或尚未投影，无法判断哪些事实已说过；可在 config.toml 开启 [generation_memory] 后重试。"
+                    .to_string(),
+            );
+        };
+        let requested = entity_raw.map(str::trim).filter(|entity| !entity.is_empty());
+        let entity = match requested {
+            Some(entity) => {
+                let canonical = self.aligner.canonical_form(entity);
+                if canonical.is_empty() {
+                    entity.to_string()
+                } else {
+                    canonical
+                }
+            }
+            None => match self.context.focus().map(str::to_string) {
+                Some(focus) => focus,
+                None => {
+                    return Some(
+                        "还没有可对账的实体焦点：先聊一个实体，或用「没说过：实体名」指定。"
+                            .to_string(),
+                    )
+                }
+            },
+        };
+        let overlay = self.generation_overlay();
+        let Some(clauses) =
+            self.generator
+                .profile_clauses_with_overlay(&entity, GenerationOrder::Relevance, &overlay)
+        else {
+            return Some(format!("知识图谱中没有关于「{}」的可生成事实。", entity));
+        };
+        let unsaid: Vec<&str> = clauses
+            .iter()
+            .map(|clause| clause.sentence.as_str())
+            .filter(|sentence| !check(sentence))
+            .collect();
+        if unsaid.is_empty() {
+            return Some(format!(
+                "关于「{}」的图谱事实都已说过，没有遗漏的命题。",
+                entity
+            ));
+        }
+        let mut report = format!("关于「{}」还有 {} 条没说过的事实：", entity, unsaid.len());
+        for (position, sentence) in unsaid.iter().enumerate() {
+            report.push_str(&format!("\n  {}. {}", position + 1, sentence));
+        }
+        Some(report)
+    }
+
     /// 观察一份新计划：只有启用 PCC 时才写入逐命题复核台账。
     fn observe_epistemic_plan(&mut self, plan: &AnswerPlan) {
         if !self.config.confidence.enabled {

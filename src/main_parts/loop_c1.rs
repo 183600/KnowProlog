@@ -530,6 +530,41 @@
             continue;
         }
 
+        // 生成记忆对账：「还有没说过的事实吗」/「没说过：实体名」——
+        // 图谱命题 × 已投影生成记忆，只读列出「图谱有、但还没说过」的事实。
+        // 开关关闭时同样给出明确指引，不静默、不把全部命题谎报为未说过。
+        {
+            let stripped = input.trim().trim_end_matches(['？', '?', '。', '！', '!']);
+            let targeted = strip_any_prefix(
+                input,
+                &["没说过：", "没说过:", "还没说过：", "还没说过:"],
+            )
+            .map(str::trim)
+            .filter(|entity| !entity.is_empty());
+            let asked = matches!(
+                stripped,
+                "还有没说过的事实吗"
+                    | "还有什么没说过"
+                    | "还有哪些没说过"
+                    | "还有什么没说过的"
+                    | "还有没说过的吗"
+                    | "有没说过的事实吗"
+                    | "没说过的事实"
+            );
+            if targeted.is_some() || asked {
+                match load_graph_snapshot(&oxigraph_manager).await {
+                    Ok(facts) => symbolic_reasoner.observe_facts(&facts),
+                    Err(e) => println!("加载知识图谱失败: {}", e),
+                }
+                match symbolic_reasoner.unsaid_facts_report(targeted) {
+                    Some(text) => println!("{}", text),
+                    None => println!("生成功能未启用，无法对账已说与未说的事实。"),
+                }
+                println!();
+                continue;
+            }
+        }
+
         // 符号主义叙述：OWL 本体定义开场 + 层级/继承推理 + DCG 文法实现的多句连贯段落
         if let Some(entity) = strip_any_prefix(
             input,

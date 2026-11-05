@@ -530,6 +530,48 @@ rules = [
         );
     }
 
+    /// 「还有没说过的事实吗」：图谱命题与生成记忆对账的三态——
+    /// 有遗漏逐条列出、全部已说显式说清、无记忆时诚实说明而不是谎报。
+    #[test]
+    fn unsaid_facts_report_reconciles_graph_claims_with_memory() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+
+        // 无记忆检查：不得把全部命题谎报为「没说过」。
+        let no_memory = reasoner
+            .unsaid_facts_report(Some("张三"))
+            .expect("无记忆也应给出明确说明");
+        assert!(no_memory.contains("生成记忆未启用"), "{}", no_memory);
+
+        // 部分已说：只列剩余命题，已说的不再出现。
+        reasoner.set_already_said_check(Some(Box::new(|text| text == "张三的师傅是李四。")));
+        let partial = reasoner
+            .unsaid_facts_report(Some("张三"))
+            .expect("有遗漏应逐条列出");
+        assert!(partial.contains("还有 1 条没说过的事实"), "{}", partial);
+        assert!(partial.contains("张三的师祖是王五"), "{}", partial);
+        assert!(!partial.contains("师傅是李四"), "{}", partial);
+
+        // 全部已说：明确说「没有遗漏」。
+        reasoner.set_already_said_check(Some(Box::new(|_| true)));
+        let exhausted = reasoner
+            .unsaid_facts_report(Some("张三"))
+            .expect("全部已说也应显式说明");
+        assert!(exhausted.contains("没有遗漏"), "{}", exhausted);
+
+        // 图谱没有该实体：不伪装成空结果。
+        let unknown = reasoner
+            .unsaid_facts_report(Some("不存在的人"))
+            .expect("未知实体应显式说明");
+        assert!(unknown.contains("没有关于「不存在的人」"), "{}", unknown);
+
+        // 无实体且无焦点：给指引，不猜。
+        let no_focus = reasoner
+            .unsaid_facts_report(None)
+            .expect("无焦点应给指引");
+        assert!(no_focus.contains("实体焦点"), "{}", no_focus);
+    }
+
     #[test]
     fn test_generation_audit_drops_unsupported_and_unparsed_sentences() {
         let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
