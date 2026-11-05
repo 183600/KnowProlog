@@ -220,12 +220,11 @@ pub fn recall_intent(memory: &GenerationMemory, intent: RecallIntent) -> RecallR
 /// SPARQL-based recall for AlreadySaid intent: uses ASK query against named graphs.
 async fn recall_already_said_sparql(
     manager: &OxigraphManager,
-    session: &str,
+    memory: &GenerationMemory,
     target: Option<&str>,
 ) -> Option<String> {
-    let memory = GenerationMemory::empty(session);
     let query = if let Some(target) = target.filter(|t| !t.is_empty()) {
-        generation_memory::already_said_sparql_query(&memory, target)
+        generation_memory::already_said_sparql_query(memory, target)
     } else {
         // For "这句话说过吗" without explicit target, we need the latest claim
         // Fall back to in-memory for now as it requires the latest claim
@@ -250,17 +249,18 @@ async fn recall_already_said_sparql(
 /// SPARQL-based recall for PlanStep intent: uses SELECT query against named graphs.
 async fn recall_plan_step_sparql(
     manager: &OxigraphManager,
-    session: &str,
+    memory: &GenerationMemory,
     index: usize,
 ) -> Option<String> {
-    let memory = GenerationMemory::empty(session);
-    let query = generation_memory::list_all_claims_sparql(&memory);
+    let query = generation_memory::list_all_claims_sparql(memory);
     if query.is_empty() {
         return None;
     }
     match manager.query_sparql(&query).await {
         Ok(result) => {
-            let claims: Vec<_> = result.data.iter()
+            let claims: Vec<_> = result
+                .data
+                .iter()
                 .filter_map(|row| {
                     let digest = row.get("digest")?.as_str()?;
                     let text = row.get("text")?.as_str()?;
@@ -272,7 +272,11 @@ async fn recall_plan_step_sparql(
                 return Some(format!("第 {} 点（SPARQL 召回）：{}", index, text));
             }
             if !claims.is_empty() {
-                return Some(format!("生成记忆里一共 {} 条命题，没有第 {} 点。", claims.len(), index));
+                return Some(format!(
+                    "生成记忆里一共 {} 条命题，没有第 {} 点。",
+                    claims.len(),
+                    index
+                ));
             }
             Some("生成记忆里还没有命题。".to_string())
         }
@@ -283,9 +287,8 @@ async fn recall_plan_step_sparql(
 /// SPARQL-based recall for Recap intent: uses SELECT across named graphs.
 async fn recall_recap_sparql(
     manager: &OxigraphManager,
-    session: &str,
+    memory: &GenerationMemory,
 ) -> Option<String> {
-    let memory = GenerationMemory::empty(session);
     let query = format!(
         "SELECT ?turnSeq ?user ?replySeq ?answer WHERE {{
             GRAPH ?g {{
@@ -308,7 +311,8 @@ async fn recall_recap_sparql(
         generation_memory::P_SEQ,
         generation_memory::P_ANSWER,
         generation_memory::P_TURN_SEQ,
-        memory.graph_iris()
+        memory
+            .graph_iris()
             .iter()
             .map(|iri| format!("<{}>", iri))
             .collect::<Vec<_>>()
@@ -323,9 +327,16 @@ async fn recall_recap_sparql(
             text.push_str("生成记忆回顾（SPARQL 命名图）：\n");
             let mut current_turn = 0u64;
             for row in &result.data {
-                let turn_seq = row.get("turnSeq").and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                let turn_seq = row
+                    .get("turnSeq")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
                 let user = row.get("user").and_then(|v| v.as_str()).unwrap_or("");
-                let reply_seq = row.get("replySeq").and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok());
+                let reply_seq = row
+                    .get("replySeq")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse::<u64>().ok());
                 let answer = row.get("answer").and_then(|v| v.as_str()).unwrap_or("");
                 if turn_seq != current_turn {
                     current_turn = turn_seq;
@@ -348,24 +359,21 @@ async fn recall_recap_sparql(
     }
 }
 
-/// SPARQL-based recall dispatcher.
+/// SPARQL-based recall dispatcher：使用已加载的记忆，使图查询受限于该会话
+/// 实际承载的命名图（`graph_iris()`），避免全图扫描。
 pub async fn recall_sparql(
     manager: &OxigraphManager,
-    session: &str,
+    memory: &GenerationMemory,
     input: &str,
 ) -> Option<RecallReply> {
     let intent = classify(input)?;
     let intent_tag = intent.tag().to_string();
     let text = match &intent {
         RecallIntent::AlreadySaid(target) => {
-            recall_already_said_sparql(manager, session, target.as_deref()).await
+            recall_already_said_sparql(manager, memory, target.as_deref()).await
         }
-        RecallIntent::PlanStep(index) => {
-            recall_plan_step_sparql(manager, session, *index).await
-        }
-        RecallIntent::Recap => {
-            recall_recap_sparql(manager, session).await
-        }
+        RecallIntent::PlanStep(index) => recall_plan_step_sparql(manager, memory, *index).await,
+        RecallIntent::Recap => recall_recap_sparql(manager, memory).await,
         _ => None,
     };
     text.map(|text| RecallReply {
@@ -1108,6 +1116,104 @@ mod tests {
         // 规范化只折叠空白/标点/大小写：数字与汉字差异仍算没说过。
         let said = recall(&loaded, "说过吗： 姚明的身高是 226 厘米。").unwrap();
         assert!(said.text.contains("这句话说过"), "{}", said.text);
+    }
+
+    #[tokio::test]
+    async fn recall_sparql_bounds_to_session_graphs_and_isolates_sessions() {
+        let dir = TempDir::new().unwrap();
+        let memory = sample_memory(&dir);
+        let manager = OxigraphManager::with_perf_ledger(
+            &dir.path().join("store").to_string_lossy(),
+            Arc::new(PerfLedger::new()),
+        )
+        .unwrap();
+        manager.sync_generation_memory(&memory).await.unwrap();
+        let loaded = manager
+            .load_generation_memory(&memory.session)
+            .await
+            .unwrap();
+
+        // SPARQL 已说查询：命中本会话命题，受图边界约束。
+        let said = recall_sparql(&manager, &loaded, "说过吗：姚明是篮球运动员")
+            .await
+            .unwrap();
+        assert!(said.text.contains("这句话说过"), "{}", said.text);
+
+        let unsaid = recall_sparql(&manager, &loaded, "说过吗：姚明是足球运动员")
+            .await
+            .unwrap();
+        assert!(unsaid.text.contains("没有说过"), "{}", unsaid.text);
+
+        // 回顾：跨轮读取回答。
+        let recap = recall_sparql(&manager, &loaded, "我们刚才聊了点什么")
+            .await
+            .unwrap();
+        assert!(recap.text.contains("SPARQL 命名图"), "{}", recap.text);
+
+        // 第 N 个命题：SPARQL 召回（列表无序，只断言返回的是已知命题之一）。
+        let step = recall_sparql(&manager, &loaded, "上一个回答的第1个命题是什么")
+            .await
+            .unwrap();
+        let known_texts = [
+            "姚明是篮球运动员。",
+            "他的身高是 226 厘米。",
+            "姚明的身高是 226 厘米。",
+        ];
+        assert!(
+            known_texts.iter().any(|t| step.text.contains(t)),
+            "未返回已知命题之一：{}",
+            step.text
+        );
+
+        // 跨会话隔离：另一会话同词面不串入本会话的 SPARQL 召回。
+        let other_dir = TempDir::new().unwrap();
+        let other_session = DialogueSession::open_or_create(
+            &other_dir
+                .path()
+                .join("dialogue.session.json")
+                .to_string_lossy(),
+        )
+        .unwrap();
+        let (mut other_chronicle, _) = Chronicle::open(
+            &other_dir
+                .path()
+                .join("dialogue.chronicle.jsonl")
+                .to_string_lossy(),
+            FsyncPolicy::None,
+        )
+        .unwrap();
+        other_chronicle
+            .append_turn("姚明是谁", "query", None, 0)
+            .unwrap();
+        other_chronicle
+            .append_reply("姚明是足球运动员。", &[], &[], &[])
+            .unwrap();
+        let other_memory = GenerationMemory::from_chronicle(&other_session, &other_chronicle, 0);
+        manager.sync_generation_memory(&other_memory).await.unwrap();
+        let other_loaded = manager
+            .load_generation_memory(other_session.id())
+            .await
+            .unwrap();
+
+        // 本会话查询「姚明是足球运动员」应仍为未说过（其他会话的不串入）。
+        let scoped = recall_sparql(&manager, &loaded, "说过吗：姚明是足球运动员")
+            .await
+            .unwrap();
+        assert!(
+            scoped.text.contains("没有说过"),
+            "本会话 SPARQL 召回不得命中其它会话：{}",
+            scoped.text
+        );
+
+        // 其它会话自己的查询应命中。
+        let other_said = recall_sparql(&manager, &other_loaded, "说过吗：姚明是足球运动员")
+            .await
+            .unwrap();
+        assert!(
+            other_said.text.contains("这句话说过"),
+            "{}",
+            other_said.text
+        );
     }
 
     #[test]

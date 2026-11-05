@@ -429,18 +429,23 @@ async fn answer_generation_recall(
     if know_prolog::generation_recall::classify(input).is_none() {
         return None;
     }
-    // Try SPARQL-based recall first (more efficient, doesn't load full memory)
-    if let Some(reply) = know_prolog::generation_recall::recall_sparql(manager, session.id(), input).await {
-        return Some(reply);
-    }
-    // Fall back to in-memory recall
-    match manager.load_generation_memory(session.id()).await {
-        Ok(memory) => know_prolog::generation_recall::recall(&memory, input),
+    // 先把本会话的生成记忆从 RDF 命名图读回，供 SPARQL 召回用于图边界；
+    // 读图失败不阻塞，回退既有管线。
+    let memory = match manager.load_generation_memory(session.id()).await {
+        Ok(memory) => memory,
         Err(error) => {
             eprintln!("读取生成记忆失败（本轮不走召回）：{}", error);
-            None
+            return None;
         }
+    };
+    // Try SPARQL-based recall first（已受图边界约束，不扫全图）
+    if let Some(reply) =
+        know_prolog::generation_recall::recall_sparql(manager, &memory, input).await
+    {
+        return Some(reply);
     }
+    // Fall back to in-memory recall（同一份已加载记忆，无需二次读图）
+    know_prolog::generation_recall::recall(&memory, input)
 }
 
 /// 解析编年史与会话标识路径（交互模式、工件与生成记忆共用同一规则）。

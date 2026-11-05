@@ -88,7 +88,8 @@ pub const P_SOURCE_TURNS: &str = "http://example.org/kg/ledger/dialogue/projecti
 pub const P_DROPPED_TURNS: &str = "http://example.org/kg/ledger/dialogue/projectionDroppedTurns";
 pub const P_DROPPED_SEQS: &str = "http://example.org/kg/ledger/dialogue/projectionDroppedSeqs";
 pub const P_SOURCE_REPLIES: &str = "http://example.org/kg/ledger/dialogue/projectionSourceReplies";
-pub const P_DROPPED_REPLIES: &str = "http://example.org/kg/ledger/dialogue/projectionDroppedReplies";
+pub const P_DROPPED_REPLIES: &str =
+    "http://example.org/kg/ledger/dialogue/projectionDroppedReplies";
 
 type MemoryResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -499,7 +500,13 @@ impl GenerationMemory {
     /// 向记忆中添加一个轮次（幂等：已存在则不重复）。
     ///
     /// 返回被写入的轮次 seq，若 seq 已存在则返回 None。
-    pub fn add_turn(&mut self, seq: u64, user: String, mode: String, focus: Option<String>) -> Option<u64> {
+    pub fn add_turn(
+        &mut self,
+        seq: u64,
+        user: String,
+        mode: String,
+        focus: Option<String>,
+    ) -> Option<u64> {
         if self.turns.contains_key(&seq) {
             return None;
         }
@@ -527,11 +534,7 @@ impl GenerationMemory {
     /// 如果轮次不存在，会自动创建；如果该轮次已有该 seq 的回答则不重复写入。
     ///
     /// 注意：如果返回 `None`，调用方仍保有 `reply` 的所有权。
-    pub fn add_reply(
-        &mut self,
-        turn_seq: u64,
-        reply: ReplyArtifact,
-    ) -> Option<&ReplyArtifact> {
+    pub fn add_reply(&mut self, turn_seq: u64, reply: ReplyArtifact) -> Option<&ReplyArtifact> {
         let reply_seq = reply.seq;
         let turn = self.turns.get_mut(&turn_seq);
         match turn {
