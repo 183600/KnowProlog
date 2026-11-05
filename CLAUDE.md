@@ -88,7 +88,19 @@ The system is configured via `config.toml`:
 - Facts loaded dynamically from RDF store
 - Custom predicates: `oxigraph_entity/3`, `oxigraph_relation/3`
 - Query generation based on intent patterns
-- Result extraction currently has limitations (see warnings in code)
+- Bindings flow through a unified typed contract (`BindingSet` / `BoundTerm`);
+  string views and typed views share one rendering path (`render_binding_rows`),
+  and engine faults are surfaced as a third state, never as empty results
+
+### Generation Memory (RDF Dialogue Ledger)
+- Optional (`[generation_memory]` in `config.toml`, default off): each turn's
+  reply, claims, evidence and focus are projected into per-turn RDF named graphs
+  under `kg:graphs/dialogue/`; the default graph stays untouched
+- Meta-questions ("我们刚才聊到哪了 / 这句话说过吗 / 第N个命题是什么") are
+  answered read-only from those graphs (SPARQL first, in-memory fallback with
+  identical wording)
+- Forgetting records a `forget_memory` watermark entry in the chronicle, so
+  forgotten history is not re-projected on later syncs
 
 ### Error Handling
 - Comprehensive error handling in async operations
@@ -111,11 +123,9 @@ Tests use temporary directories and create test configurations automatically.
 
 ## Known Limitations
 
-1. **Prolog Result Extraction**: The current Scryer Prolog integration has limitations in extracting variable bindings programmatically (see warnings in `prolog_engine.rs:106-118`)
+1. **Chinese Name Recognition**: Limited to configured patterns and may miss complex name variations
 
-2. **Chinese Name Recognition**: Limited to configured patterns and may miss complex name variations
-
-3. **Pattern Matching**: Extraction rules are rigid and may not handle all linguistic variations
+2. **Pattern Matching**: Extraction rules are rigid and may not handle all linguistic variations
 
 ## Development Notes
 
