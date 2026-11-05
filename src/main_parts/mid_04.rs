@@ -69,10 +69,24 @@ async fn run_ask(
     };
     // 生成记忆供给闭包（默认关闭）：ask 也是只读入口，会话内生成状态缺失时
     // （每次 ask 都是新进程），「风格：第N点」类复述据此回退到 RDF 记忆里
-    // 最近一条回答的第 N 点。读图失败不阻塞回答，落回既有指引。
+    // 最近一条回答的第 N 点；「介绍：实体」的已说过滤与更正定位也共用这份
+    // 记忆。读图失败不阻塞回答，落回既有指引。
     if let Some(session) = recall_session.as_ref() {
         match oxigraph_manager.load_generation_memory(session.id()).await {
             Ok(memory) if !memory.is_empty() => {
+                let memory = std::sync::Arc::new(memory);
+                // 已说过滤：ask 的「介绍：实体」不重复陈述历史命题。
+                let said = std::sync::Arc::clone(&memory);
+                reasoner.set_already_said_check(Some(Box::new(move |text: &str| {
+                    said.already_said(text)
+                })));
+                // 更正定位：更正回答可标记撤回历史命题 URI。
+                let corrects = std::sync::Arc::clone(&memory);
+                reasoner.set_corrects_check(Some(Box::new(
+                    move |entity: &str, attribute: &str, previous: &str| {
+                        corrects.corrected_claim_uris(entity, attribute, previous)
+                    },
+                )));
                 reasoner.set_memory_reply_provider(Some(Box::new(move || {
                     memory.latest_reply().map(|reply| MemoryReplyFragment {
                         reply_seq: reply.seq,
