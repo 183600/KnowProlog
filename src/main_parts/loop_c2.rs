@@ -957,7 +957,18 @@
             } else {
                 refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
                 match symbolic_reasoner.abduce_statement(target) {
-                    Some(text) => println!("{}", text),
+                    Some(text) => {
+                        println!("{}", text);
+                        // 溯因解释也是「说过的话」：落账后回顾与已说过过滤
+                        // 才能覆盖这一轮；假设性质由计划标签保留。
+                        log_chronicle_reply(
+                            &mut chronicle,
+                            &text,
+                            &["abduction".to_string()],
+                            &[],
+                            &[],
+                        );
+                    }
                     None => println!(
                         "无法把「{}」形式化为可溯因的目标。支持句式：S的P是O / O是S的P / S是类型。",
                         target
@@ -988,6 +999,27 @@
         // 跨重启、有界、只读；未开启、非元话语或读图失败时本块整体不生效。
         if generation_memory_enabled {
             if let Some(session) = dialogue_session.as_ref() {
+                // 当前轮已在 loop_b1 写入编年史，但顶部的同步发生在读输入之前：
+                // 回答前补一次有界投影，让 RDF 记忆包含本轮的焦点与已说命题，
+                // 回顾不落后一轮；共享 Arc 同步更新，供给闭包即时生效。
+                if let Some(chronicle) = chronicle.as_ref() {
+                    if chronicle.len() != synced_chronicle_len {
+                        let memory = generation_memory::GenerationMemory::from_chronicle(
+                            session,
+                            chronicle,
+                            config.generation_memory.max_turns,
+                        );
+                        match oxigraph_manager.sync_generation_memory(&memory).await {
+                            Ok(_) => {
+                                synced_chronicle_len = chronicle.len();
+                                *generation_memory.lock().unwrap() = Some(memory);
+                            }
+                            Err(error) => {
+                                eprintln!("生成记忆落图失败（本轮不阻塞回答）：{}", error);
+                            }
+                        }
+                    }
+                }
                 if let Some(reply) =
                     answer_generation_recall(&config, &oxigraph_manager, session, input).await
                 {
@@ -1033,7 +1065,16 @@
             } else {
                 refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
                 match symbolic_reasoner.abduce_statement(target) {
-                    Some(text) => println!("{}", text),
+                    Some(text) => {
+                        println!("{}", text);
+                        log_chronicle_reply(
+                            &mut chronicle,
+                            &text,
+                            &["abduction".to_string()],
+                            &[],
+                            &[],
+                        );
+                    }
                     None => println!(
                         "无法把「{}」形式化为可解释的目标。支持句式：S的P是O / O是S的P / S是类型。",
                         target

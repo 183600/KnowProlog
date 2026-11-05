@@ -198,7 +198,18 @@
         // 多轮生成：按同一份回答计划换风格重述（不重新检索、不新增事实）
         if let Some(directive) = StyleDirective::parse(input) {
             match symbolic_reasoner.restyle_generation(directive) {
-                Some(text) => println!("{}", text),
+                Some(text) => {
+                    println!("{}", text);
+                    // 重述也是「说过的话」：落账后生成记忆才能记住这次表达，
+                    // 已说过过滤与回顾才不会漏掉它。指引措辞不落账。
+                    log_chronicle_reply(
+                        &mut chronicle,
+                        &text,
+                        &["generation".to_string(), "restyle".to_string()],
+                        &[],
+                        &[],
+                    );
+                }
                 None => println!("生成功能未启用，无法按回答计划重述。"),
             }
             println!();
@@ -211,7 +222,16 @@
             "接着说" | "继续说" | "继续介绍" | "继续讲" | "接着讲"
         ) {
             match symbolic_reasoner.continue_generation() {
-                Some(text) => println!("{}", text),
+                Some(text) => {
+                    println!("{}", text);
+                    log_chronicle_reply(
+                        &mut chronicle,
+                        &text,
+                        &["generation".to_string(), "continue".to_string()],
+                        &[],
+                        &[],
+                    );
+                }
                 None => println!("还没有可续说的生成内容，请先输入「介绍：实体名」。"),
             }
             println!();
@@ -224,7 +244,16 @@
             "换个角度说" | "换个说法" | "换个角度" | "换一个角度" | "重新介绍"
         ) {
             match symbolic_reasoner.switch_generation_angle() {
-                Some(text) => println!("{}", text),
+                Some(text) => {
+                    println!("{}", text);
+                    log_chronicle_reply(
+                        &mut chronicle,
+                        &text,
+                        &["generation".to_string(), "switch".to_string()],
+                        &[],
+                        &[],
+                    );
+                }
                 None => println!("还没有可重述的生成内容，请先输入「介绍：实体名」。"),
             }
             println!();
@@ -523,7 +552,18 @@
                 }
             }
             match symbolic_reasoner.generate_about(entity) {
-                Some(text) => println!("{}", text),
+                Some(text) => {
+                    println!("{}", text);
+                    // 介绍是成段的世界断言：必须落账，否则生成记忆与
+                    // already_said 过滤都看不到这段命题。
+                    log_chronicle_reply(
+                        &mut chronicle,
+                        &text,
+                        &["generation".to_string(), "about".to_string()],
+                        &[],
+                        &[],
+                    );
+                }
                 None => println!("知识图谱中没有关于「{}」的可生成事实。", entity),
             }
             println!();
@@ -556,8 +596,22 @@
                     Ok(facts) => symbolic_reasoner.observe_facts(&facts),
                     Err(e) => println!("加载知识图谱失败: {}", e),
                 }
-                match symbolic_reasoner.unsaid_facts_report(targeted) {
-                    Some(text) => println!("{}", text),
+                // 未指名实体时用对话管理器的当前焦点（与编年史 turn.focus
+                // 同源）；推理器自身上下文在重启后可能为空。
+                let entity = targeted.or_else(|| dialogue_manager.focus_entity());
+                match symbolic_reasoner.unsaid_facts_report(entity) {
+                    Some(text) => {
+                        println!("{}", text);
+                        // 对账报告列出的命题也算「说过」：落账让回顾完整，
+                        // 也避免同一批事实反复以「没说过」的身份出现。
+                        log_chronicle_reply(
+                            &mut chronicle,
+                            &text,
+                            &["generation".to_string(), "unsaid_facts".to_string()],
+                            &[],
+                            &[],
+                        );
+                    }
                     None => println!("生成功能未启用，无法对账已说与未说的事实。"),
                 }
                 println!();
@@ -585,7 +639,16 @@
             }
             refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
             match symbolic_reasoner.narrate(entity) {
-                Some(text) => println!("{}", text),
+                Some(text) => {
+                    println!("{}", text);
+                    log_chronicle_reply(
+                        &mut chronicle,
+                        &text,
+                        &["generation".to_string(), "narrate".to_string()],
+                        &[],
+                        &[],
+                    );
+                }
                 None => println!("知识图谱中没有关于「{}」的叙述材料。", entity),
             }
             println!();
@@ -602,7 +665,17 @@
                 {
                     refresh_symbolic_reasoner(&mut symbolic_reasoner, &oxigraph_manager).await;
                     match symbolic_reasoner.paraphrase_fact(entity.trim(), predicate.trim(), 4) {
-                        Some(text) => println!("{}", text),
+                        Some(text) => {
+                            println!("{}", text);
+                            // 改写句式仍是「说过」这条事实：落账保持记忆完整。
+                            log_chronicle_reply(
+                                &mut chronicle,
+                                &text,
+                                &["generation".to_string(), "paraphrase".to_string()],
+                                &[],
+                                &[],
+                            );
+                        }
                         None => println!(
                             "没有找到「{}」的「{}」相关事实。",
                             entity.trim(),
