@@ -430,9 +430,8 @@ async fn answer_generation_recall(
     if !config.generation_memory.enabled {
         return None;
     }
-    if know_prolog::generation_recall::classify(input).is_none() {
-        return None;
-    }
+    // 不是元话语即早退（`?` 传播 None，交给既有管线）。
+    know_prolog::generation_recall::classify(input)?;
     // 先把本会话的生成记忆从 RDF 命名图读回，供 SPARQL 召回用于图边界；
     // 读图失败不阻塞，回退既有管线。
     let mut memory = match manager.load_generation_memory(session.id()).await {
@@ -1584,7 +1583,7 @@ async fn run_predicates(
             let canonical = registry.resolve(name).canonical;
             registry
                 .profile(&canonical)
-                .map_or(false, |profile| profile.provisional)
+                .is_some_and(|profile| profile.provisional)
         };
         if !provisional {
             rejected.push((name.to_string(), 0usize, "not_provisional"));
@@ -2069,7 +2068,7 @@ mod generation_recall_default_off_tests {
 
     #[tokio::test]
     async fn generation_recall_excludes_inflight_unanswered_turn() {
-        use know_prolog::dialogue_uri::{DialogueArtifactIndex, DialogueSession};
+        use know_prolog::dialogue_uri::DialogueSession;
         use know_prolog::generation_memory::GenerationMemory;
 
         let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR 应设置");

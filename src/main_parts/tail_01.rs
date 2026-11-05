@@ -361,7 +361,7 @@ fn emit_reply(
     let answer_str = answer.as_ref();
     let is_repeat = chronicle
         .as_ref()
-        .and_then(|c| session.as_ref().map(|s| (c, s)))
+        .zip(session.as_ref())
         .map(|(chronicle, session)| {
             let memory = generation_memory::GenerationMemory::from_chronicle_since(
                 session,

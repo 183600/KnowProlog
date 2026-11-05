@@ -423,7 +423,7 @@ async fn run_ask(
         };
         if answer
             .as_deref()
-            .map_or(false, |text| !is_no_record_text(text))
+            .is_some_and(|text| !is_no_record_text(text))
         {
             // 一次性问答也做轮末预取：下一行继续追问时可命中同纪元草稿。
             reasoner.prefetch_answer_drafts();

@@ -813,9 +813,7 @@ fn split_chinese_ordinal(text: &str) -> Option<(&str, &str)> {
     if first == '十' {
         return Some((&text[..first_width], &text[first_width..]));
     }
-    if chinese_digit(first).is_none() {
-        return None;
-    }
+    chinese_digit(first)?;
     if let Some(second) = text[first_width..].chars().next() {
         let second_width = second.len_utf8();
         if second == '十' {
@@ -886,7 +884,7 @@ fn parse_said_target(text: &str) -> Option<Option<String>> {
         if let Some(position) = text.find(infix) {
             let raw = text[position + infix.len()..].trim();
             // 「你刚才说过什么」不是说过吗，是回顾。
-            if INTERROGATIVES.iter().any(|word| raw == *word) {
+            if INTERROGATIVES.contains(&raw) {
                 return None;
             }
             let target = strip_particles(strip_lead(raw));
@@ -899,7 +897,7 @@ fn parse_said_target(text: &str) -> Option<Option<String>> {
     for suffix in SAID_SUFFIXES {
         if let Some(head) = text.strip_suffix(suffix) {
             let head = head.trim();
-            if DEMONSTRATIVES.iter().any(|word| head == *word) {
+            if DEMONSTRATIVES.contains(&head) {
                 return Some(None);
             }
             let target = strip_particles(strip_lead(head));
