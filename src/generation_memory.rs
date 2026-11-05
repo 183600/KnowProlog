@@ -401,6 +401,16 @@ impl GenerationMemory {
         }
     }
 
+    /// 清空记忆内容，保留会话标识。用于会话重启或测试场景。
+    ///
+    /// 此操作仅重置内存状态，不影响 RDF 存储中的已有记录。
+    /// 若要在 RDF 存储中删除会话，请使用 `OxigraphManager::forget_generation_memory`。
+    pub fn clear(&mut self) {
+        self.turns.clear();
+        self.unattached_replies.clear();
+        self.projection = None;
+    }
+
     /// 从工件索引投影最近 `max_turns` 轮；`0` 表示不设上限。
     pub fn from_index(index: &DialogueArtifactIndex, max_turns: usize) -> Self {
         let session = index.session().trim().to_string();
