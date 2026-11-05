@@ -869,13 +869,11 @@ mod tests {
 
         // 有界投影的回顾不得谎称「本会话共 1 轮」。
         let recap = recall(&memory, "我们刚才聊了点什么").unwrap();
+        assert!(recap.text.contains("投影保留最近 1 轮"), "{}", recap.text);
         assert!(
-            recap.text.contains("投影保留最近 1 轮"),
-            "{}",
-            recap.text
-        );
-        assert!(
-            recap.text.contains("编年史共 2 轮，另有 1 轮更早轮次不在记忆中"),
+            recap
+                .text
+                .contains("编年史共 2 轮，另有 1 轮更早轮次不在记忆中"),
             "{}",
             recap.text
         );
@@ -883,16 +881,16 @@ mod tests {
         // 「没有说过」在有界投影下必须披露检索范围。
         let miss = recall(&memory, "说过吗：姚明是篮球运动员").unwrap();
         assert!(miss.text.contains("没有说过"), "{}", miss.text);
-        assert!(
-            miss.text.contains("更早 1 轮不在检索范围"),
-            "{}",
-            miss.text
-        );
+        assert!(miss.text.contains("更早 1 轮不在检索范围"), "{}", miss.text);
 
         // 无丢弃的投影沿用「本会话共 N 轮」。
         let full = GenerationMemory::from_index(&index, 0);
         let full_recap = recall(&full, "我们刚才聊了点什么").unwrap();
-        assert!(full_recap.text.contains("本会话共 2 轮"), "{}", full_recap.text);
+        assert!(
+            full_recap.text.contains("本会话共 2 轮"),
+            "{}",
+            full_recap.text
+        );
         let full_miss = recall(&full, "说过吗：姚明是足球运动员").unwrap();
         assert!(!full_miss.text.contains("有界投影"), "{}", full_miss.text);
     }

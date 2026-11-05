@@ -9,8 +9,7 @@ use std::sync::Arc;
 const COMMON_SURNAMES: &str = "王李张刘陈杨黄赵吴周徐孙马朱胡郭何高林罗郑梁谢宋唐许韩冯邓曹彭曾肖田董潘袁蒋蔡余杜叶程苏魏吕丁任沈姚卢姜崔钟谭陆汪范金石廖贾夏韦付方白邹孟熊秦邱江尹薛闫段雷侯龙史陶黎贺顾毛郝龚邵万钱严覃武戴莫孔向汤";
 
 /// Regex pattern for person name recognition: surname + 1-3 non-function chars
-const COMMON_PERSON_PATTERN: &str =
-    r"[王李张刘陈杨黄赵吴周徐孙马朱胡郭何高林罗郑梁谢宋唐许韩冯邓曹彭曾肖田董潘袁蒋蔡余杜叶程苏魏吕丁任沈姚卢姜崔钟谭陆汪范金石廖贾夏韦付方白邹孟熊秦邱江尹薛闫段雷侯龙史陶黎贺顾毛郝龚邵万钱严覃武戴莫孔向汤][^的了是在有和与及把被给对从向为以于而且或但吗呢吧啊，。！？；：、\s]{1,3}";
+const COMMON_PERSON_PATTERN: &str = r"[王李张刘陈杨黄赵吴周徐孙马朱胡郭何高林罗郑梁谢宋唐许韩冯邓曹彭曾肖田董潘袁蒋蔡余杜叶程苏魏吕丁任沈姚卢姜崔钟谭陆汪范金石廖贾夏韦付方白邹孟熊秦邱江尹薛闫段雷侯龙史陶黎贺顾毛郝龚邵万钱严覃武戴莫孔向汤][^的了是在有和与及把被给对从向为以于而且或但吗呢吧啊，。！？；：、\s]{1,3}";
 
 /// Organization recognition patterns
 const ORG_PATTERNS: &[&str] = &[
@@ -23,38 +22,19 @@ const ORG_PATTERNS: &[&str] = &[
 ];
 
 /// Organization context keywords
-const ORG_KEYWORDS: &[&str] = &[
-    "公司", "集团", "企业", "学校", "大学", "医院", "银行",
-];
+const ORG_KEYWORDS: &[&str] = &["公司", "集团", "企业", "学校", "大学", "医院", "银行"];
 
 /// Location recognition patterns
-const LOC_PATTERNS: &[&str] = &[
-    r".+省",
-    r".+市",
-    r".+县",
-    r".+区",
-    r".+镇",
-    r".+村",
-];
+const LOC_PATTERNS: &[&str] = &[r".+省", r".+市", r".+县", r".+区", r".+镇", r".+村"];
 
 /// Location context keywords
-const LOC_KEYWORDS: &[&str] = &[
-    "省", "市", "县", "区", "位于", "坐落", "地处",
-];
+const LOC_KEYWORDS: &[&str] = &["省", "市", "县", "区", "位于", "坐落", "地处"];
 
 /// Concept recognition patterns
-const CONCEPT_PATTERNS: &[&str] = &[
-    r".+主义",
-    r".+理论",
-    r".+方法",
-    r".+技术",
-    r".+系统",
-];
+const CONCEPT_PATTERNS: &[&str] = &[r".+主义", r".+理论", r".+方法", r".+技术", r".+系统"];
 
 /// Concept context keywords
-const CONCEPT_KEYWORDS: &[&str] = &[
-    "理论", "概念", "方法", "技术", "系统", "原理", "思想",
-];
+const CONCEPT_KEYWORDS: &[&str] = &["理论", "概念", "方法", "技术", "系统", "原理", "思想"];
 
 /// Extraction patterns (regex-based relation extraction)
 const EXTRACTION_PATTERNS: &[(&str, &str, usize, usize, &str, &[&str])] = &[
@@ -142,10 +122,7 @@ const EXTRACTION_PATTERNS: &[(&str, &str, usize, usize, &str, &[&str])] = &[
 
 /// Relation keywords mapping
 const RELATION_KEYWORDS: &[(&str, &[&str])] = &[
-    (
-        "is_a",
-        &["是", "为", "属于", "作为"],
-    ),
+    ("is_a", &["是", "为", "属于", "作为"]),
     (
         "work_for",
         &["工作", "就职", "任职", "服务", "供职", "受雇"],
@@ -158,10 +135,7 @@ const RELATION_KEYWORDS: &[(&str, &[&str])] = &[
         "has_property",
         &["有", "具有", "拥有", "包含", "含有", "带有"],
     ),
-    (
-        "born_in",
-        &["出生", "诞生", "生于"],
-    ),
+    ("born_in", &["出生", "诞生", "生于"]),
     (
         "founded_by",
         &["创立", "创建", "建立", "成立", "创办", "设立"],
@@ -391,21 +365,17 @@ impl EntityRelationExtractor {
     fn initialize_extraction_patterns(&self) {
         let mut patterns = self.extraction_patterns.write();
 
-        patterns.extend(
-            EXTRACTION_PATTERNS
-                .iter()
-                .map(|(name, pattern, subj_grp, obj_grp, pred_tmpl, examples)| {
-                    ExtractionPattern {
-                        name: name.to_string(),
-                        pattern: pattern.to_string(),
-                        relation_type: name.strip_suffix("_pattern").unwrap_or(name).to_string(),
-                        subject_group: *subj_grp,
-                        object_group: *obj_grp,
-                        predicate_template: pred_tmpl.to_string(),
-                        examples: examples.iter().map(|s| s.to_string()).collect(),
-                    }
-                }),
-        );
+        patterns.extend(EXTRACTION_PATTERNS.iter().map(
+            |(name, pattern, subj_grp, obj_grp, pred_tmpl, examples)| ExtractionPattern {
+                name: name.to_string(),
+                pattern: pattern.to_string(),
+                relation_type: name.strip_suffix("_pattern").unwrap_or(name).to_string(),
+                subject_group: *subj_grp,
+                object_group: *obj_grp,
+                predicate_template: pred_tmpl.to_string(),
+                examples: examples.iter().map(|s| s.to_string()).collect(),
+            },
+        ));
     }
 
     fn initialize_relation_keywords(&self) {
@@ -422,9 +392,9 @@ impl EntityRelationExtractor {
     fn initialize_dependency_patterns(&self) {
         let mut patterns = self.dependency_patterns.write();
 
-        patterns.extend(
-            DEPENDENCY_PATTERNS.iter().map(
-                |(pname, subj_pos, verb_pos, obj_pos, rel_map)| DependencyPattern {
+        patterns.extend(DEPENDENCY_PATTERNS.iter().map(
+            |(pname, subj_pos, verb_pos, obj_pos, rel_map)| {
+                DependencyPattern {
                     pattern_name: pname.to_string(),
                     subject_pos: subj_pos.iter().map(|s| s.to_string()).collect(),
                     verb_pos: verb_pos.iter().map(|s| s.to_string()).collect(),
@@ -433,9 +403,9 @@ impl EntityRelationExtractor {
                         .iter()
                         .map(|(k, v)| (k.to_string(), v.to_string()))
                         .collect(),
-                },
-            ),
-        );
+                }
+            },
+        ));
     }
 
     pub async fn extract_entities_and_relations(
@@ -568,7 +538,10 @@ impl EntityRelationExtractor {
 
             // Check if this word should stop name extraction
             // Stop at: verbs (v), function words (p, c, u, etc.), punctuation
-            let is_stop_tag = matches!(tag_text, "v" | "vd" | "vg" | "p" | "c" | "u" | "w" | "x" | "e" | "o" | "y");
+            let is_stop_tag = matches!(
+                tag_text,
+                "v" | "vd" | "vg" | "p" | "c" | "u" | "w" | "x" | "e" | "o" | "y"
+            );
 
             if !in_name_mode {
                 // Not yet started extracting a name

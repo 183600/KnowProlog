@@ -647,12 +647,7 @@ impl AnswerPlan {
             };
             builder.push(
                 SurfaceUnitKind::Claim,
-                format!(
-                    "  {}. {}{}\n",
-                    index + 1,
-                    claim.text.trim(),
-                    suffix
-                ),
+                format!("  {}. {}{}\n", index + 1, claim.text.trim(), suffix),
                 Some(&claim.slot),
                 Some(index + 1),
             );
