@@ -376,7 +376,13 @@ async fn recall_recap_sparql(
                 return Some("生成记忆里还没有投影任何轮次（SPARQL 确认）。".to_string());
             }
             let mut text = String::new();
-            text.push_str("生成记忆回顾（SPARQL 命名图）：\n");
+            text.push_str(&format!(
+                "生成记忆回顾（SPARQL 命名图）：{}、{} 条回答、{} 条命题、{} 条依据。\n",
+                projection_scope(memory),
+                memory.reply_count(),
+                memory.claim_count(),
+                memory.evidence_count()
+            ));
             let mut current_turn = 0u64;
             for row in &result.data {
                 let turn_seq = row
@@ -490,16 +496,10 @@ pub async fn recall_sparql(
     })
 }
 
-/// 会话回顾：计数 + 最近若干轮的问答切片 + 当前焦点；空记忆显式说明。
-///
-/// 有界投影不得谎称「本会话共 N 轮」：投影收据记录了丢弃的轮次，
-/// 措辞必须披露「另有 K 轮更早轮次不在记忆中」。
-fn render_recap(memory: &GenerationMemory) -> String {
-    if memory.is_empty() {
-        return "生成记忆里还没有投影任何轮次；先用「dialogue-memory --sync」从编年史投影，再问这句话。"
-            .to_string();
-    }
-    let scope = match memory.projection.as_ref() {
+/// 投影范围词（内存与 SPARQL 回顾共用同一口径）：有界投影如实披露
+/// 「编年史共几轮、另有几轮更早轮次不在记忆中」，不谎称全量。
+fn projection_scope(memory: &GenerationMemory) -> String {
+    match memory.projection.as_ref() {
         Some(receipt) if receipt.dropped_turns.is_empty() => {
             format!("本会话共 {} 轮", memory.turn_count())
         }
@@ -510,10 +510,21 @@ fn render_recap(memory: &GenerationMemory) -> String {
             receipt.dropped_turns.len()
         ),
         None => format!("本会话共 {} 轮", memory.turn_count()),
-    };
+    }
+}
+
+/// 会话回顾：计数 + 最近若干轮的问答切片 + 当前焦点；空记忆显式说明。
+///
+/// 有界投影不得谎称「本会话共 N 轮」：投影收据记录了丢弃的轮次，
+/// 措辞必须披露「另有 K 轮更早轮次不在记忆中」。
+fn render_recap(memory: &GenerationMemory) -> String {
+    if memory.is_empty() {
+        return "生成记忆里还没有投影任何轮次；先用「dialogue-memory --sync」从编年史投影，再问这句话。"
+            .to_string();
+    }
     let mut text = format!(
         "生成记忆回顾（RDF 命名图）：{}、{} 条回答、{} 条命题、{} 条依据。",
-        scope,
+        projection_scope(memory),
         memory.reply_count(),
         memory.claim_count(),
         memory.evidence_count()
@@ -1189,6 +1200,59 @@ mod tests {
             .unwrap()
             .text
             .contains("还没有投影任何轮次"));
+    }
+
+    #[tokio::test]
+    async fn sparql_recap_discloses_bounded_projection_window() {
+        let dir = TempDir::new().unwrap();
+        let session_path = dir.path().join("dialogue.session.json");
+        let session = DialogueSession::open_or_create(&session_path.to_string_lossy()).unwrap();
+        let chronicle_path = dir.path().join("dialogue.chronicle.jsonl");
+        let (mut chronicle, _) =
+            Chronicle::open(&chronicle_path.to_string_lossy(), FsyncPolicy::None).unwrap();
+        chronicle
+            .append_turn_with_refs("姚明是谁", "query", None, 0, &[])
+            .unwrap();
+        chronicle
+            .append_reply("姚明是篮球运动员。", &[], &[], &[])
+            .unwrap();
+        chronicle
+            .append_turn_with_refs("他的身高呢", "query", Some("姚明"), 1, &[])
+            .unwrap();
+        chronicle
+            .append_reply("姚明的身高是 226 厘米。", &[], &[], &[])
+            .unwrap();
+        let index = DialogueArtifactIndex::from_chronicle(&session, &chronicle);
+        // 有界投影：只保留最近 1 轮。
+        let memory = GenerationMemory::from_index(&index, 1);
+        let manager = OxigraphManager::with_perf_ledger(
+            &dir.path().join("store").to_string_lossy(),
+            Arc::new(PerfLedger::new()),
+        )
+        .unwrap();
+        manager.sync_generation_memory(&memory).await.unwrap();
+        let loaded = manager
+            .load_generation_memory(&memory.session)
+            .await
+            .unwrap();
+
+        let recap = recall_sparql(&manager, &loaded, "我们刚才聊了点什么")
+            .await
+            .unwrap();
+        // SPARQL 回顾与内存侧共用同一范围词：不得谎称「本会话共 1 轮」。
+        assert!(
+            recap
+                .text
+                .contains("投影保留最近 1 轮（编年史共 2 轮，另有 1 轮更早轮次不在记忆中）"),
+            "{}",
+            recap.text
+        );
+        assert!(
+            !recap.text.contains("姚明是谁"),
+            "被窗口丢弃的轮次不得出现在回顾里：{}",
+            recap.text
+        );
+        assert!(recap.text.contains("姚明的身高是 226 厘米"), "{}", recap.text);
     }
 
     #[test]
