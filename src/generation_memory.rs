@@ -329,6 +329,43 @@ pub fn corrections_sparql_query(memory: &GenerationMemory) -> String {
     )
 }
 
+/// SPARQL SELECT 查询：最近一次投影的收据标量（会话图内），
+/// 返回 `(?window, ?sourceTurns, ?droppedTurns, ?droppedSeqs, ?sourceReplies,
+/// ?droppedReplies)`。
+///
+/// 「保留了哪些轮、丢弃了哪些轮、为什么」的机器可读口径：外部工具不必解析
+/// JSON 收据即可用 SPARQL 审计上下文选择。图与主语都由会话标识确定性推出，
+/// 查询天然有界；无收据（空记忆或旧版本投影）时查询无解。
+pub fn projection_receipt_sparql(memory: &GenerationMemory) -> String {
+    let graph = session_graph_iri(&memory.session);
+    let subject = session_uri(&memory.session);
+    format!(
+        "SELECT ?window ?sourceTurns ?droppedTurns ?droppedSeqs ?sourceReplies ?droppedReplies WHERE {{ \
+           GRAPH <{}> {{ \
+             <{}> <{}> ?window . \
+             <{}> <{}> ?sourceTurns . \
+             <{}> <{}> ?droppedTurns . \
+             <{}> <{}> ?droppedSeqs . \
+             <{}> <{}> ?sourceReplies . \
+             <{}> <{}> ?droppedReplies . \
+           }} \
+         }}",
+        graph,
+        subject,
+        P_WINDOW,
+        subject,
+        P_SOURCE_TURNS,
+        subject,
+        P_DROPPED_TURNS,
+        subject,
+        P_DROPPED_SEQS,
+        subject,
+        P_SOURCE_REPLIES,
+        subject,
+        P_DROPPED_REPLIES
+    )
+}
+
 /// SPARQL SELECT 查询：最近一次记录的实体焦点，返回 `(?focus, ?turnSeq)`。
 ///
 /// 与内存侧 `latest_focus` 同口径：轮次按 seq 降序取第一条带焦点的；
@@ -2289,6 +2326,60 @@ mod tests {
             query.contains("ORDER BY DESC(xsd:integer(?turnSeq)) LIMIT 1"),
             "{}",
             query
+        );
+    }
+
+    #[tokio::test]
+    async fn projection_receipt_sparql_reports_window_and_drops() {
+        let dir = TempDir::new().unwrap();
+        let (index, _session, _chronicle) = sample_index(&dir);
+        let memory = GenerationMemory::from_index(&index, 1);
+        let store_dir = dir.path().join("store");
+        let manager = OxigraphManager::with_perf_ledger(
+            &store_dir.to_string_lossy(),
+            Arc::new(PerfLedger::new()),
+        )
+        .unwrap();
+        manager.sync_generation_memory(&memory).await.unwrap();
+
+        let rows = manager
+            .query_sparql(&projection_receipt_sparql(&memory))
+            .await
+            .unwrap();
+        assert_eq!(rows.data.len(), 1, "{:?}", rows.data);
+        assert_eq!(
+            rows.data[0].get("window").and_then(JsonValue::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            rows.data[0].get("sourceTurns").and_then(JsonValue::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            rows.data[0].get("droppedTurns").and_then(JsonValue::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            rows.data[0].get("droppedSeqs").and_then(JsonValue::as_str),
+            Some("1")
+        );
+
+        // 全量投影：无丢弃、窗口未设上限。
+        let full = GenerationMemory::from_index(&index, 0);
+        manager.sync_generation_memory(&full).await.unwrap();
+        let full_rows = manager
+            .query_sparql(&projection_receipt_sparql(&full))
+            .await
+            .unwrap();
+        assert_eq!(
+            full_rows.data[0].get("window").and_then(JsonValue::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            full_rows.data[0]
+                .get("droppedTurns")
+                .and_then(JsonValue::as_str),
+            Some("0")
         );
     }
 
