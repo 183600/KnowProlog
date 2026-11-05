@@ -796,6 +796,23 @@ async fn run_interactive_mode(
                 .map(|mem| mem.already_said(text))
                 .unwrap_or(false)
         })));
+        // 注入生成记忆供给闭包：会话内生成状态缺失时（重启后），「风格：第N点」
+        // 类复述据此回退到 RDF 记忆里最近一条回答的第 N 点（last_plan 跨重启）。
+        // 记忆为空或未同步时返回 None，调用方落回既有指引，绝不伪装成答案。
+        let gen_mem = Arc::clone(&generation_memory);
+        symbolic_reasoner.set_memory_reply_provider(Some(Box::new(move || {
+            let guard = gen_mem.lock().unwrap();
+            guard.as_ref().and_then(|memory| {
+                memory.latest_reply().map(|reply| MemoryReplyFragment {
+                    reply_seq: reply.seq,
+                    claims: reply
+                        .claims
+                        .iter()
+                        .map(|claim| (claim.index, claim.text.clone()))
+                        .collect(),
+                })
+            })
+        })));
     }
 
     println!("{}", config.messages.ready);

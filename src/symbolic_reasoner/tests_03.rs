@@ -1520,6 +1520,52 @@ rules = [
         assert!(text.contains(plan.claims[0].text.trim()), "{}", text);
     }
 
+    /// 重启后（会话内无生成状态、无快照），`Focus(n)` 复述经供给闭包回退到
+    /// RDF 生成记忆里最近一条回答的第 N 点；无闭包或闭包返回 None 时维持
+    /// 既有指引，绝不把空记忆伪装成答案。
+    #[test]
+    fn focus_restyle_falls_back_to_memory_reply_provider() {
+        let mut reasoner = SymbolicReasoner::new(test_config(), HashMap::new());
+        reasoner.observe_facts(&master_facts());
+
+        let guidance = reasoner
+            .restyle_generation(StyleDirective::Focus(1))
+            .expect("无生成状态也应给出指引而非空结果");
+        assert!(guidance.contains("还没有可复述的回答计划"), "{}", guidance);
+
+        // 与交互 / ask 入口同一构造路径：最近一条回答 → 命题切片。
+        reasoner.set_memory_reply_provider(Some(Box::new(|| {
+            Some(MemoryReplyFragment {
+                reply_seq: 4,
+                claims: vec![
+                    (1, "张三是篮球运动员。".to_string()),
+                    (2, "张三的身高是 226 厘米。".to_string()),
+                ],
+            })
+        })));
+        let hit = reasoner
+            .restyle_generation(StyleDirective::Focus(2))
+            .expect("记忆回退应能定位第 2 点");
+        assert!(
+            hit.contains("RDF 生成记忆里最近一条回答（第 4 条）的第 2 点"),
+            "{}",
+            hit
+        );
+        assert!(hit.contains("张三的身高是 226 厘米"), "{}", hit);
+
+        let miss = reasoner
+            .restyle_generation(StyleDirective::Focus(3))
+            .expect("越界也应显式说明");
+        assert!(miss.contains("共 2 点，没有第 3 点"), "{}", miss);
+
+        // 供给闭包返回 None（记忆为空）时落回既有指引。
+        reasoner.set_memory_reply_provider(Some(Box::new(|| None)));
+        let empty = reasoner
+            .restyle_generation(StyleDirective::Focus(1))
+            .expect("空记忆也应给出指引");
+        assert!(empty.contains("还没有可复述的回答计划"), "{}", empty);
+    }
+
     #[test]
     fn test_expected_answer_type_reorders_find_object() {
         let mut facts = vec![

@@ -133,7 +133,9 @@ use know_prolog::{
     shape_gate::{RepairAction, ShapeReport, ShapeSet},
     startup_ledger::StartupLedger,
     symbolic_generator::SymbolicGenerator,
-    symbolic_reasoner::{FormalClarificationOutcome, LanguagePolicySync, SymbolicReasoner},
+    symbolic_reasoner::{
+        FormalClarificationOutcome, LanguagePolicySync, MemoryReplyFragment, SymbolicReasoner,
+    },
     synonym_graph::{SynonymContext, SynonymGraph, SynonymKind, SynonymResolution, SynonymSense},
     teachable_assertion::{TarResponse, TeachableAssertionReader},
     temporal::{self, TemporalConstraint, TemporalIndex, UnknownTimePolicy, Validity},

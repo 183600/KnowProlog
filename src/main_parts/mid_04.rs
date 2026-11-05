@@ -67,6 +67,29 @@ async fn run_ask(
     } else {
         None
     };
+    // 生成记忆供给闭包（默认关闭）：ask 也是只读入口，会话内生成状态缺失时
+    // （每次 ask 都是新进程），「风格：第N点」类复述据此回退到 RDF 记忆里
+    // 最近一条回答的第 N 点。读图失败不阻塞回答，落回既有指引。
+    if let Some(session) = recall_session.as_ref() {
+        match oxigraph_manager.load_generation_memory(session.id()).await {
+            Ok(memory) if !memory.is_empty() => {
+                reasoner.set_memory_reply_provider(Some(Box::new(move || {
+                    memory.latest_reply().map(|reply| MemoryReplyFragment {
+                        reply_seq: reply.seq,
+                        claims: reply
+                            .claims
+                            .iter()
+                            .map(|claim| (claim.index, claim.text.clone()))
+                            .collect(),
+                    })
+                })));
+            }
+            Ok(_) => {}
+            Err(error) => {
+                eprintln!("读取生成记忆失败（复述回退不可用）：{}", error);
+            }
+        }
+    }
     for question in questions {
         // 管道输入常沿用交互脚本的收尾行：不要把它当成待回答的问题。
         if is_ask_terminator(&question) {
