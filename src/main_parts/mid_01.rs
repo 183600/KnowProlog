@@ -618,28 +618,35 @@ async fn run_dialogue_memory(
         }
     };
     if let Some(question) = recall {
-        match know_prolog::generation_recall::recall(&memory, question) {
-            Some(reply) => {
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "question": question,
-                            "intent": reply.intent.tag(),
-                            "answer": reply.render(),
-                        })
+        // 与交互模式同一套三级守卫：先走 SPARQL 直查命名图，失败或语义
+        // 无法在图上表达（指示词、空记忆）时回退内存召回，同一份已加载
+        // 记忆保证两条路径同口径。
+        let reply = match know_prolog::generation_recall::recall_sparql(&manager, &memory, question)
+            .await
+        {
+            Some(reply) => reply,
+            None => match know_prolog::generation_recall::recall(&memory, question) {
+                Some(reply) => reply,
+                None => {
+                    eprintln!(
+                        "无法把「{}」理解为生成记忆召回问题（支持：回顾 / 说过吗：<文本> / 第N个命题是什么 / 当前焦点 / 更正冲突）。",
+                        question
                     );
-                } else {
-                    println!("{}", reply.render());
+                    std::process::exit(1);
                 }
-            }
-            None => {
-                eprintln!(
-                    "无法把「{}」理解为生成记忆召回问题（支持：回顾 / 说过吗：<文本> / 第N个命题是什么）。",
-                    question
-                );
-                std::process::exit(1);
-            }
+            },
+        };
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "question": question,
+                    "intent": reply.intent.tag(),
+                    "answer": reply.render(),
+                })
+            );
+        } else {
+            println!("{}", reply.render());
         }
         return;
     }
