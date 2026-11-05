@@ -2,12 +2,18 @@
 //!
 //! 编年史与对话快照记住「发生过什么」，`DialogueArtifactIndex` 记住「每个工件
 //! 在哪里」，`GenerationMemory` 把这些投影成按轮隔离的命名图。本模块补上最后一
-//! 环：**这些图能否直接回答元话语问题**。三类问题只读图作答，不重新检索知识：
+//! 环：**这些图能否直接回答元话语问题**。五类问题只读图作答，不重新检索知识：
 //!
 //! - 「我们刚才聊到哪了 / 回顾一下」：跨重启、有界、带计数的会话回顾；
 //! - 「这句话说过吗 / 你是不是说过 X」：对已说命题做规范化比对（`answer_key`），
 //!   命中说清是哪一轮回答的第几点，未命中也明确说「没有说过」，不返回空结果；
-//! - 「上一轮的第 N 个命题是什么」：按序号取最近一条回答的命题切片。
+//! - 「上一轮的第 N 个命题是什么」：按序号取最近一条回答的命题切片；
+//! - 「当前焦点是谁」：最近一次记录的实体焦点；
+//! - 「上次说的和这次冲突吗」：本会话记录的更正关系（回答 → 被更正命题）。
+//!
+//! 每类意图都有两条等价路径：SPARQL 查询直查命名图（跨进程、受会话图边界
+//! 约束、序号排序投 `xsd:integer`），与内存侧同口径逐字一致（只多一个路径
+//! 标记）；SPARQL 失败或语义无法在图上表达（指示词、空记忆）时回退内存。
 //!
 //! 设计边界：
 //! - **只读**：召回不写任何命名图，也不推进知识版本；
@@ -217,93 +223,139 @@ pub fn recall_intent(memory: &GenerationMemory, intent: RecallIntent) -> RecallR
     RecallReply { intent, text, plan }
 }
 
-/// SPARQL-based recall for AlreadySaid intent: uses ASK query against named graphs.
+/// SPARQL 召回「说过吗」：命中报位置与原文，未命中报检索量与有界投影范围，
+/// 与内存侧 `render_said` 同口径。指示词追问（无显式文本）与空记忆返回
+/// `None`，由内存召回补上「这句话指最近第 N 点」「生成记忆为空」的措辞。
 async fn recall_already_said_sparql(
     manager: &OxigraphManager,
     memory: &GenerationMemory,
     target: Option<&str>,
 ) -> Option<String> {
-    let query = if let Some(target) = target.filter(|t| !t.is_empty()) {
-        generation_memory::already_said_sparql_query(memory, target)
-    } else {
-        // For "这句话说过吗" without explicit target, we need the latest claim
-        // Fall back to in-memory for now as it requires the latest claim
+    // 指示词（「这句话说过吗」）需要先解析最近命题，交回内存召回。
+    let target = target.filter(|t| !t.trim().is_empty())?;
+    if memory.is_empty() {
         return None;
-    };
+    }
+    let query = generation_memory::locate_claim_by_text_sparql(memory, target);
     if query.is_empty() {
         return None;
     }
-    match manager.query_sparql(&query).await {
-        Ok(result) => {
-            if let Some(row) = result.data.first() {
-                if let Some(Value::Bool(true)) = row.get("boolean") {
-                    return Some("这句话说过（SPARQL 确认）。".to_string());
-                }
-            }
-            Some("这句话在本会话的生成记忆里没有说过（SPARQL 确认）。".to_string())
-        }
-        Err(_) => None,
+    let located = manager.query_sparql(&query).await.ok()?;
+    // 行按（回答 seq 升序、命题序号升序）排序：首行即最早一次提及，
+    // 与内存侧 `find_claim` 的命中顺序一致。
+    if let Some(row) = located.data.first() {
+        let claim_index = row.get("claimIndex").and_then(Value::as_str)?;
+        let reply_seq = row.get("replySeq").and_then(Value::as_str)?;
+        let text = row.get("text").and_then(Value::as_str)?;
+        let turn_part = match row.get("turnSeq").and_then(Value::as_str) {
+            Some(turn_seq) => format!("（关联第 {} 轮）", turn_seq),
+            None => String::new(),
+        };
+        return Some(format!(
+            "这句话说过：第 {} 点出自第 {} 条回答{}——「{}」。（SPARQL 确认）",
+            claim_index, reply_seq, turn_part, text
+        ));
     }
+    // 未命中：报检索量；有界投影下披露范围（收据与图同源，直接读内存侧）。
+    let total = manager
+        .query_sparql(&generation_memory::count_claims_sparql(memory))
+        .await
+        .ok()
+        .and_then(|counted| counted.data.first().and_then(|row| row.get("total")).cloned())
+        .and_then(|total| total.as_u64().map(|n| n as usize))
+        .unwrap_or_else(|| memory.claim_count());
+    let bound = match memory.projection.as_ref() {
+        Some(receipt) if !receipt.dropped_turns.is_empty() => format!(
+            "；记忆为最近 {} 轮的有界投影，更早 {} 轮不在检索范围",
+            receipt.kept_turns.len(),
+            receipt.dropped_turns.len()
+        ),
+        _ => String::new(),
+    };
+    Some(format!(
+        "这句话在本会话的生成记忆里没有说过（已检索 {} 条命题{}）。（SPARQL 确认）",
+        total, bound
+    ))
 }
 
-/// SPARQL-based recall for PlanStep intent: uses SELECT query against named graphs.
+/// SPARQL 召回「第 N 个命题」：与内存侧 `render_plan_step` 同口径——最近一条
+/// 回答的第 N 点；越界说清共几点，没有回答显式说明。查询失败或结果异常返回
+/// `None`，回退内存召回。
 async fn recall_plan_step_sparql(
     manager: &OxigraphManager,
     memory: &GenerationMemory,
     index: usize,
 ) -> Option<String> {
-    let query = generation_memory::list_all_claims_sparql(memory);
+    let query = generation_memory::latest_reply_claims_sparql(memory);
     if query.is_empty() {
         return None;
     }
-    match manager.query_sparql(&query).await {
-        Ok(result) => {
-            let claims: Vec<_> = result
-                .data
-                .iter()
-                .filter_map(|row| {
-                    let digest = row.get("digest")?.as_str()?;
-                    let text = row.get("text")?.as_str()?;
-                    Some((digest.to_string(), text.to_string()))
-                })
-                .collect();
-            if index > 0 && index <= claims.len() {
-                let (_, text) = &claims[index - 1];
-                return Some(format!("第 {} 点（SPARQL 召回）：{}", index, text));
-            }
-            if !claims.is_empty() {
-                return Some(format!(
-                    "生成记忆里一共 {} 条命题，没有第 {} 点。",
-                    claims.len(),
-                    index
-                ));
-            }
-            Some("生成记忆里还没有命题。".to_string())
-        }
-        Err(_) => None,
+    let result = manager.query_sparql(&query).await.ok()?;
+    // 行已按（回答 seq 降序、命题序号升序）排序：第一组行即最近一条回答。
+    let latest_seq = result
+        .data
+        .first()
+        .and_then(|row| row.get("replySeq"))
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<u64>().ok())?;
+    let claims: Vec<(u32, &str)> = result
+        .data
+        .iter()
+        .filter(|row| {
+            row.get("replySeq")
+                .and_then(Value::as_str)
+                .and_then(|s| s.parse::<u64>().ok())
+                == Some(latest_seq)
+        })
+        .filter_map(|row| {
+            let claim_index = row
+                .get("claimIndex")
+                .and_then(Value::as_str)?
+                .parse::<u32>()
+                .ok()?;
+            let text = row.get("text").and_then(Value::as_str)?;
+            Some((claim_index, text))
+        })
+        .collect();
+    if claims.is_empty() {
+        return None;
+    }
+    match claims.iter().find(|(claim_index, _)| *claim_index == index as u32) {
+        Some((_, text)) => Some(format!(
+            "第 {} 点出自第 {} 条回答：「{}」。（SPARQL 召回）",
+            index, latest_seq, text
+        )),
+        None => Some(format!(
+            "最近一条回答（第 {} 条）一共 {} 点，没有第 {} 点。（SPARQL 召回）",
+            latest_seq,
+            claims.len(),
+            index
+        )),
     }
 }
 
-/// SPARQL-based recall for Recap intent: uses SELECT across named graphs.
+/// SPARQL 召回回顾：跨轮读取回答；排序按 seq 数值升序（字面量投 xsd:integer，
+/// 避免多位数词面按字典序错排）。图集合受会话边界约束，不扫全图。
 async fn recall_recap_sparql(
     manager: &OxigraphManager,
     memory: &GenerationMemory,
 ) -> Option<String> {
     let query = format!(
-        "SELECT ?turnSeq ?user ?replySeq ?answer WHERE {{
-            GRAPH ?g {{
-                ?turn a <{}> .
-                ?turn <{}> ?turnSeq .
-                ?turn <{}> ?user .
-                OPTIONAL {{
-                    ?reply a <{}> .
-                    ?reply <{}> ?replySeq .
-                    ?reply <{}> ?answer .
-                    ?reply <{}> ?turnSeq .
-                }}
-            }}
-            FILTER(?g IN ({}))
-        }} ORDER BY ?turnSeq ?replySeq",
+        "{} SELECT ?turnSeq ?user ?replySeq ?answer WHERE {{\
+            GRAPH ?g {{\
+                ?turn a <{}> .\
+                ?turn <{}> ?turnSeq .\
+                ?turn <{}> ?user .\
+                OPTIONAL {{\
+                    ?reply a <{}> .\
+                    ?reply <{}> ?replySeq .\
+                    ?reply <{}> ?answer .\
+                    ?reply <{}> ?turnSeq .\
+                }}\
+            }}\
+            FILTER(?g IN ({}))\
+        }} ORDER BY ASC(xsd:integer(?turnSeq)) ASC(xsd:integer(?replySeq))",
+        generation_memory::XSD_PREFIX,
         generation_memory::TURN_CLASS,
         generation_memory::P_SEQ,
         generation_memory::P_USER,
@@ -359,6 +411,60 @@ async fn recall_recap_sparql(
     }
 }
 
+/// SPARQL 召回更正关系：与内存侧 `render_corrections` 同口径——列出
+/// 更正回答与其撤回的先前命题；被更正命题所在图被丢弃的行自然消失。
+async fn recall_corrections_sparql(
+    manager: &OxigraphManager,
+    memory: &GenerationMemory,
+) -> Option<String> {
+    let query = generation_memory::corrections_sparql_query(memory);
+    let result = manager.query_sparql(&query).await.ok()?;
+    let corrections: Vec<(String, String)> = result
+        .data
+        .iter()
+        .filter_map(|row| {
+            let answer = row.get("answer").and_then(Value::as_str).unwrap_or("");
+            let corrected = row.get("correctedText").and_then(Value::as_str)?;
+            Some((excerpt(answer, 40), corrected.to_string()))
+        })
+        .collect();
+    if corrections.is_empty() {
+        return Some(
+            "本会话还没有记录更正关系；回答未标记更正任何先前命题。（SPARQL 确认）".to_string(),
+        );
+    }
+    let mut out = format!("本会话共记录 {} 条更正关系。\n", corrections.len());
+    for (position, (reply_excerpt, corrected)) in corrections.iter().enumerate() {
+        out.push_str(&format!(
+            "  {}. 更正回答「{}」撤回了先前命题「{}」。\n",
+            position + 1,
+            reply_excerpt,
+            corrected
+        ));
+    }
+    out.push_str("（SPARQL 确认）");
+    Some(out)
+}
+
+/// SPARQL 召回当前焦点：焦点与轮次取自图（seq 数值降序取一）；提及计数与
+/// 内存侧同源（同一份已加载记忆）。无焦点行时返回 `None`，回退内存召回。
+async fn recall_focus_sparql(
+    manager: &OxigraphManager,
+    memory: &GenerationMemory,
+) -> Option<String> {
+    let query = generation_memory::latest_focus_sparql_query(memory);
+    let result = manager.query_sparql(&query).await.ok()?;
+    let row = result.data.first()?;
+    let focus = row.get("focus").and_then(Value::as_str)?;
+    let turn_seq = row.get("turnSeq").and_then(Value::as_str)?;
+    Some(format!(
+        "当前实体焦点是「{}」（第 {} 轮记录；本会话共 {} 次实体提及）。（SPARQL 确认）",
+        focus,
+        turn_seq,
+        mention_count(memory)
+    ))
+}
+
 /// SPARQL-based recall dispatcher：使用已加载的记忆，使图查询受限于该会话
 /// 实际承载的命名图（`graph_iris()`），避免全图扫描。
 pub async fn recall_sparql(
@@ -374,7 +480,8 @@ pub async fn recall_sparql(
         }
         RecallIntent::PlanStep(index) => recall_plan_step_sparql(manager, memory, *index).await,
         RecallIntent::Recap => recall_recap_sparql(manager, memory).await,
-        _ => None,
+        RecallIntent::Corrections => recall_corrections_sparql(manager, memory).await,
+        RecallIntent::Focus => recall_focus_sparql(manager, memory).await,
     };
     text.map(|text| RecallReply {
         intent,
@@ -1150,20 +1257,87 @@ mod tests {
             .unwrap();
         assert!(recap.text.contains("SPARQL 命名图"), "{}", recap.text);
 
-        // 第 N 个命题：SPARQL 召回（列表无序，只断言返回的是已知命题之一）。
+        // 第 N 个命题：SPARQL 召回与内存侧同口径——最近一条回答（seq 4）的第 N 点。
         let step = recall_sparql(&manager, &loaded, "上一个回答的第1个命题是什么")
             .await
             .unwrap();
-        let known_texts = [
-            "姚明是篮球运动员。",
-            "他的身高是 226 厘米。",
-            "姚明的身高是 226 厘米。",
-        ];
-        assert!(
-            known_texts.iter().any(|t| step.text.contains(t)),
-            "未返回已知命题之一：{}",
-            step.text
+        let memory_step = recall(&loaded, "上一个回答的第1个命题是什么").unwrap();
+        assert_eq!(
+            step.text,
+            format!("{}（SPARQL 召回）", memory_step.text),
+            "SPARQL 召回必须与内存召回同口径：{} vs {}",
+            step.text,
+            memory_step.text
         );
+
+        // 越界：说清最近一条回答共几点，而不是拿全局命题列表顶数。
+        let missing = recall_sparql(&manager, &loaded, "上一个回答的第3个命题是什么")
+            .await
+            .unwrap();
+        assert!(
+            missing.text.contains("一共 1 点，没有第 3 点"),
+            "{}",
+            missing.text
+        );
+
+        // 更正关系：SPARQL 召回与内存侧同口径（未标记更正时如实说无）。
+        let no_corrections = recall_sparql(&manager, &loaded, "上次和这次冲突吗")
+            .await
+            .unwrap();
+        assert!(
+            no_corrections
+                .text
+                .contains("还没有记录更正关系")
+                && no_corrections.text.contains("SPARQL 确认"),
+            "{}",
+            no_corrections.text
+        );
+
+        // 当前焦点：SPARQL 召回最近一次焦点（第 3 轮「姚明」）。
+        let focus = recall_sparql(&manager, &loaded, "当前焦点是谁").await.unwrap();
+        let memory_focus = recall(&loaded, "当前焦点是谁").unwrap();
+        assert_eq!(
+            focus.text,
+            format!("{}（SPARQL 确认）", memory_focus.text),
+            "{} vs {}",
+            focus.text,
+            memory_focus.text
+        );
+
+        // 标记更正后：SPARQL 召回列出更正关系，与内存侧逐字一致。
+        let mut corrected_memory = loaded.clone();
+        let corrected_uri = corrected_memory.reply_iter().next().unwrap().claims[0]
+            .uri
+            .clone();
+        let latest_seq = corrected_memory.latest_reply().unwrap().seq;
+        for stored in corrected_memory.turns.values_mut() {
+            for reply in stored.replies.iter_mut() {
+                if reply.seq == latest_seq {
+                    reply.corrects = vec![corrected_uri.clone()];
+                }
+            }
+        }
+        manager
+            .sync_generation_memory(&corrected_memory)
+            .await
+            .unwrap();
+        let corrected_loaded = manager
+            .load_generation_memory(&corrected_memory.session)
+            .await
+            .unwrap();
+        let corrections_sparql_reply = recall_sparql(&manager, &corrected_loaded, "上次和这次矛盾吗")
+            .await
+            .unwrap();
+        let corrections_memory_reply =
+            recall(&corrected_loaded, "上次和这次矛盾吗").unwrap();
+        assert_eq!(
+            corrections_sparql_reply.text,
+            format!("{}（SPARQL 确认）", corrections_memory_reply.text),
+            "{} vs {}",
+            corrections_sparql_reply.text,
+            corrections_memory_reply.text
+        );
+        assert!(corrections_sparql_reply.text.contains("共记录 1 条更正关系"));
 
         // 跨会话隔离：另一会话同词面不串入本会话的 SPARQL 召回。
         let other_dir = TempDir::new().unwrap();
