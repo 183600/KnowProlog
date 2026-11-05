@@ -2,13 +2,13 @@ name: Continuous Loop
 
 on:
   workflow_dispatch:
-  # 每 5 分钟一次「心跳」+ 下面 concurrency 排队，保证「一个 job 结束后立刻触发下一个」：
+  # 每小时一次「心跳」+ 下面 concurrency 排队，保证「一个 job 结束后立刻触发下一个」：
   # 任何时刻组内最多 1 个 running + 1 个 pending；当前 run 无论以何种方式结束
   # （成功 / 失败 / 被取消 / runner 意外宕机），队列中的下一个 run 都会在几秒内开始。
   # 即使收尾的 self-dispatch 步骤被 GitHub 跳过（runner 宕机时连 if: always()
-  # 步骤也不会执行），下一次心跳也能在 ≤5 分钟内补位续跑，链条永不断。
+  # 步骤也不会执行），下一次心跳也能在 ≤1 小时内补位续跑，链条永不断。
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '49 * * * *'
 
 concurrency:
   group: continuous-loop
@@ -719,7 +719,7 @@ jobs:
           #   42=无可识别测试 / 43=测试依赖环境不可用 / 124|137|143=测试超时 → 视为无法判定失败，放行。
           # 明确失败 → 提交并推送当前状态（保存进度）→ 提前结束本 job（exit 86）：
           #   后继 run 已由开头的 “Queue next run” 派发进 concurrency 队列，
-          #   并有收尾 next-run job 与 */15|*/30 心跳兜底，本 job 一结束下一个几秒内自动开始。
+          #   并有收尾 next-run job 与每小时心跳兜底，本 job 一结束下一个几秒内自动开始。
           pre_phase_test() {
             local phase="$1"
             cat > /tmp/pretest_run.sh <<'PTGEOF'
@@ -1125,7 +1125,7 @@ jobs:
           # 现拆分为两个 job 阶段：ideas（xuen 灵感，单次调用）与 improve（写代码，单次调用）。
           # 想法经 .github/.loop-ideas 传递；轮换状态存于 .github/.loop-phase（phase:failcount）。
           # 需要进行下一次调用时，由已排队的后继 job 接续（concurrency 队列 + 收尾 next-run job
-          # + */15 心跳三重兜底，链条永不断）。测试类调用不受单次限制（前置测试门 / 冒烟测试）。
+          # + 每小时心跳三重兜底，链条永不断）。测试类调用不受单次限制（前置测试门 / 冒烟测试）。
           # 轮换：ideas → improve →（1/10 概率插入 docs）→ ideas 循环。
           STATE_FILE=".github/.loop-phase"
           read_loop_state() {
@@ -1382,6 +1382,21 @@ jobs:
             *) WF_FILE="continuous-loop.yml" ;;
           esac
           echo "[loop] repo=${GH_REPO} workflow=${WF_FILE} branch=${BRANCH} run=${RUN_ID}"
+          # 防重派：若队列中已有后继 run（含心跳排队的），不再重复 dispatch，
+          # 避免并发组不断产生被替换/取消的多余 run 记录。
+          pending_other() {
+            gh api "repos/${GH_REPO}/actions/workflows/${WF_FILE}/runs?per_page=30" \
+              --jq '[.workflow_runs[] | select((.id|tostring) != "'"${RUN_ID}"'") | select(.status=="pending" or .status=="queued" or .status=="waiting" or .status=="requested")] | length' \
+              2>/dev/null
+          }
+          Q="$(pending_other)"
+          # 查询失败按 0 处理：宁可多派一个（会被队列合并），也绝不能漏派而断链
+          case "$Q" in ''|*[!0-9]*) Q=0 ;; esac
+          echo "[loop] queued successors before dispatch: ${Q}"
+          if [ "$Q" != "0" ]; then
+            echo "[loop] 后继 run 已在队列中，无需重复派发"
+            exit 0
+          fi
           for attempt in 1 2 3 4 5; do
             if gh workflow run "$WF_FILE" --ref "$BRANCH"; then
               echo "[loop] 已派发后继 run（attempt ${attempt}）——本 run 结束后立刻起跑"
