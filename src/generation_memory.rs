@@ -222,6 +222,144 @@ pub fn entity_attribute_said_sparql_query(
     )
 }
 
+/// SPARQL 数值排序前缀：轮次/回答/命题序号以简单字面量落图，多位数词面
+/// 按字典序会错排（"10" < "2"），排序前先投成 `xsd:integer`。
+pub const XSD_PREFIX: &str = "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>";
+
+/// SPARQL SELECT 查询：最近一条回答（回答 seq 最大）的全部命题，
+/// 返回 `(?replySeq, ?claimIndex, ?text)`，按回答 seq 降序、命题序号升序。
+///
+/// 「第 N 个命题」的 SPARQL 召回用它取最近一条回答的命题切片，与内存侧
+/// `render_plan_step` 同口径：结果第一组行就是最近一条回答，组内按序号升序。
+pub fn latest_reply_claims_sparql(memory: &GenerationMemory) -> String {
+    format!(
+        "{} SELECT ?replySeq ?claimIndex ?text WHERE {{ {} }} \
+         ORDER BY DESC(xsd:integer(?replySeq)) ASC(xsd:integer(?claimIndex))",
+        XSD_PREFIX,
+        memory_graph_body(
+            memory,
+            "?reply",
+            &format!(
+                "?reply a <{}> . ?reply <{}> ?replySeq . \
+                 ?reply <{}> ?claim . ?claim <{}> ?claimIndex . ?claim <{}> ?text .",
+                REPLY_CLASS, P_SEQ, P_HAS_CLAIM, P_INDEX, P_TEXT
+            )
+        )
+    )
+}
+
+/// SPARQL SELECT 查询：定位「说过指定文本」的回答与命题（带位置信息），
+/// 返回 `(?replySeq, ?claimIndex, ?turnSeq, ?text)`，按回答 seq 升序、命题
+/// 序号升序——与内存侧 `find_claim`「最早一次提及优先」的顺序同口径。
+///
+/// 无轮次回答的 `?turnSeq` 不绑定（缺席即无轮次关联）；文本为空时返回空串。
+pub fn locate_claim_by_text_sparql(memory: &GenerationMemory, text: &str) -> String {
+    let normalized = answer_key(text);
+    if normalized.is_empty() {
+        return String::new();
+    }
+    let escaped = escape_sparql_literal(&normalized);
+    format!(
+        "{} SELECT ?replySeq ?claimIndex ?turnSeq ?text WHERE {{ {} }} \
+         ORDER BY ASC(xsd:integer(?replySeq)) ASC(xsd:integer(?claimIndex))",
+        XSD_PREFIX,
+        memory_graph_body(
+            memory,
+            "?claim",
+            &format!(
+                "?claim a <{}> . ?claim <{}> ?text . ?claim <{}> \"{}\" . \
+                 ?claim <{}> ?claimIndex . ?claim <{}> ?reply . ?reply <{}> ?replySeq . \
+                 OPTIONAL {{ ?reply <{}> ?turnSeq . }}",
+                CLAIM_CLASS,
+                P_TEXT,
+                P_TEXT_KEY,
+                escaped,
+                P_INDEX,
+                P_REPLY,
+                P_SEQ,
+                P_TURN_SEQ
+            )
+        )
+    )
+}
+
+/// SPARQL SELECT 查询：本记忆中的命题总数（单行 `?total`，十进制词面）。
+///
+/// 「没有说过」的召回用它如实报检索量，与内存侧 `claim_count()` 同口径。
+pub fn count_claims_sparql(memory: &GenerationMemory) -> String {
+    format!(
+        "SELECT (COUNT(?claim) AS ?total) WHERE {{ {} }}",
+        memory_graph_body(
+            memory,
+            "?claim",
+            &format!("?claim a <{}> .", CLAIM_CLASS)
+        )
+    )
+}
+
+/// SPARQL SELECT 查询：本记忆里的更正关系（更正回答 → 被更正命题文本），
+/// 返回 `(?replySeq, ?answer, ?correctedText)`，按回答 seq 升序、被更正文本
+/// 升序——与内存侧「按回答顺序列出」一致。
+///
+/// 更正回答与被更正命题可能落在不同轮次图：用两个 GRAPH 子句分别绑定并
+/// 各自受会话图列表约束。被更正命题所在图被有界投影丢弃时，`?correctedText`
+/// 不绑定、该行内连接消失，与内存侧「找不到命题文本就不列出」同口径。
+pub fn corrections_sparql_query(memory: &GenerationMemory) -> String {
+    let session = escape_sparql_literal(&memory.session);
+    let iris = memory.graph_iris();
+    let filter_for = |variable: &str| {
+        if iris.is_empty() {
+            String::new()
+        } else {
+            let list = iris
+                .iter()
+                .map(|iri| format!("<{}>", iri))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(" FILTER(?{} IN ({}))", variable, list)
+        }
+    };
+    format!(
+        "{} SELECT ?replySeq ?answer ?correctedText WHERE {{ \
+           GRAPH ?g1 {{ ?reply <{}> \"{}\" . ?reply a <{}> . \
+             ?reply <{}> ?corrected . ?reply <{}> ?replySeq . \
+             OPTIONAL {{ ?reply <{}> ?answer . }} }}{} \
+           GRAPH ?g2 {{ ?corrected <{}> ?correctedText . }}{} \
+         }} \
+         ORDER BY ASC(xsd:integer(?replySeq)) ASC(?correctedText)",
+        XSD_PREFIX,
+        P_SESSION,
+        session,
+        REPLY_CLASS,
+        P_CORRECTS,
+        P_SEQ,
+        P_ANSWER,
+        filter_for("g1"),
+        P_TEXT,
+        filter_for("g2")
+    )
+}
+
+/// SPARQL SELECT 查询：最近一次记录的实体焦点，返回 `(?focus, ?turnSeq)`。
+///
+/// 与内存侧 `latest_focus` 同口径：轮次按 seq 降序取第一条带焦点的；
+/// seq 投成 `xsd:integer` 比较，避免多位数词面按字典序错排。
+pub fn latest_focus_sparql_query(memory: &GenerationMemory) -> String {
+    format!(
+        "{} SELECT ?focus ?turnSeq WHERE {{ {} }} \
+         ORDER BY DESC(xsd:integer(?turnSeq)) LIMIT 1",
+        XSD_PREFIX,
+        memory_graph_body(
+            memory,
+            "?turn",
+            &format!(
+                "?turn a <{}> . ?turn <{}> ?turnSeq . ?turn <{}> ?focus .",
+                TURN_CLASS, P_SEQ, P_FOCUS
+            )
+        )
+    )
+}
+
 /// 把待插入 SPARQL 简单字面量的文本转义：反斜杠与双引号做转义，控制字符
 /// 改写为 SPARQL 转义序列，避免用户文本破坏查询语法或注入额外子句。
 /// 仅用于生成记忆内部拼装的受控查询，不处理任意 IRI。
@@ -1891,6 +2029,247 @@ mod tests {
         let blank = GenerationMemory::empty("s-1");
         assert!(find_claim_by_text_sparql(&blank, "   ").is_empty());
         assert!(find_claim_by_text_sparql(&blank, "").is_empty());
+    }
+
+    #[test]
+    fn locate_claim_by_text_sparql_escapes_and_reports_position() {
+        let dir = TempDir::new().unwrap();
+        let (index, _session, _chronicle) = sample_index(&dir);
+        let memory = GenerationMemory::from_index(&index, 0);
+        let bounded = locate_claim_by_text_sparql(&memory, "姚明\"说'话");
+        assert!(!bounded.is_empty());
+        assert!(bounded.contains('\\'), "{}", bounded);
+        assert!(bounded.contains("SELECT ?replySeq ?claimIndex ?turnSeq ?text"));
+        assert!(bounded.contains("GRAPH ?g"), "{}", bounded);
+        assert!(bounded.contains("FILTER(?g IN"), "{}", bounded);
+        assert!(bounded.contains(P_INDEX), "{}", bounded);
+        assert!(bounded.contains(P_REPLY), "{}", bounded);
+        // 回答 seq 参与排序：xsd:integer 投影保证多位数词面不按字典序错排。
+        assert!(
+            bounded.contains("ORDER BY ASC(xsd:integer(?replySeq))"),
+            "{}",
+            bounded
+        );
+
+        // 空文本不产生查询。
+        let blank = GenerationMemory::empty("s-1");
+        assert!(locate_claim_by_text_sparql(&blank, "   ").is_empty());
+        assert!(locate_claim_by_text_sparql(&blank, "").is_empty());
+    }
+
+    #[test]
+    fn latest_reply_claims_sparql_anchors_to_reply_class_and_orders_desc() {
+        let dir = TempDir::new().unwrap();
+        let (index, _session, _chronicle) = sample_index(&dir);
+        let memory = GenerationMemory::from_index(&index, 0);
+        let query = latest_reply_claims_sparql(&memory);
+        assert!(query.contains("SELECT ?replySeq ?claimIndex ?text"), "{}", query);
+        assert!(query.contains(REPLY_CLASS), "{}", query);
+        assert!(query.contains(P_HAS_CLAIM), "{}", query);
+        assert!(
+            query.contains("ORDER BY DESC(xsd:integer(?replySeq))"),
+            "{}",
+            query
+        );
+        assert!(query.contains("GRAPH ?g"), "{}", query);
+        assert!(query.contains("FILTER(?g IN"), "{}", query);
+
+        // 空记忆仍产出可执行查询（会话过滤天然无解）。
+        let blank = latest_reply_claims_sparql(&GenerationMemory::empty("s-1"));
+        assert!(blank.contains("GRAPH ?g"), "{}", blank);
+        assert!(!blank.contains("FILTER(?g IN"), "{}", blank);
+    }
+
+    #[test]
+    fn count_claims_sparql_aggregates_claim_class_only() {
+        let dir = TempDir::new().unwrap();
+        let (index, _session, _chronicle) = sample_index(&dir);
+        let memory = GenerationMemory::from_index(&index, 0);
+        let query = count_claims_sparql(&memory);
+        assert!(query.contains("(COUNT(?claim) AS ?total)"), "{}", query);
+        assert!(query.contains(CLAIM_CLASS), "{}", query);
+        assert!(!query.contains(REPLY_CLASS), "{}", query);
+        assert!(query.contains("FILTER(?g IN"), "{}", query);
+    }
+
+    #[test]
+    fn corrections_sparql_query_joins_two_graphs_with_session_bounds() {
+        let dir = TempDir::new().unwrap();
+        let (index, _session, _chronicle) = sample_index(&dir);
+        let memory = GenerationMemory::from_index(&index, 0);
+        let query = corrections_sparql_query(&memory);
+        assert!(
+            query.contains("SELECT ?replySeq ?answer ?correctedText"),
+            "{}",
+            query
+        );
+        // 双图绑定：更正回答与被更正命题可以分属不同轮次图。
+        assert!(query.contains("GRAPH ?g1"), "{}", query);
+        assert!(query.contains("GRAPH ?g2"), "{}", query);
+        assert!(query.contains(P_CORRECTS), "{}", query);
+        // 两个图变量各自受会话图列表约束。
+        assert!(query.contains("FILTER(?g1 IN"), "{}", query);
+        assert!(query.contains("FILTER(?g2 IN"), "{}", query);
+        assert!(
+            query.contains(&turn_graph_iri(&memory.session, 1)),
+            "{}",
+            query
+        );
+
+        // 空记忆：省略图列表过滤，会话过滤天然无解。
+        let blank = corrections_sparql_query(&GenerationMemory::empty("s-1"));
+        assert!(!blank.contains("FILTER(?g1 IN"), "{}", blank);
+        assert!(!blank.contains("FILTER(?g2 IN"), "{}", blank);
+    }
+
+    #[test]
+    fn latest_focus_sparql_query_orders_turns_desc_with_limit() {
+        let dir = TempDir::new().unwrap();
+        let (index, _session, _chronicle) = sample_index(&dir);
+        let memory = GenerationMemory::from_index(&index, 0);
+        let query = latest_focus_sparql_query(&memory);
+        assert!(query.contains("SELECT ?focus ?turnSeq"), "{}", query);
+        assert!(query.contains(TURN_CLASS), "{}", query);
+        assert!(query.contains(P_FOCUS), "{}", query);
+        assert!(
+            query.contains("ORDER BY DESC(xsd:integer(?turnSeq)) LIMIT 1"),
+            "{}",
+            query
+        );
+    }
+
+    #[tokio::test]
+    async fn positional_sparql_builders_execute_against_projected_memory() {
+        let dir = TempDir::new().unwrap();
+        let (index, _session, _chronicle) = sample_index(&dir);
+        let memory = GenerationMemory::from_index(&index, 0);
+        let store_dir = dir.path().join("store");
+        let manager = OxigraphManager::with_perf_ledger(
+            &store_dir.to_string_lossy(),
+            Arc::new(PerfLedger::new()),
+        )
+        .unwrap();
+        manager.sync_generation_memory(&memory).await.unwrap();
+
+        // 最近一条回答的命题：行按（回答 seq 降序、命题序号升序）排序，
+        // 第一组（replySeq 相同的连续行）就是最近回答（seq 4）。
+        let rows = manager
+            .query_sparql(&latest_reply_claims_sparql(&memory))
+            .await
+            .unwrap();
+        assert_eq!(rows.data.len(), 3, "{:?}", rows.data);
+        assert_eq!(
+            rows.data[0].get("replySeq").and_then(JsonValue::as_str),
+            Some("4")
+        );
+        assert_eq!(
+            rows.data[0].get("claimIndex").and_then(JsonValue::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            rows.data[0].get("text").and_then(JsonValue::as_str),
+            Some("姚明的身高是 226 厘米。")
+        );
+        // 后续组是更早回答（seq 2），组内命题序号升序。
+        assert_eq!(
+            rows.data[1].get("replySeq").and_then(JsonValue::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            rows.data[2].get("claimIndex").and_then(JsonValue::as_str),
+            Some("2")
+        );
+
+        // 定位已说命题：给出回答 seq、命题序号、所属轮次与原文。
+        let located = manager
+            .query_sparql(&locate_claim_by_text_sparql(
+                &memory,
+                " 姚明是篮球运动员 。",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(located.data.len(), 1, "{:?}", located.data);
+        assert_eq!(
+            located.data[0].get("replySeq").and_then(JsonValue::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            located.data[0].get("claimIndex").and_then(JsonValue::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            located.data[0].get("turnSeq").and_then(JsonValue::as_str),
+            Some("1")
+        );
+
+        // 命题计数与内存侧 claim_count 同口径（聚合返回 xsd:integer，JSON 为数字）。
+        let counted = manager
+            .query_sparql(&count_claims_sparql(&memory))
+            .await
+            .unwrap();
+        let total = counted
+            .data[0]
+            .get("total")
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            total.as_u64().or_else(|| {
+                total.as_str().and_then(|s| s.parse::<u64>().ok())
+            }),
+            Some(3),
+            "{:?}",
+            counted.data
+        );
+
+        // 最近焦点：第 3 轮记录了焦点「姚明」。
+        let focused = manager
+            .query_sparql(&latest_focus_sparql_query(&memory))
+            .await
+            .unwrap();
+        assert_eq!(focused.data.len(), 1, "{:?}", focused.data);
+        assert_eq!(
+            focused.data[0].get("focus").and_then(JsonValue::as_str),
+            Some("姚明")
+        );
+        assert_eq!(
+            focused.data[0].get("turnSeq").and_then(JsonValue::as_str),
+            Some("3")
+        );
+
+        // 更正关系：让最近回答更正第 2 条回答的命题后，双图联接能取回文本。
+        let mut corrected_memory = memory.clone();
+        let corrected_uri = corrected_memory.reply_iter().next().unwrap().claims[0]
+            .uri
+            .clone();
+        let latest_seq = corrected_memory.latest_reply().unwrap().seq;
+        for stored in corrected_memory.turns.values_mut() {
+            for reply in stored.replies.iter_mut() {
+                if reply.seq == latest_seq {
+                    reply.corrects = vec![corrected_uri.clone()];
+                }
+            }
+        }
+        manager
+            .sync_generation_memory(&corrected_memory)
+            .await
+            .unwrap();
+        let corrections = manager
+            .query_sparql(&corrections_sparql_query(&corrected_memory))
+            .await
+            .unwrap();
+        assert_eq!(corrections.data.len(), 1, "{:?}", corrections.data);
+        assert_eq!(
+            corrections.data[0]
+                .get("correctedText")
+                .and_then(JsonValue::as_str),
+            Some("姚明是篮球运动员。")
+        );
+        assert_eq!(
+            corrections.data[0]
+                .get("replySeq")
+                .and_then(JsonValue::as_str),
+            Some("4")
+        );
     }
 
     #[tokio::test]
