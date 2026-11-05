@@ -486,6 +486,62 @@ impl GenerationMemory {
         Self::from_index(&index, max_turns)
     }
 
+    /// 向记忆中添加一个轮次（幂等：已存在则不重复）。
+    ///
+    /// 返回被写入的轮次 seq，若 seq 已存在则返回 None。
+    pub fn add_turn(&mut self, seq: u64, user: String, mode: String, focus: Option<String>) -> Option<u64> {
+        if self.turns.contains_key(&seq) {
+            return None;
+        }
+        self.turns.insert(
+            seq,
+            MemoryTurn {
+                turn: TurnArtifact {
+                    seq,
+                    uri: turn_graph_iri(&self.session, seq),
+                    user,
+                    mode,
+                    focus,
+                    focus_uri: None,
+                    kb_revision: 0,
+                    mentions: Vec::new(),
+                },
+                replies: Vec::new(),
+            },
+        );
+        Some(seq)
+    }
+
+    /// 向指定轮次添加一个回答（幂等：重复调用不重复写入）。
+    ///
+    /// 如果轮次不存在，会自动创建；如果该轮次已有该 seq 的回答则不重复写入。
+    ///
+    /// 注意：如果返回 `None`，调用方仍保有 `reply` 的所有权。
+    pub fn add_reply(
+        &mut self,
+        turn_seq: u64,
+        reply: ReplyArtifact,
+    ) -> Option<&ReplyArtifact> {
+        let reply_seq = reply.seq;
+        let turn = self.turns.get_mut(&turn_seq);
+        match turn {
+            Some(stored) => {
+                // 检查是否已存在相同 seq 的回答（按 uri 唯一性）
+                if stored.replies.iter().any(|r| r.seq == reply_seq) {
+                    return None;
+                }
+                stored.replies.push(reply);
+                stored.replies.sort_by_key(|r| r.seq);
+                Some(stored.replies.last().unwrap())
+            }
+            None => {
+                // 轮次不存在，作为无轮次回答保存
+                self.unattached_replies.insert(reply_seq, reply);
+                Some(self.unattached_replies.get(&reply_seq).unwrap())
+            }
+        }
+    }
+
     pub fn session_uri(&self) -> String {
         session_uri(&self.session)
     }
