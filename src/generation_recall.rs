@@ -19,7 +19,9 @@
 //! - **确定性**：排序固定、文案不含挂钟时间，同一份记忆对同一问题逐字节可复现。
 
 use crate::dialogue_uri::ClaimArtifact;
-use crate::generation_memory::GenerationMemory;
+use crate::generation_memory::{self, GenerationMemory};
+use crate::OxigraphManager;
+use serde_json::Value;
 
 /// 回顾默认展示的最近轮次数（记忆本身已在投影时有界）。
 pub const RECAP_TURN_LIMIT: usize = 3;
@@ -213,6 +215,164 @@ pub fn recall_intent(memory: &GenerationMemory, intent: RecallIntent) -> RecallR
     };
     let plan = vec!["generation_recall".to_string(), intent.tag().to_string()];
     RecallReply { intent, text, plan }
+}
+
+/// SPARQL-based recall for AlreadySaid intent: uses ASK query against named graphs.
+async fn recall_already_said_sparql(
+    manager: &OxigraphManager,
+    session: &str,
+    target: Option<&str>,
+) -> Option<String> {
+    let memory = GenerationMemory::empty(session);
+    let query = if let Some(target) = target.filter(|t| !t.is_empty()) {
+        generation_memory::already_said_sparql_query(&memory, target)
+    } else {
+        // For "这句话说过吗" without explicit target, we need the latest claim
+        // Fall back to in-memory for now as it requires the latest claim
+        return None;
+    };
+    if query.is_empty() {
+        return None;
+    }
+    match manager.query_sparql(&query).await {
+        Ok(result) => {
+            if let Some(row) = result.data.first() {
+                if let Some(Value::Bool(true)) = row.get("boolean") {
+                    return Some("这句话说过（SPARQL 确认）。".to_string());
+                }
+            }
+            Some("这句话在本会话的生成记忆里没有说过（SPARQL 确认）。".to_string())
+        }
+        Err(_) => None,
+    }
+}
+
+/// SPARQL-based recall for PlanStep intent: uses SELECT query against named graphs.
+async fn recall_plan_step_sparql(
+    manager: &OxigraphManager,
+    session: &str,
+    index: usize,
+) -> Option<String> {
+    let memory = GenerationMemory::empty(session);
+    let query = generation_memory::list_all_claims_sparql(&memory);
+    if query.is_empty() {
+        return None;
+    }
+    match manager.query_sparql(&query).await {
+        Ok(result) => {
+            let claims: Vec<_> = result.data.iter()
+                .filter_map(|row| {
+                    let digest = row.get("digest")?.as_str()?;
+                    let text = row.get("text")?.as_str()?;
+                    Some((digest.to_string(), text.to_string()))
+                })
+                .collect();
+            if index > 0 && index <= claims.len() {
+                let (_, text) = &claims[index - 1];
+                return Some(format!("第 {} 点（SPARQL 召回）：{}", index, text));
+            }
+            if !claims.is_empty() {
+                return Some(format!("生成记忆里一共 {} 条命题，没有第 {} 点。", claims.len(), index));
+            }
+            Some("生成记忆里还没有命题。".to_string())
+        }
+        Err(_) => None,
+    }
+}
+
+/// SPARQL-based recall for Recap intent: uses SELECT across named graphs.
+async fn recall_recap_sparql(
+    manager: &OxigraphManager,
+    session: &str,
+) -> Option<String> {
+    let memory = GenerationMemory::empty(session);
+    let query = format!(
+        "SELECT ?turnSeq ?user ?replySeq ?answer WHERE {{
+            GRAPH ?g {{
+                ?turn a <{}> .
+                ?turn <{}> ?turnSeq .
+                ?turn <{}> ?user .
+                OPTIONAL {{
+                    ?reply a <{}> .
+                    ?reply <{}> ?replySeq .
+                    ?reply <{}> ?answer .
+                    ?reply <{}> ?turnSeq .
+                }}
+            }}
+            FILTER(?g IN ({}))
+        }} ORDER BY ?turnSeq ?replySeq",
+        generation_memory::TURN_CLASS,
+        generation_memory::P_SEQ,
+        generation_memory::P_USER,
+        generation_memory::REPLY_CLASS,
+        generation_memory::P_SEQ,
+        generation_memory::P_ANSWER,
+        generation_memory::P_TURN_SEQ,
+        memory.graph_iris()
+            .iter()
+            .map(|iri| format!("<{}>", iri))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    match manager.query_sparql(&query).await {
+        Ok(result) => {
+            if result.data.is_empty() {
+                return Some("生成记忆里还没有投影任何轮次（SPARQL 确认）。".to_string());
+            }
+            let mut text = String::new();
+            text.push_str("生成记忆回顾（SPARQL 命名图）：\n");
+            let mut current_turn = 0u64;
+            for row in &result.data {
+                let turn_seq = row.get("turnSeq").and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                let user = row.get("user").and_then(|v| v.as_str()).unwrap_or("");
+                let reply_seq = row.get("replySeq").and_then(|v| v.as_str()).and_then(|s| s.parse::<u64>().ok());
+                let answer = row.get("answer").and_then(|v| v.as_str()).unwrap_or("");
+                if turn_seq != current_turn {
+                    current_turn = turn_seq;
+                    text.push_str(&format!("第 {} 轮你问「{}」。", turn_seq, user));
+                }
+                if let Some(rseq) = reply_seq {
+                    if !answer.is_empty() {
+                        let excerpt = if answer.chars().count() > 40 {
+                            format!("{}…", answer.chars().take(40).collect::<String>())
+                        } else {
+                            answer.to_string()
+                        };
+                        text.push_str(&format!("  回答 {}：{}\n", rseq, excerpt));
+                    }
+                }
+            }
+            Some(text)
+        }
+        Err(_) => None,
+    }
+}
+
+/// SPARQL-based recall dispatcher.
+pub async fn recall_sparql(
+    manager: &OxigraphManager,
+    session: &str,
+    input: &str,
+) -> Option<RecallReply> {
+    let intent = classify(input)?;
+    let intent_tag = intent.tag().to_string();
+    let text = match &intent {
+        RecallIntent::AlreadySaid(target) => {
+            recall_already_said_sparql(manager, session, target.as_deref()).await
+        }
+        RecallIntent::PlanStep(index) => {
+            recall_plan_step_sparql(manager, session, *index).await
+        }
+        RecallIntent::Recap => {
+            recall_recap_sparql(manager, session).await
+        }
+        _ => None,
+    };
+    text.map(|text| RecallReply {
+        intent,
+        text,
+        plan: vec!["generation_recall_sparql".to_string(), intent_tag],
+    })
 }
 
 /// 会话回顾：计数 + 最近若干轮的问答切片 + 当前焦点；空记忆显式说明。

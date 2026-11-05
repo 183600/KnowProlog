@@ -439,6 +439,7 @@
                             .unwrap_or_default();
                         // 更正回答带上被撤回命题的 URI（trace_correction 专属；其余为空表）。
                         let corrects = correction_targets(
+                            &symbolic_reasoner,
                             &dialogue_manager,
                             &dialogue_session,
                             &chronicle,

@@ -159,6 +159,7 @@ impl SymbolicReasoner {
             persisted_laws: None,
             context: DialogueContext::new(5),
             already_said_check: None,
+            corrects_check: None,
             memory_reply_provider: None,
             claims: crate::claim_lifecycle::ClaimLedger::new(),
             epistemic_turns: EpistemicTurnBook::new(),
@@ -237,6 +238,22 @@ impl SymbolicReasoner {
     /// 状态缺失时，`Focus(n)` 复述据此取记忆里最近一条回答的第 N 点。
     pub fn set_memory_reply_provider(&mut self, f: Option<MemoryReplyProvider>) {
         self.memory_reply_provider = f;
+    }
+
+    /// 设置“更正关系”检查闭包。由对话循环按已投影的生成记忆设置；
+    /// `None`（默认）表示不检查更正，既有生成行为不变。
+    /// 闭包参数：(实体名, 属性名, 旧回答片段) -> 被更正的命题 URI 列表。
+    /// 用于在生成计划中标记 `corrects` 关系，实现「上一轮说错了，现在更正」。
+    pub fn set_corrects_check(
+        &mut self,
+        f: Option<Box<dyn Fn(&str, &str, &str) -> Vec<String> + Send + Sync>>,
+    ) {
+        self.corrects_check = f;
+    }
+
+    /// 获取“更正关系”检查闭包的引用（供外部调用，如编年史回复登记）。
+    pub fn corrects_check(&self) -> Option<&Box<dyn Fn(&str, &str, &str) -> Vec<String> + Send + Sync>> {
+        self.corrects_check.as_ref()
     }
 
     /// 从预热基座分叉一个新会话：知识派生状态按值深拷贝，会话态清零。

@@ -429,6 +429,11 @@ async fn answer_generation_recall(
     if know_prolog::generation_recall::classify(input).is_none() {
         return None;
     }
+    // Try SPARQL-based recall first (more efficient, doesn't load full memory)
+    if let Some(reply) = know_prolog::generation_recall::recall_sparql(manager, session.id(), input).await {
+        return Some(reply);
+    }
+    // Fall back to in-memory recall
     match manager.load_generation_memory(session.id()).await {
         Ok(memory) => know_prolog::generation_recall::recall(&memory, input),
         Err(error) => {

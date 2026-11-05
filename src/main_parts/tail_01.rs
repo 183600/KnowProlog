@@ -303,12 +303,13 @@ fn log_chronicle_reply(
     }
 }
 
-/// 更正回答的 `corrects` 负载：从追踪图取最近一次值更正，在生成记忆里定位
-/// 被撤回的先前命题 URI。非更正回答（计划里没有 `trace_correction`）返回空表。
+/// 更正回答的 `corrects` 负载：优先使用符号推理器的 `corrects_check`（生成记忆直连），
+/// 回退到追踪图的更正记录。非更正回答（计划里没有 `trace_correction`）返回空表。
 ///
 /// 失败语义（尽力而为，绝不阻塞回答）：会话/编年史缺失、追踪图没有更正记录、
 /// 生成记忆里定位不到命题时，一律返回空表，让回答照常落账。
 fn correction_targets(
+    reasoner: &SymbolicReasoner,
     dialogue_manager: &DialogueManager,
     session: &Option<DialogueSession>,
     chronicle: &Option<Chronicle>,
@@ -317,18 +318,27 @@ fn correction_targets(
     if !plan.iter().any(|step| step == "trace_correction") {
         return Vec::new();
     }
+    // 优先使用 reasoner 的 corrects_check（生成记忆直连，跨重启也生效）。
+    // 需要从追踪图获取实体、属性、旧回答片段作为参数。
+    let trace_correction = dialogue_manager.trace_store().corrections().last();
+    if let Some(correction) = trace_correction {
+        if let Some(check) = reasoner.corrects_check() {
+            return check(&correction.entity, &correction.attribute, &correction.previous);
+        }
+    }
+    // 回退：直接用生成记忆（需会话+编年史）。
     let (Some(session), Some(chronicle)) = (session.as_ref(), chronicle.as_ref()) else {
         return Vec::new();
     };
-    let Some(correction) = dialogue_manager.trace_store().corrections().last() else {
-        return Vec::new();
-    };
-    let memory = generation_memory::GenerationMemory::from_chronicle(session, chronicle, 0);
-    memory.corrected_claim_uris(
-        &correction.entity,
-        &correction.attribute,
-        &correction.previous,
-    )
+    if let Some(correction) = trace_correction {
+        let memory = generation_memory::GenerationMemory::from_chronicle(session, chronicle, 0);
+        return memory.corrected_claim_uris(
+            &correction.entity,
+            &correction.attribute,
+            &correction.previous,
+        );
+    }
+    Vec::new()
 }
 
 /// 打印回答并写入编年史；若该回答文本已作为某条回答说过（按 `already_replied`），

@@ -796,6 +796,17 @@ async fn run_interactive_mode(
                 .map(|mem| mem.already_said(text))
                 .unwrap_or(false)
         })));
+        // 注入 corrects_check 到符号推理器：用于在生成时定位被更正的先前命题 URI。
+        // 参数：(实体名, 属性名, 旧回答片段) -> 被更正的命题 URI 列表。
+        let gen_mem = Arc::clone(&generation_memory);
+        symbolic_reasoner.set_corrects_check(Some(Box::new(move |entity: &str, attribute: &str, previous: &str| {
+            gen_mem
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|mem| mem.corrected_claim_uris(entity, attribute, previous))
+                .unwrap_or_default()
+        })));
         // 注入生成记忆供给闭包：会话内生成状态缺失时（重启后），「风格：第N点」
         // 类复述据此回退到 RDF 记忆里最近一条回答的第 N 点（last_plan 跨重启）。
         // 记忆为空或未同步时返回 None，调用方落回既有指引，绝不伪装成答案。

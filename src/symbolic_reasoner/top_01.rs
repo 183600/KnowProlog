@@ -1349,11 +1349,14 @@ pub struct SymbolicReasoner {
     // 可选的“已说过命题”过滤：由对话循环按已投影的生成记忆设置，默认 None，
     // 既有生成行为不变。闭包返回 true 表示该命题文本已说过，生成时应跳过，
     // 实现“生成受约束、不重复陈述”。
-    already_said_check: Option<Box<dyn Fn(&str) -> bool + Send + Sync>>,
+    pub(crate) already_said_check: Option<Box<dyn Fn(&str) -> bool + Send + Sync>>,
+    // 可选的“更正关系”检查：由对话循环按已投影的生成记忆设置，默认 None，
+    // 闭包返回被更正的命题 URI 列表，用于在生成计划中标记更正关系。
+    pub(crate) corrects_check: Option<Box<dyn Fn(&str, &str, &str) -> Vec<String> + Send + Sync>>,
     // 可选的“生成记忆供给”闭包：由对话循环按已投影的生成记忆设置，默认 None，
     // 既有复述行为不变。会话内生成状态缺失时（重启后），`Focus(n)` 类复述
     // 据此回退到记忆里最近一条回答的第 N 点，实现 last_plan 跨重启连续。
-    memory_reply_provider: Option<MemoryReplyProvider>,
+    pub(crate) memory_reply_provider: Option<MemoryReplyProvider>,
     // 生成断言的提交前闸门与生命周期；随对话快照持久化，不写知识图谱。
     claims: crate::claim_lifecycle::ClaimLedger,
     epistemic_turns: EpistemicTurnBook,
