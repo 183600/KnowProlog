@@ -88,6 +88,7 @@ KnowProlog 把中文文本转成可查询、可推理、可追溯的知识图谱
 | 存储 | `OxigraphManager`（`src/lib/`） | RDF 三元组读写、SPARQL 查询、事实导出 |
 | 推理 | `src/prolog_engine.rs`、`src/resolution_engine.rs`、`src/planning.rs` | Prolog 事实装载、三态查询、查询计划与轨迹 |
 | 对话 | `src/dialogue_manager/`、`src/contextual_reference.rs` | 多轮上下文、指代消解、澄清与挂账 |
+| 生成记忆 | `src/generation_memory.rs`、`src/generation_recall.rs` | 回答史投影为按轮隔离的 RDF 命名图，元话语召回（回顾 / 说过吗 / 第N点 / 焦点 / 更正） |
 | 恢复 | `src/recovery.rs`、`src/fulfillment.rs` | 失败分级、提名验证、状态化措辞 |
 | 观测 | `src/perf_ledger.rs`、`src/startup_ledger.rs`、`src/provenance.rs` | 操作计数、启动分期、来源与冲突记录 |
 | 质量 | `src/quality.rs`、`src/release.rs`、`src/shape_gate.rs` | 质量索引、发布检查、形状校验 |
@@ -211,6 +212,34 @@ right = "地点"
 ```
 
 用于实体类型的别名归一、子类闭包与互斥判定；模式闸门按「别名 + 子类 + 互斥」三重证据决定是否放行。
+
+### 6.5 生成记忆
+
+```toml
+[generation_memory]
+enabled = false   # 默认关闭；开启后只在轮次边界做有界投影
+max_turns = 8     # 每次投影保留的最近轮次数（0 = 全部，谨慎）
+```
+
+把编年史里的回答史投影成按轮隔离的 RDF 命名图（`kg:graphs/dialogue/`），
+让「说过什么、依据什么、下一轮该记得什么」与知识事实共用同一套 SPARQL
+底座。设计约定：
+
+- **默认图零污染**：全部四元组落在会话命名图下，全图扫描与 Prolog 事实
+  快照都看不到；投影是账本写入，不推进知识版本；
+- **有界且可审计**：每次投影留「收据」（窗口、保留与丢弃的 seq），回顾措辞
+  必须披露「另有 K 轮更早轮次不在记忆中」，不谎称全量；
+- **召回双路径同口径**：元话语问题先走受会话图边界约束的 SPARQL，失败或
+  语义无法在图上表达（指示词、空记忆、在途轮次）时回退内存侧，两者逐字
+  一致（只差一个路径标记）；
+- **忘记带水位**：忘记会话删除命名图，并向编年史追加 `forget_memory`
+  水位条目；之后所有投影只覆盖水位之后的条目，已忘记的历史不会被重新
+  写回图，也不再算「说过」。
+
+入口：REPL 命令 `生成记忆`（查看投影）与 `忘记生成记忆`（删图 + 落水位）；
+CLI 子命令 `dialogue-memory --sync / --forget / --recall <问题>`。
+生成侧消费三件事：`already_said_check`（生成去重）、`corrects_check`
+（更正定位）、`memory_reply_provider`（跨重启复述「第 N 点」）。
 
 ## 7. 质量门禁
 
