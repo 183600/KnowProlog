@@ -544,9 +544,10 @@
                 if let (Some(chronicle), Some(session)) =
                     (chronicle.as_ref(), dialogue_session.as_ref())
                 {
-                    let memory = generation_memory::GenerationMemory::from_chronicle(
+                    let memory = generation_memory::GenerationMemory::from_chronicle_since(
                         session,
                         chronicle,
+                        generation_memory::chronicle_watermark(chronicle),
                         config.generation_memory.max_turns,
                     );
                     *generation_memory.lock().unwrap() = Some(memory);
@@ -1183,6 +1184,82 @@
 
         if matches!(input, "清空语境记忆" | "清空读法记忆" | "忘记读法记忆") {
             println!("{}", symbolic_reasoner.clear_contextual_reading_memory());
+            println!();
+            continue;
+        }
+
+        // 生成记忆报告：查看本会话投影到 RDF 命名图的轮次、命题、依据与投影收据。
+        if matches!(input, "生成记忆" | "生成记忆报告") {
+            if !generation_memory_enabled {
+                println!("生成记忆未启用（config.toml [generation_memory] enabled = true 开启）。");
+            } else {
+                let snapshot = generation_memory.lock().unwrap().clone();
+                let memory = match snapshot {
+                    Some(memory) => Some(memory),
+                    None => match dialogue_session.as_ref() {
+                        Some(session) => oxigraph_manager
+                            .load_generation_memory(session.id())
+                            .await
+                            .ok(),
+                        None => None,
+                    },
+                };
+                match memory {
+                    Some(memory) if !memory.is_empty() => println!("{}", memory.render_report()),
+                    _ => println!(
+                        "生成记忆为空：还没有可展示的轮次（开启后每轮边界自动投影；也可用 dialogue-memory --sync 手动投影）。"
+                    ),
+                }
+            }
+            println!();
+            continue;
+        }
+
+        // 忘记生成记忆：删除本会话的 RDF 命名图并清空共享记忆快照，
+        // 再往编年史追加水位条目（跨重启持久）：之后的投影只覆盖水位
+        // 之后的轮次，已忘记的历史不会被重新写回图。编年史本身保留
+        // （历史真相在文件里，追溯与崩溃恢复不受影响）。
+        if matches!(input, "忘记生成记忆" | "清空生成记忆") {
+            if !generation_memory_enabled {
+                println!("生成记忆未启用，无需忘记。");
+            } else {
+                match dialogue_session.as_ref() {
+                    Some(session) => {
+                        match oxigraph_manager.forget_generation_memory(session.id()).await {
+                            Ok(removed) => {
+                                *generation_memory.lock().unwrap() = None;
+                                if let Some(chronicle) = chronicle.as_mut() {
+                                    if let Ok(seq) = chronicle.append(
+                                        generation_memory::FORGET_WATERMARK_KIND,
+                                        serde_json::json!({
+                                            "forgotten_graphs": removed,
+                                            "session": session.id(),
+                                        }),
+                                    ) {
+                                        synced_chronicle_len = chronicle.len();
+                                        println!(
+                                            "已忘记生成记忆：{} 个命名图（会话 {}，水位 seq {}）。后续轮次会重新开始投影。",
+                                            removed,
+                                            session.uri(),
+                                            seq
+                                        );
+                                    } else {
+                                        synced_chronicle_len = chronicle.len();
+                                        println!(
+                                            "已忘记生成记忆：{} 个命名图（会话 {}）。水位写入失败，重启后会按编年史重新投影最近 {} 轮。",
+                                            removed,
+                                            session.uri(),
+                                            config.generation_memory.max_turns
+                                        );
+                                    }
+                                }
+                            }
+                            Err(error) => eprintln!("忘记生成记忆失败：{}", error),
+                        }
+                    }
+                    None => println!("会话标识不可用，无法定位要忘记的生成记忆。"),
+                }
+            }
             println!();
             continue;
         }

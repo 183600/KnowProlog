@@ -1004,11 +1004,12 @@
                 // 回顾不落后一轮；共享 Arc 同步更新，供给闭包即时生效。
                 if let Some(chronicle) = chronicle.as_ref() {
                     if chronicle.len() != synced_chronicle_len {
-                        let memory = generation_memory::GenerationMemory::from_chronicle(
-                            session,
-                            chronicle,
-                            config.generation_memory.max_turns,
-                        );
+                    let memory = generation_memory::GenerationMemory::from_chronicle_since(
+                        session,
+                        chronicle,
+                        generation_memory::chronicle_watermark(chronicle),
+                        config.generation_memory.max_turns,
+                    );
                         match oxigraph_manager.sync_generation_memory(&memory).await {
                             Ok(_) => {
                                 synced_chronicle_len = chronicle.len();

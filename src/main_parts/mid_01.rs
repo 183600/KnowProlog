@@ -609,7 +609,12 @@ async fn run_dialogue_memory(
         if !audit.is_clean() {
             eprintln!("对话编年史{}", audit.verdict());
         }
-        let memory = GenerationMemory::from_chronicle(&session, &chronicle, max_turns);
+        let memory = GenerationMemory::from_chronicle_since(
+            &session,
+            &chronicle,
+            know_prolog::generation_memory::chronicle_watermark(&chronicle),
+            max_turns,
+        );
         if let Err(error) = manager.sync_generation_memory(&memory).await {
             eprintln!("写入生成记忆失败：{}", error);
             std::process::exit(1);

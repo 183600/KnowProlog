@@ -851,9 +851,10 @@ async fn run_interactive_mode(
                 (chronicle.as_ref(), dialogue_session.as_ref())
             {
                 if chronicle.len() != synced_chronicle_len {
-                    let memory = generation_memory::GenerationMemory::from_chronicle(
+                    let memory = generation_memory::GenerationMemory::from_chronicle_since(
                         session,
                         chronicle,
+                        generation_memory::chronicle_watermark(chronicle),
                         config.generation_memory.max_turns,
                     );
                     match oxigraph_manager.sync_generation_memory(&memory).await {

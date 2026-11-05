@@ -499,6 +499,23 @@ pub fn session_graph_prefix(session: &str) -> String {
     )
 }
 
+/// 编年史里「忘记生成记忆」水位条目的种类。
+pub const FORGET_WATERMARK_KIND: &str = "forget_memory";
+
+/// 读取编年史的「忘记生成记忆」水位：最后一次水位条目的 seq。
+///
+/// 水位之后的条目才参与生成记忆投影（`from_chronicle_since`）；没有水位
+/// 条目时返回 0（全量投影）。跨重启持久——水位随编年史落盘。
+pub fn chronicle_watermark(chronicle: &Chronicle) -> u64 {
+    chronicle
+        .entries()
+        .iter()
+        .filter(|entry| entry.kind == FORGET_WATERMARK_KIND)
+        .map(|entry| entry.seq)
+        .next_back()
+        .unwrap_or(0)
+}
+
 /// 轮次命名图 IRI。
 pub fn turn_graph_iri(session: &str, turn_seq: u64) -> String {
     format!("{}turn/{}", session_graph_prefix(session), turn_seq)
@@ -621,6 +638,20 @@ impl GenerationMemory {
         max_turns: usize,
     ) -> Self {
         let index = DialogueArtifactIndex::from_chronicle(session, chronicle);
+        Self::from_index(&index, max_turns)
+    }
+
+    /// 便捷投影：从编年史的水位之后构建（「忘记生成记忆」后的增量口径）。
+    ///
+    /// `min_seq` 之前的条目不参与投影，已忘记的历史不会被重新写回图；
+    /// 投影收据如实记录水位后的轮次总数。
+    pub fn from_chronicle_since(
+        session: &DialogueSession,
+        chronicle: &Chronicle,
+        min_seq: u64,
+        max_turns: usize,
+    ) -> Self {
+        let index = DialogueArtifactIndex::from_chronicle_since(session, chronicle, min_seq);
         Self::from_index(&index, max_turns)
     }
 
@@ -1556,6 +1587,58 @@ mod tests {
             .unwrap();
         let index = DialogueArtifactIndex::from_chronicle(&session, &chronicle);
         (index, session, chronicle)
+    }
+
+    #[test]
+    fn forget_watermark_excludes_history_from_projection() {
+        let dir = TempDir::new().unwrap();
+        let (index, session, mut chronicle) = sample_index(&dir);
+        let _ = index;
+
+        // 无水位条目：全量投影。
+        assert_eq!(chronicle_watermark(&chronicle), 0);
+        let full = GenerationMemory::from_chronicle(&session, &chronicle, 0);
+        assert_eq!(full.turn_count(), 2);
+        assert!(full.already_said("姚明是篮球运动员"));
+
+        // 忘记生成记忆：追加水位条目（seq 记入编年史）。
+        let watermark_seq = chronicle
+            .append(
+                FORGET_WATERMARK_KIND,
+                serde_json::json!({"forgotten_graphs": 3}),
+            )
+            .unwrap();
+        assert_eq!(chronicle_watermark(&chronicle), watermark_seq);
+
+        // 水位之后的新一轮问答。
+        chronicle
+            .append_turn_with_refs("叶莉是谁", "query", None, 2, &[])
+            .unwrap();
+        chronicle
+            .append_reply("叶莉是篮球运动员。", &[], &[], &[])
+            .unwrap();
+
+        // 水位之后投影：只含新一轮，已忘记的历史不再算「说过」。
+        let since = GenerationMemory::from_chronicle_since(
+            &session,
+            &chronicle,
+            chronicle_watermark(&chronicle),
+            0,
+        );
+        assert_eq!(since.turn_count(), 1);
+        assert_eq!(since.reply_count(), 1);
+        assert!(since.already_said("叶莉是篮球运动员"));
+        assert!(!since.already_said("姚明是篮球运动员"));
+        assert!(!since.already_replied("姚明是篮球运动员。\n他的身高是 226 厘米。"));
+        let receipt = since.projection.as_ref().unwrap();
+        assert_eq!(receipt.source_turns, 1, "收据只统计水位后的轮次");
+
+        // 无关种类不算水位；多条水位取最后一条。
+        chronicle.append("trace", serde_json::json!({})).unwrap();
+        let later = chronicle
+            .append(FORGET_WATERMARK_KIND, serde_json::json!({}))
+            .unwrap();
+        assert_eq!(chronicle_watermark(&chronicle), later);
     }
 
     #[test]

@@ -331,7 +331,12 @@ fn correction_targets(
         return Vec::new();
     };
     if let Some(correction) = trace_correction {
-        let memory = generation_memory::GenerationMemory::from_chronicle(session, chronicle, 0);
+        let memory = generation_memory::GenerationMemory::from_chronicle_since(
+            session,
+            chronicle,
+            generation_memory::chronicle_watermark(chronicle),
+            0,
+        );
         return memory.corrected_claim_uris(
             &correction.entity,
             &correction.attribute,
@@ -344,6 +349,7 @@ fn correction_targets(
 /// 打印回答并写入编年史；若该回答文本已作为某条回答说过（按 `already_replied`），
 /// 或其全部命题单元均已作为某个回答的命题说过（按 `already_said`），
 /// 则改打印重复提示并不再重复落图，避免同一事实在不同轮次被连续输出。
+/// 「忘记生成记忆」水位之后的口径：已忘记的历史不再算「说过」。
 fn emit_reply(
     chronicle: &mut Option<Chronicle>,
     session: &Option<DialogueSession>,
@@ -357,7 +363,12 @@ fn emit_reply(
         .as_ref()
         .and_then(|c| session.as_ref().map(|s| (c, s)))
         .map(|(chronicle, session)| {
-            let memory = generation_memory::GenerationMemory::from_chronicle(session, chronicle, 0);
+            let memory = generation_memory::GenerationMemory::from_chronicle_since(
+                session,
+                chronicle,
+                generation_memory::chronicle_watermark(chronicle),
+                0,
+            );
             // 快速路径：整条回答文本是否已作为某条回答的完整正文说过。
             if memory.already_replied(answer_str) {
                 return true;

@@ -628,6 +628,24 @@ impl DialogueArtifactIndex {
         Self::build(session.id(), chronicle.entries())
     }
 
+    /// 从编年史构建工件索引，只收录 `min_seq` 之后的条目（不含）。
+    ///
+    /// 这是「忘记生成记忆」的投影水位：水位条目（`forget_memory`）之前的
+    /// 轮次与回答不再参与投影，已忘记的历史不会被重新写回图。
+    pub fn from_chronicle_since(
+        session: &DialogueSession,
+        chronicle: &Chronicle,
+        min_seq: u64,
+    ) -> Self {
+        let entries: Vec<ChronicleEntry> = chronicle
+            .entries()
+            .iter()
+            .filter(|entry| entry.seq > min_seq)
+            .cloned()
+            .collect();
+        Self::build(session.id(), &entries)
+    }
+
     pub fn session(&self) -> &str {
         &self.session
     }
