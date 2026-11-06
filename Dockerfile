@@ -8,9 +8,12 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
-COPY Cargo.toml Cargo.lock ./
+# Cargo.lock 被 .gitignore 排除、不入库（见 .github/workflows/tests.yml 中对
+# 无锁文件场景的处理），因此用通配符容忍其缺失，避免全新克隆直接 docker build 失败。
+COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
-RUN cargo build --release --locked
+# 存在 Cargo.lock 时用 --locked 严格校验依赖版本；否则现场解析依赖再构建
+RUN if [ -f Cargo.lock ]; then cargo build --release --locked; else cargo build --release; fi
 
 FROM debian:bookworm-slim
 
