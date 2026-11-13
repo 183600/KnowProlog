@@ -628,8 +628,8 @@ cargo fmt --check
 | 配置解析 | toml | TOML 解析与序列化 |
 | 唯一标识 | uuid | UUID v4 生成 |
 | 并发原语 | parking_lot | 更快的锁与 RWLock |
-| 加密 | aes-gcm / rand | 对称加密与随机数 |
-| JSON-LD | json-ld | JSON-LD 处理 |
+| 加密 | 未启用 | 当前版本未实现加密，也未引入加密依赖 |
+| JSON-LD | serde_json / Oxigraph | 内置 JSON-LD 展开、导入与导出 |
 
 ## 🤝 贡献指南
 
