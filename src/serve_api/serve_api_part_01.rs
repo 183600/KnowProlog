@@ -1053,7 +1053,9 @@ impl Session {
         let plugin_answer = self.plugin_recipe_answer(&raw_input, plugin_outcome.as_ref());
 
         control.enter(TurnPhase::Recall)?;
-        let dialogue = if style_command.is_some()
+        let memory_recall_hit = memory_recall.is_some();
+        let dialogue = if memory_recall_hit
+            || style_command.is_some()
             || generation_entity.is_some()
             || audit_command.is_some()
             || completion_command.is_some()

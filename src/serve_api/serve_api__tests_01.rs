@@ -1721,3 +1721,169 @@ template = "「{entity}」导演过的作品：{answer}。依据：{evidence}"
         .await;
         assert_eq!(status, 404);
     }
+
+// ---------------------------------------------------------------------------
+// RDF 生成记忆（默认关闭）：开启后服务会话的回答史按轮投影为命名图，
+// 元话语问题走记忆召回；默认关闭时回答路径与存储零改动。
+// ---------------------------------------------------------------------------
+
+/// 带存储与生成记忆配置的服务状态（事实与 [`test_state`] 同一套）。
+fn memory_enabled_state(store_dir: &std::path::Path, max_sessions: usize) -> Arc<ApiState> {
+    use crate::generation_memory::GenerationMemoryConfig;
+
+    let mut yao = HashMap::new();
+    yao.insert("身高".to_string(), "226".to_string());
+    let facts = vec![PrologFact::Entity {
+        name: "姚明".to_string(),
+        entity_type: "人物".to_string(),
+        properties: yao,
+    }];
+    let reasoning = ReasoningConfig {
+        enable_link_prediction: false,
+        ..ReasoningConfig::default()
+    };
+    let mut state = ApiState::new(
+        facts,
+        reasoning,
+        HashMap::new(),
+        PerfLedger::shared(),
+        max_sessions,
+        StartupLedger::shared(),
+    );
+    let manager =
+        crate::OxigraphManager::new(store_dir.to_str().unwrap()).expect("临时存储应可打开");
+    state.set_generation_memory(
+        Arc::new(manager),
+        GenerationMemoryConfig {
+            enabled: true,
+            max_turns: 8,
+        },
+    );
+    Arc::new(state)
+}
+
+#[tokio::test]
+async fn generation_memory_disabled_by_default_leaves_meta_questions_unclaimed() {
+    let state = test_state(2);
+    let session_id = state.create_session().await.expect("会话应创建成功");
+    let answer = state
+        .take_turn(&session_id, "姚明的身高是多少")
+        .await
+        .expect("问答应成功");
+    assert!(answer.reply.contains("226"), "{}", answer.reply);
+
+    // 未开启生成记忆：元话语问题不被记忆召回接管（回退既有管线/让位）。
+    let meta = state
+        .take_turn(&session_id, "我们刚才聊到哪了")
+        .await
+        .expect("轮次应成功");
+    assert_ne!(
+        meta.source, "generation_memory",
+        "默认关闭时不得由记忆召回作答：{}",
+        meta.reply
+    );
+    assert!(
+        state.generation_memory_store.is_none(),
+        "默认不得持有存储句柄"
+    );
+}
+
+#[tokio::test]
+async fn generation_memory_records_turns_and_answers_meta_questions() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let state = memory_enabled_state(&dir.path().to_path_buf(), 4);
+    let session_id = state.create_session().await.expect("会话应创建成功");
+
+    let answer = state
+        .take_turn(&session_id, "姚明的身高是多少")
+        .await
+        .expect("问答应成功");
+    assert_eq!(answer.status, "answered", "{}", answer.reply);
+    assert!(answer.reply.contains("226"), "{}", answer.reply);
+
+    // 回顾：记忆召回接管，报出轮次与问答词面。
+    let recap = state
+        .take_turn(&session_id, "我们刚才聊到哪了")
+        .await
+        .expect("回顾轮应成功");
+    assert_eq!(recap.source, "generation_memory", "{}", recap.reply);
+    assert_eq!(recap.kind.as_deref(), Some("generation_recall"));
+    assert!(recap.reply.contains("姚明"), "{}", recap.reply);
+
+    // 第 N 点：走生成计划复述通道，会话内无计划时按 last_plan 桥接
+    // 从记忆取最近一条回答的命题（与 REPL 同一语义，来源标记
+    // generation_plan + style_directive，措辞注明出自 RDF 生成记忆）。
+    let step = state
+        .take_turn(&session_id, "第一点是什么")
+        .await
+        .expect("点序号轮应成功");
+    assert_eq!(step.source, "generation_plan", "{}", step.reply);
+    assert!(step.reply.contains("226"), "{}", step.reply);
+    assert!(step.reply.contains("生成记忆"), "{}", step.reply);
+
+    // 落图：存储里可读回同一份记忆（跨重启的持久真相）；回顾与点序号
+    // 两轮的回答也一并登记（召回回答本身是回答史的一部分）。
+    let store = state.generation_memory_store.as_ref().expect("存储应已注入");
+    let persisted = store
+        .load_generation_memory(&session_id)
+        .await
+        .expect("记忆应可读回");
+    assert_eq!(persisted.turn_count(), 3, "问答 + 回顾 + 点序号三轮");
+    assert_eq!(persisted.reply_count(), 3);
+    let answered_claim = persisted
+        .reply_iter()
+        .flat_map(|reply| reply.claims.iter().map(|claim| claim.text.clone()))
+        .find(|text| text.contains("226"))
+        .expect("首问的命题应已按 answer_units 口径切分落图");
+    assert!(persisted.already_said(&answered_claim));
+}
+
+#[tokio::test]
+async fn generation_memory_survives_cold_restart_of_the_service() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let session_id = {
+        let state = memory_enabled_state(&dir.path().to_path_buf(), 4);
+        let session_id = state.create_session().await.expect("会话应创建成功");
+        let answer = state
+            .take_turn(&session_id, "姚明的身高是多少")
+            .await
+            .expect("问答应成功");
+        assert!(answer.reply.contains("226"), "{}", answer.reply);
+        session_id
+        // state 在此丢弃：模拟服务重启（存储仍在原目录）。
+    };
+
+    let restarted = memory_enabled_state(&dir.path().to_path_buf(), 4);
+    let same_id = restarted
+        .create_session()
+        .await
+        .expect("重启后应得到同名会话（id 从 s-1 重新计数）");
+    assert_eq!(same_id, session_id);
+    let recap = restarted
+        .take_turn(&same_id, "我们刚才聊到哪了")
+        .await
+        .expect("跨重启回顾应成功");
+    assert_eq!(recap.source, "generation_memory", "{}", recap.reply);
+    assert!(recap.reply.contains("姚明"), "{}", recap.reply);
+}
+
+#[tokio::test]
+async fn generation_memory_close_session_forgets_dialogue_graphs() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let state = memory_enabled_state(&dir.path().to_path_buf(), 4);
+    let session_id = state.create_session().await.expect("会话应创建成功");
+    let answer = state
+        .take_turn(&session_id, "姚明的身高是多少")
+        .await
+        .expect("问答应成功");
+    assert!(answer.reply.contains("226"), "{}", answer.reply);
+    let store = state.generation_memory_store.as_ref().expect("存储应已注入");
+    let before = store.load_generation_memory(&session_id).await.unwrap();
+    assert!(before.reply_count() >= 1);
+
+    // 删除会话：按「按会话删除」约束，其全部对话命名图一并忘记。
+    assert!(state.close_session(&session_id).await);
+    let after = store.load_generation_memory(&session_id).await.unwrap();
+    assert!(after.is_empty(), "删除会话后记忆应为空");
+}
+
