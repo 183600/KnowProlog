@@ -1,10 +1,13 @@
 {
+            // 存储管理器搬进 Arc：开启生成记忆时由 ApiState 持有同一实例，
+            // 会话记忆的读写与启动期配置共用一份缓存与注册表。
+            let oxigraph_manager = std::sync::Arc::new(oxigraph_manager);
             let prompt_mode = parse_prompt_mode(&prompt_mode);
             let recovery_mode = parse_recovery_mode(&recovery);
             warn_config_contract(&config);
             let frame_program = compile_frame_program(&config);
             let facts_start = Instant::now();
-            let facts = match serve_facts(&oxigraph_manager).await {
+            let facts = match serve_facts(oxigraph_manager.as_ref()).await {
                 Ok(facts) => {
                     startup_ledger.record_since("facts_load", facts_start);
                     facts
@@ -80,6 +83,20 @@
                 max_sessions,
                 startup_ledger.clone(),
             );
+            // RDF 生成记忆（默认关闭）：开启后服务会话与 REPL 共用同一套
+            // 按轮隔离的回答史命名图——跨重启的回顾、「说过吗」、「第 N 点」、
+            // 已说过滤与更正定位在 HTTP 入口同样生效；默认关闭时回答路径
+            // 与默认图零改动（配置开关在 ApiState 内部把关）。
+            api_state.set_generation_memory(
+                std::sync::Arc::clone(&oxigraph_manager),
+                config.generation_memory.clone(),
+            );
+            if config.generation_memory.enabled {
+                println!(
+                    "服务已开启 RDF 生成记忆：最近 {} 轮按会话投影（回顾 / 说过吗 / 第N点 / 焦点 / 更正走记忆召回）。",
+                    config.generation_memory.max_turns
+                );
+            }
             // 读法观测：服务会话的失败轮同样留下有界回执，指标进共享性能台账。
             api_state.set_nlp_config(config.nlp.clone());
             api_state.set_attribute_profiles(&config.attributes);

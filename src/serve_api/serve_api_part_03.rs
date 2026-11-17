@@ -845,6 +845,9 @@ async fn stream_turn(
             .await?;
     }
     state.turns_total.fetch_add(1, Ordering::Relaxed);
+    // 回答史落图（启用时，尽力而为）：在流结束前完成，保持与普通轮
+    // 相同的「响应返回时存储已同步」约定。
+    state.sync_generation_memory(session_id).await;
     for chunk in sentence_chunks(&turn.reply) {
         let event = serde_json::json!({
             "session_id": turn.session_id,

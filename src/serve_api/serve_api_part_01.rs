@@ -554,7 +554,15 @@ struct Session {
     knowledge: Arc<KnowledgeBase>,
     knowledge_generation: u64,
     perf: Arc<PerfLedger>,
+    /// RDF 生成记忆槽（默认 `None` = 关闭）：actor 每轮末写入，HTTP 层
+    /// 负责落图；推理器的已说过滤 / 更正定位 / 记忆复述闭包同读这一份。
+    generation_memory: Option<GenerationMemorySlot>,
 }
+/// 会话级生成记忆槽：actor 线程与 HTTP 层共享，各自持有一份 `Arc`。
+///
+/// 内层锁是 `parking_lot`（同步）：actor 在轮末写、推理器闭包在读；
+/// 存储同步由 HTTP 层（async 上下文）在响应返回前完成。
+type GenerationMemorySlot = Arc<parking_lot::Mutex<crate::generation_memory::GenerationMemory>>;
 /// 一轮开始前的可观察状态：失败轮必须原样回滚，不能出现「回答没给出，焦点却跳走」。
 struct SessionCheckpoint {
     turns: u32,
@@ -670,6 +678,105 @@ impl Session {
                 self.perf.bump("knowledge_session_rebuilds");
             }
         }
+    }
+
+    /// 接入生成记忆：保存共享槽，并把「已说过滤 / 更正定位 / 记忆复述」
+    /// 三个闭包注入推理器。闭包只读槽内状态，绝不阻塞回答（读锁即取即放）。
+    fn attach_generation_memory(&mut self, slot: GenerationMemorySlot) {
+        let said = Arc::clone(&slot);
+        self.reasoner
+            .set_already_said_check(Some(Box::new(move |text: &str| {
+                said.lock().already_said(text)
+            })));
+        let corrects = Arc::clone(&slot);
+        self.reasoner
+            .set_corrects_check(Some(Box::new(
+                move |entity: &str, attribute: &str, previous: &str| {
+                    corrects
+                        .lock()
+                        .corrected_claim_uris(entity, attribute, previous)
+                },
+            )));
+        let replies = Arc::clone(&slot);
+        self.reasoner
+            .set_memory_reply_provider(Some(Box::new(move || {
+                replies.lock().latest_reply().map(|reply| {
+                    crate::symbolic_reasoner::MemoryReplyFragment {
+                        reply_seq: reply.seq,
+                        claims: reply
+                            .claims
+                            .iter()
+                            .map(|claim| (claim.index, claim.text.clone()))
+                            .collect(),
+                    }
+                })
+            })));
+        self.generation_memory = Some(slot);
+    }
+
+    /// 轮末把本轮回答史记入生成记忆（启用时）：轮次工件总是登记（含让位轮），
+    /// 回答工件只在非故障且非空回答时登记；幂等，重复调用不重复写入。
+    ///
+    /// 命题切分与编年史投影共用 [`crate::dialogue_uri::answer_units`]，保证
+    /// 「第 N 点」「说过吗」在 HTTP 与 CLI 两条投影路径下指向同一批命题。
+    /// 这里只改内存槽；落图由 HTTP 层在响应返回前完成（尽力而为）。
+    fn record_generation_memory(&self, input: &str, response: &TurnResponse) {
+        let Some(slot) = self.generation_memory.as_ref() else {
+            return;
+        };
+        if response.fault.is_some() {
+            return;
+        }
+        let question = input.trim().to_string();
+        if question.is_empty() {
+            return;
+        }
+        let turn_seq = u64::from(response.turn);
+        let kb_revision = self.knowledge.generation();
+        let mut memory = slot.lock();
+        memory.add_turn(
+            turn_seq,
+            question.clone(),
+            "query".to_string(),
+            response.focus.clone(),
+        );
+        if response.status != "answered" || response.reply.is_empty() {
+            return;
+        }
+        let session_id = memory.session.clone();
+        let reply_seq = turn_seq;
+        let claims: Vec<crate::dialogue_uri::ClaimArtifact> =
+            crate::dialogue_uri::answer_units(&response.reply)
+                .into_iter()
+                .enumerate()
+                .map(|(position, text)| {
+                    let index = position as u32 + 1;
+                    let digest = crate::dialogue_uri::content_digest(&text);
+                    crate::dialogue_uri::ClaimArtifact {
+                        index,
+                        uri: crate::dialogue_uri::claim_uri(&session_id, reply_seq, index),
+                        statement_uri: crate::dialogue_uri::statement_uri(&session_id, &digest),
+                        digest,
+                        text,
+                    }
+                })
+                .collect();
+        memory.add_reply(
+            turn_seq,
+            crate::dialogue_uri::ReplyArtifact {
+                seq: reply_seq,
+                uri: crate::dialogue_uri::reply_uri(&session_id, reply_seq),
+                turn_seq: Some(turn_seq),
+                question: Some(question),
+                answer: response.reply.clone(),
+                plan: response.plan.clone(),
+                proof_id: None,
+                kb_revision,
+                claims,
+                evidence: Vec::new(),
+                corrects: Vec::new(),
+            },
+        );
     }
 
     fn engine_stamp(&self) -> EngineStamp {
@@ -877,6 +984,16 @@ impl Session {
         let audit_command = parse_generation_audit_command(&raw_input);
         // 上一轮确认/更正过的事实必须进入本轮推理前提（幂等，不写图谱）。
         let adopted = self.sync_recovery_confirmed_facts();
+        // RDF 生成记忆召回（默认关闭）：元话语问题（回顾 / 说过吗 / 第N点 /
+        // 焦点 / 更正）由会话记忆槽直接作答，与 REPL 内存召回同一套措辞；
+        // 未启用或非元话语输入时本块整体不生效。
+        let memory_recall = match self.generation_memory.as_ref() {
+            Some(slot) => {
+                let memory = slot.lock();
+                crate::generation_recall::recall(&memory, &raw_input)
+            }
+            None => None,
+        };
         // 补全回合与假设世界命令使用原始措辞，避免被插件改写；
         // 带「那么」的一次性反事实句仍让位给 what-if 管线。
         let completion_command = self.reasoner.handle_completion_command(&raw_input);
@@ -953,7 +1070,16 @@ impl Session {
 
         control.enter(TurnPhase::Reason)?;
         let (status, source, kind, mut plan, mut reply, derivation) =
-            if let Some(directive) = style_command {
+            if let Some(recall_reply) = memory_recall {
+                (
+                    "answered".to_string(),
+                    "generation_memory".to_string(),
+                    Some("generation_recall".to_string()),
+                    recall_reply.plan,
+                    recall_reply.text,
+                    None,
+                )
+            } else if let Some(directive) = style_command {
                 self.reasoner.clear_pending_awaiting();
                 let text = self
                     .reasoner
@@ -1591,6 +1717,7 @@ fn build_session(
         knowledge,
         knowledge_generation,
         perf: Arc::clone(perf),
+        generation_memory: None,
     };
     if let Some(restore) = restore {
         session.turns = restore.turns;
@@ -1650,4 +1777,13 @@ pub struct ApiState {
     turn_budget: TurnBudget,
     /// 跨会话共享语义白板：默认私有，显式发布到全局或指定会话。
     shared_memory: Arc<SharedMemoryBoard>,
+    /// RDF 生成记忆存储（默认 `None` = 关闭）：开启后按会话读写
+    /// `kg:graphs/dialogue/` 下的命名图，回答史与知识事实共用 SPARQL 底座。
+    generation_memory_store: Option<Arc<crate::OxigraphManager>>,
+    /// 生成记忆配置（窗口等）；`enabled = false` 时即使有存储也不读写。
+    generation_memory_config: crate::generation_memory::GenerationMemoryConfig,
+    /// 每会话的生成记忆槽：会话分叉时从存储加载，actor 轮末写入，
+    /// HTTP 层落图；会话冻结/关闭时移除（存储是持久真相，槽只是缓存）。
+    generation_memory_slots:
+        Arc<parking_lot::Mutex<HashMap<String, GenerationMemorySlot>>>,
 }

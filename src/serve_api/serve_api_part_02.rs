@@ -38,6 +38,9 @@ impl ApiState {
             frame_program: None,
             turn_budget: TurnBudget::enforced(crate::turn_runtime::DEFAULT_TURN_BUDGET),
             shared_memory: Arc::new(SharedMemoryBoard::new(DEFAULT_MAX_CLAIMS)),
+            generation_memory_store: None,
+            generation_memory_config: crate::generation_memory::GenerationMemoryConfig::default(),
+            generation_memory_slots: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         }
     }
 
@@ -330,6 +333,91 @@ impl ApiState {
         self.plugin = runtime;
     }
 
+    /// 注入 RDF 生成记忆（在 `Arc::new` / `serve` 之前调用；默认关闭）。
+    ///
+    /// 开启后：会话分叉时从存储加载该会话的命名图（跨重启续写记忆），
+    /// actor 轮末把回答史记入共享槽，HTTP 层在响应返回前把有界投影落图
+    /// （尽力而为，失败不改变回答内容）。`config.enabled = false` 时本层
+    /// 整体不生效，回答路径与默认图零改动。
+    pub fn set_generation_memory(
+        &mut self,
+        store: Arc<crate::OxigraphManager>,
+        config: crate::generation_memory::GenerationMemoryConfig,
+    ) {
+        self.generation_memory_config = config;
+        self.generation_memory_store = Some(store);
+    }
+
+    /// 生成记忆是否在服务层生效。
+    pub fn generation_memory_enabled(&self) -> bool {
+        self.generation_memory_store.is_some() && self.generation_memory_config.enabled
+    }
+
+    /// 取（或建）某会话的生成记忆槽；关闭或读取失败返回 `None`。
+    ///
+    /// 槽按会话惰性创建：命中即复用；未命中从存储加载（跨重启续写），
+    /// 加载失败降级为空记忆（召回会说「还没有投影任何轮次」，不阻塞）。
+    async fn generation_memory_slot(&self, session_id: &str) -> Option<GenerationMemorySlot> {
+        if !self.generation_memory_enabled() {
+            return None;
+        }
+        {
+            let slots = self.generation_memory_slots.lock();
+            if let Some(slot) = slots.get(session_id) {
+                return Some(Arc::clone(slot));
+            }
+        }
+        let store = self.generation_memory_store.as_ref()?;
+        let mut loaded = match store.load_generation_memory(session_id).await {
+            Ok(memory) => memory,
+            Err(error) => {
+                eprintln!("生成记忆加载失败（本会话先从空记忆开始）：{}", error);
+                crate::generation_memory::GenerationMemory::empty(session_id)
+            }
+        };
+        loaded.truncate_to_recent_turns(self.generation_memory_config.max_turns);
+        let slot: GenerationMemorySlot = Arc::new(parking_lot::Mutex::new(loaded));
+        self.generation_memory_slots
+            .lock()
+            .insert(session_id.to_string(), Arc::clone(&slot));
+        Some(slot)
+    }
+
+    /// 轮末落图：把会话记忆槽的有界投影写进存储（尽力而为，不阻塞回答）。
+    ///
+    /// 与 REPL 同一约定：同步失败只告警并计数，回答已生成，不影响本轮语义。
+    async fn sync_generation_memory(&self, session_id: &str) {
+        if !self.generation_memory_enabled() {
+            return;
+        }
+        let Some(store) = self.generation_memory_store.as_ref() else {
+            return;
+        };
+        let snapshot = {
+            let slots = self.generation_memory_slots.lock();
+            let Some(slot) = slots.get(session_id) else {
+                return;
+            };
+            let memory = slot.lock();
+            if memory.is_empty() {
+                return;
+            }
+            memory.clone()
+        };
+        match store.sync_generation_memory(&snapshot).await {
+            Ok(_) => self.perf.bump("generation_memory_http_syncs"),
+            Err(error) => {
+                eprintln!("生成记忆落图失败（本轮不阻塞回答）：{}", error);
+                self.perf.bump("generation_memory_http_sync_errors");
+            }
+        }
+    }
+
+    /// 移除会话记忆槽（冻结/关闭时调用）；存储里的命名图不受影响。
+    fn drop_generation_memory_slot(&self, session_id: &str) {
+        self.generation_memory_slots.lock().remove(session_id);
+    }
+
     /// 当前引擎指纹（知识库指纹 + 运行模式）。
     pub fn engine_stamp(&self) -> EngineStamp {
         let snapshot = self.knowledge.snapshot();
@@ -348,6 +436,7 @@ impl ApiState {
         &self,
         id: String,
         restore: Option<SessionRestore>,
+        generation_memory: Option<GenerationMemorySlot>,
     ) -> Result<SessionHandle, &'static str> {
         let (tx, mut rx) = mpsc::channel::<SessionCommand>(64);
         let warm = Arc::clone(&self.warm);
@@ -383,6 +472,9 @@ impl ApiState {
                         restore,
                     )
                 };
+                if let Some(slot) = generation_memory {
+                    session.attach_generation_memory(slot);
+                }
                 while let Some(command) = rx.blocking_recv() {
                     match command {
                         SessionCommand::Turn {
@@ -397,10 +489,21 @@ impl ApiState {
                             }
                             let response =
                                 session.run_turn_with_cancel_and_progress(&input, cancel, progress);
+                            // 轮末记账（启用时）：回答史先进共享槽，落图由
+                            // HTTP 层在响应返回前完成；故障轮不留记忆。
+                            session.record_generation_memory(&input, &response);
                             let _ = reply.send(response);
                         }
                         SessionCommand::Resume { cancel, reply } => {
+                            // 在途轮次的原始输入是本轮词面：先取出再重放。
+                            let input = session
+                                .manager
+                                .latest_open_turn()
+                                .map(|open| open.input.clone());
                             let response = session.resume_turn(cancel);
+                            if let (Ok(response), Some(input)) = (&response, input) {
+                                session.record_generation_memory(&input, response);
+                            }
                             let _ = reply.send(response);
                         }
                         SessionCommand::DiscardOpenTurn { reply } => {
@@ -528,6 +631,8 @@ impl ApiState {
         std::fs::write(&tmp, bytes).map_err(|_| SessionError::Unavailable)?;
         std::fs::rename(&tmp, &path).map_err(|_| SessionError::Unavailable)?;
         sessions.remove(&id);
+        // 记忆槽随换出移除：存储里的命名图是持久真相，换入时重新加载。
+        self.drop_generation_memory_slot(&id);
         self.evictions_total.fetch_add(1, Ordering::Relaxed);
         self.perf.bump("session_evictions");
         Ok(())
@@ -590,7 +695,11 @@ impl ApiState {
             self.freeze_lru_locked(&mut sessions).await?;
         }
         let handle = self
-            .spawn_actor(session_id.to_string(), Some(restore))
+            .spawn_actor(
+                session_id.to_string(),
+                Some(restore),
+                self.generation_memory_slot(session_id).await,
+            )
             .map_err(|_| SessionError::Unavailable)?;
         sessions.insert(session_id.to_string(), handle);
         self.perf.bump("session_resumes");
@@ -637,7 +746,17 @@ impl ApiState {
                 break candidate;
             }
         };
-        let handle = self.spawn_actor(id.clone(), None)?;
+        let handle = self
+            .spawn_actor(
+                id.clone(),
+                None,
+                self.generation_memory_slot(&id).await,
+            )
+            .map_err(|error| {
+                // actor 起不来就不留半状态：记忆槽随失败一并回收。
+                self.drop_generation_memory_slot(&id);
+                error
+            })?;
         sessions.insert(id.clone(), handle);
         Ok(id)
     }
@@ -672,6 +791,9 @@ impl ApiState {
         match tokio::time::timeout(TURN_WAIT_TIMEOUT, reply_rx).await {
             Ok(Ok(response)) => {
                 self.turns_total.fetch_add(1, Ordering::Relaxed);
+                // 回答史落图（启用时，尽力而为）：在响应返回前完成，
+                // 下一轮从存储重载的会话能看到本轮记忆。
+                self.sync_generation_memory(session_id).await;
                 Ok(response)
             }
             Ok(Err(_)) => Err(SessionError::Unavailable),
@@ -698,6 +820,7 @@ impl ApiState {
         match tokio::time::timeout(TURN_WAIT_TIMEOUT, reply_rx).await {
             Ok(Ok(Ok(turn))) => {
                 self.turns_total.fetch_add(1, Ordering::Relaxed);
+                self.sync_generation_memory(session_id).await;
                 Ok(turn)
             }
             Ok(Ok(Err(error))) => Err(error),
@@ -874,7 +997,11 @@ impl ApiState {
                 .map_err(|_| ImportError::Conflict("failed to freeze session".to_string()))?;
         }
         let handle = self
-            .spawn_actor(session_id.clone(), Some(restore))
+            .spawn_actor(
+                session_id.clone(),
+                Some(restore),
+                self.generation_memory_slot(&session_id).await,
+            )
             .map_err(|message| ImportError::Conflict(message.to_string()))?;
         sessions.insert(session_id.clone(), handle);
         Ok(serde_json::json!({
@@ -896,6 +1023,22 @@ impl ApiState {
         let removed = self.sessions.lock().await.remove(session_id).is_some();
         // 私有声明随会话生命周期结束；否则同 id 重新导入/创建会继承旧记忆。
         self.shared_memory.purge_session(session_id);
+        // 生成记忆同约：删除会话即删除其全部对话命名图（按会话隔离，
+        // 隐私约束「按会话删除」）；尽力而为，删除失败不阻塞会话关闭。
+        if self.generation_memory_enabled() {
+            if let Some(store) = self.generation_memory_store.as_ref() {
+                match store.forget_generation_memory(session_id).await {
+                    Ok(count) if count > 0 => {
+                        self.perf.bump("generation_memory_http_forgets");
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        eprintln!("生成记忆删除失败（会话已关闭，图稍后可手动清理）：{}", error)
+                    }
+                }
+            }
+        }
+        self.drop_generation_memory_slot(session_id);
         match self.session_file(session_id) {
             // 冷会话（已换出）也必须可删除，否则会被下次访问复活
             Some(path) => {
