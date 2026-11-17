@@ -950,6 +950,53 @@ impl GenerationMemory {
         true
     }
 
+    /// 有界化：只保留最近 `max_turns` 轮（`0` = 不设上限，原样返回）。
+    ///
+    /// 与编年史投影（`from_index`）同一窗口语义：被截断的轮次连同其回答
+    /// 一并移除；无轮次回答只保留最近 `max_turns` 条。收据是「累计口径」：
+    /// 此前已丢弃的轮次仍计入丢弃名单，使回顾措辞始终如实披露「另有 K 轮
+    /// 更早轮次不在记忆中」；`source_turns` 取 `保留 + 丢弃`，保证
+    /// 「共 N 轮 / 保留 M 轮 / 丢弃 K 轮」在增量截断下依然自洽。
+    pub fn truncate_to_recent_turns(&mut self, max_turns: usize) {
+        if max_turns == 0 {
+            return;
+        }
+        let replies_before = self.reply_count() + self.unattached_replies.len();
+        let seqs: Vec<u64> = self.turns.keys().copied().collect();
+        let turn_skip = seqs.len().saturating_sub(max_turns);
+        let fresh_dropped: Vec<u64> = seqs.into_iter().take(turn_skip).collect();
+        for seq in &fresh_dropped {
+            self.turns.remove(seq);
+        }
+        let reply_seqs: Vec<u64> = self.unattached_replies.keys().copied().collect();
+        let reply_skip = reply_seqs.len().saturating_sub(max_turns);
+        let dropped_replies = reply_skip;
+        for seq in reply_seqs.into_iter().take(reply_skip) {
+            self.unattached_replies.remove(&seq);
+        }
+        let previous = self.projection.take();
+        let mut dropped_turns = fresh_dropped;
+        if let Some(previous) = previous.as_ref() {
+            for seq in &previous.dropped_turns {
+                if !dropped_turns.contains(seq) {
+                    dropped_turns.push(*seq);
+                }
+            }
+        }
+        dropped_turns.sort_unstable();
+        let kept_turns: Vec<u64> = self.turns.keys().copied().collect();
+        let previous = previous.as_ref();
+        self.projection = Some(ProjectionReceipt {
+            window: max_turns,
+            // 累计口径：共 N 轮 = 保留 M 轮 + 丢弃 K 轮（含此前已丢弃的轮次）。
+            source_turns: kept_turns.len() + dropped_turns.len(),
+            source_replies: replies_before.max(previous.map(|r| r.source_replies).unwrap_or(0)),
+            kept_turns,
+            dropped_turns,
+            dropped_replies: previous.map(|r| r.dropped_replies).unwrap_or(0) + dropped_replies,
+        });
+    }
+
     /// 投影为 RDF 四元组（确定性排序、去重）。
     pub fn to_quads(&self) -> MemoryResult<Vec<Quad>> {
         if self.session.trim().is_empty() {
@@ -1729,6 +1776,57 @@ mod tests {
         let mut empty = GenerationMemory::empty("s-1");
         assert!(!empty.drop_trailing_unanswered_turn("随便什么"));
         assert!(!empty.drop_trailing_unanswered_turn("   "));
+    }
+
+    #[test]
+    fn truncate_keeps_recent_turns_and_discloses_window() {
+        let dir = TempDir::new().unwrap();
+        let (index, _session, _chronicle) = sample_index(&dir);
+        let mut memory = GenerationMemory::from_index(&index, 0);
+        assert_eq!(memory.turn_count(), 2);
+
+        // 窗口 0 = 不设上限：原样保留。
+        let mut unbounded = memory.clone();
+        unbounded.truncate_to_recent_turns(0);
+        assert_eq!(unbounded.turn_count(), 2);
+        assert!(unbounded.projection.as_ref().unwrap().is_unbounded());
+
+        // 窗口 1：只保留最近一轮（编年史 seq 是全局的：轮 1/答 2/轮 3/答 4），
+        // 已说/已答只剩窗口内命题。
+        memory.truncate_to_recent_turns(1);
+        assert_eq!(memory.turn_count(), 1);
+        assert!(memory.already_said("姚明的身高是 226 厘米"));
+        assert!(!memory.already_said("姚明是篮球运动员"));
+        let receipt = memory.projection.as_ref().unwrap();
+        assert_eq!(receipt.window, 1);
+        assert_eq!(receipt.kept_turns, vec![3]);
+        assert_eq!(receipt.dropped_turns, vec![1]);
+        assert_eq!(receipt.source_turns, 2);
+        assert_eq!(
+            receipt.render_line(),
+            "投影窗口：最近 1 轮；编年史共 2 轮，保留 1 轮，丢弃 1 轮（seq 1），丢弃回答 0 条。"
+        );
+
+        // 再次投影：丢弃名单累计，且回顾措辞继续如实披露。
+        memory.add_turn(5, "第三轮".to_string(), "query".to_string(), None);
+        memory.truncate_to_recent_turns(1);
+        let receipt = memory.projection.as_ref().unwrap();
+        assert_eq!(receipt.kept_turns, vec![5]);
+        assert_eq!(receipt.dropped_turns, vec![1, 3]);
+        assert_eq!(receipt.source_turns, 3);
+    }
+
+    #[test]
+    fn truncated_memory_roundtrips_through_quads() {
+        let dir = TempDir::new().unwrap();
+        let (index, _session, _chronicle) = sample_index(&dir);
+        let mut memory = GenerationMemory::from_index(&index, 0);
+        memory.truncate_to_recent_turns(1);
+        let quads = memory.to_quads().unwrap();
+        let restored = GenerationMemory::from_quads(quads).unwrap();
+        assert_eq!(restored, memory);
+        assert_eq!(restored.turn_count(), 1);
+        assert!(restored.already_said("姚明的身高是 226 厘米"));
     }
 
     #[test]

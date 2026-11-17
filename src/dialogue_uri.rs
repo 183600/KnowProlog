@@ -1300,7 +1300,11 @@ fn payload_strings(entry: &ChronicleEntry, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn answer_units(answer: &str) -> Vec<String> {
+/// 把一条回答拆成命题单元：按行去空白、剥列表标记；全空白时退回整句 trim。
+///
+/// 编年史索引与 RDF 生成记忆共用同一份切分口径，保证「第 N 点」「说过吗」
+/// 在两条投影路径下指向同一批命题。
+pub fn answer_units(answer: &str) -> Vec<String> {
     let mut units: Vec<String> = answer
         .lines()
         .map(str::trim)
